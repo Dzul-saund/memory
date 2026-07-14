@@ -1,0 +1,21 @@
+# Secrets — NEVER commit your private key / API creds
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# Runtime artifacts
+trades.csv
+*_trades.csv
+backtest_results.csv
+backtest_cache.json

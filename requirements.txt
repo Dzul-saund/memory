@@ -1,0 +1,14 @@
+# Core runtime dependencies for the Polymarket BTC Up/Down 5m bot.
+#
+# Only `requests` + `python-dotenv` are required to run the bot in DRY-RUN
+# (simulation) mode. `py-clob-client` is only needed to fetch your real
+# balance and to place real orders (live mode).
+requests>=2.31.0
+python-dotenv>=1.0.0
+py-clob-client==0.34.6
+# Required for live trading on the new Polymarket deposit-wallet accounts
+# (signature_type 3 / POLY_1271). The bot's live trader uses this client.
+py-clob-client-v2>=1.0.1
+# Optional: live Chainlink price feed (matches Polymarket's moving price).
+# Without it the bot falls back to Coinbase spot.
+websocket-client>=1.6.0
