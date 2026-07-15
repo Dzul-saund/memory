@@ -47,6 +47,12 @@ class Bot:
         self.wins = 0
         self.losses = 0
 
+        # Cached balance (refreshed every balance_refresh_seconds and force-
+        # invalidated after every order) + status-line throttle timestamp.
+        self._balance: Optional[float] = None
+        self._balance_ts = 0.0
+        self._last_status_log = 0.0
+
     # -- public entry points ------------------------------------------------
     def run(self) -> None:
         self._banner()
@@ -118,6 +124,20 @@ class Bot:
             return False
         return True
 
+    def _get_balance(self, now: Optional[float] = None) -> float:
+        """Balance with a small cache: it only changes when WE trade, so it is
+        refreshed every balance_refresh_seconds and immediately after orders
+        (see _invalidate_balance) instead of one HTTP call per tick."""
+        now = now if now is not None else time.time()
+        if (self._balance is None
+                or now - self._balance_ts >= self.cfg.balance_refresh_seconds):
+            self._balance = self.trader.get_balance()
+            self._balance_ts = now
+        return self._balance
+
+    def _invalidate_balance(self) -> None:
+        self._balance = None
+
     def _tick(self) -> None:
         cfg = self.cfg
         market = self.data.get_active_market()
@@ -161,19 +181,23 @@ class Bot:
         self._maybe_stop_loss(market, up_bid, dn_bid, time_to_end)
 
         btc = self.data.get_live_price()
-        balance = self.trader.get_balance()
+        balance = self._get_balance(now)
 
-        self.log.info(
-            "t-%3ds | Up px=%s (bid %s/ask %s) | Down px=%s (bid %s/ask %s) | "
-            "%s $%s target %s$%s | bal $%.2f | bought=%s",
-            int(time_to_end),
-            fmt(up_price), fmt(up_bid), fmt(up_ask),
-            fmt(dn_price), fmt(dn_bid), fmt(dn_ask),
-            cfg.asset.upper(), fmt_money(btc),
-            "" if self.strike_is_exact else "~",
-            fmt_money(self.strike), balance,
-            self.bought_this_window,
-        )
+        # The loop can spin several times a second; keep the log readable by
+        # printing the status line at most once per status_log_interval.
+        if now - self._last_status_log >= cfg.status_log_interval_seconds:
+            self._last_status_log = now
+            self.log.info(
+                "t-%3ds | Up px=%s (bid %s/ask %s) | Down px=%s (bid %s/ask %s) | "
+                "%s $%s target %s$%s | bal $%.2f | bought=%s",
+                int(time_to_end),
+                fmt(up_price), fmt(up_bid), fmt(up_ask),
+                fmt(dn_price), fmt(dn_bid), fmt(dn_ask),
+                cfg.asset.upper(), fmt_money(btc),
+                "" if self.strike_is_exact else "~",
+                fmt_money(self.strike), balance,
+                self.bought_this_window,
+            )
 
         # Stop if the account is depleted (requirement 9).
         if balance <= cfg.min_balance_usdc:
@@ -222,6 +246,7 @@ class Bot:
         self.current_condition = market.condition_id
         self.bought_this_window = False
         self.price_history.clear()   # a new window means new tokens/prices
+        self.data.watch_market_books(market)   # re-point the live book feed
         # Read the EXACT target (window open price) from Polymarket's own feed;
         # fall back to Coinbase spot only if that call fails. _refresh_strike
         # keeps trying each tick until the exact value is in hand.
@@ -315,6 +340,7 @@ class Bot:
         else:
             self.losses += 1
         self.trader.settle(payout)
+        self._invalidate_balance()
         self.log.warning(
             "SETTLED%s %s %s — %s | %.2f shares | payout $%.2f | "
             "P&L %+.2f (total %+.2f, W/L %d/%d)",
@@ -395,6 +421,7 @@ class Bot:
                 "(window marked done to avoid a duplicate order)", exc,
             )
             return
+        self._invalidate_balance()
 
         self.log.warning("Order response: %s", resp)
         self.trades.append(
@@ -471,6 +498,7 @@ class Bot:
             except Exception as exc:  # noqa: BLE001
                 self.log.error("Hedge order placement FAILED: %s", exc)
                 return
+            self._invalidate_balance()
             self.log.warning("Hedge order response: %s", resp)
             self._record_hedge_fill(order, resp)
             return
@@ -498,6 +526,7 @@ class Bot:
             self.log.error("Hedge fill FAILED: %s", exc)
             self.pending_hedge = None
             return
+        self._invalidate_balance()
         self.log.warning(
             "HEDGE FILLED %s — %.2f shares @ $%.2f (~$%.2f) on %s",
             ph["outcome"], ph["size"], ph["price"],
@@ -598,6 +627,7 @@ class Bot:
         # Credit the cash we recovered (dry-run uses the same path as a payout;
         # live mode already received USDC, so settle() is a no-op there).
         self.trader.settle(proceeds)
+        self._invalidate_balance()
 
         # Close the position so the window rollover won't settle it again.
         self.open_position = None

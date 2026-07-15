@@ -47,7 +47,7 @@ class Config:
     min_target_distance_usdc: float = 0.0
     trade_size_usdc: float = 5.0               # USDC spent per trade
     min_balance_usdc: float = 1.0              # stop if balance <= this
-    poll_interval_seconds: float = 1.0
+    poll_interval_seconds: float = 0.2
     run_duration_seconds: float = 86400.0      # default 24h
     price_source: str = "ask"                  # ask | mid | last
     trade_log_csv: str = "trades.csv"          # "" disables CSV trade logging
@@ -63,6 +63,20 @@ class Config:
     # "rising" = the price now is at/above where it was this many seconds ago
     # (it climbed, or is holding at the top; a falling price never qualifies).
     trend_lookback_seconds: float = 30.0
+
+    # --- speed ---------------------------------------------------------------
+    # Live order books over the CLOB WebSocket: bid/ask updates arrive in
+    # milliseconds instead of polling GET /book over HTTP each tick. Needs
+    # `websocket-client`; falls back to HTTP automatically when unavailable.
+    book_feed_enabled: bool = True
+    book_ws: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    # How long a fetched balance stays fresh. The balance only changes when WE
+    # trade (the bot refreshes it immediately after every order), so there is
+    # no need to ask the exchange every tick.
+    balance_refresh_seconds: float = 5.0
+    # The per-tick status line is throttled to one line per this many seconds
+    # (the loop itself still runs every poll_interval_seconds).
+    status_log_interval_seconds: float = 1.0
 
     # --- hedge (optional opposite-side lottery bet) -------------------------
     # After the main buy fills, also place a tiny bet on the OPPOSITE outcome
@@ -132,7 +146,7 @@ class Config:
             min_target_distance_usdc=_f("MIN_TARGET_DISTANCE_USDC", 0.0),
             trade_size_usdc=_f("TRADE_SIZE_USDC", 5.0),
             min_balance_usdc=_f("MIN_BALANCE_USDC", 1.0),
-            poll_interval_seconds=_f("POLL_INTERVAL_SECONDS", 1.0),
+            poll_interval_seconds=_f("POLL_INTERVAL_SECONDS", 0.2),
             run_duration_seconds=_f("RUN_DURATION_SECONDS", 86400.0),
             price_source=(_s("PRICE_SOURCE", "ask") or "ask").lower(),
             # unset -> default file; explicit empty string -> disabled
@@ -144,6 +158,12 @@ class Config:
             early_price_min=_f("EARLY_PRICE_MIN", 0.99),
             early_require_rising=_b("EARLY_REQUIRE_RISING", True),
             trend_lookback_seconds=_f("TREND_LOOKBACK_SECONDS", 30.0),
+            book_feed_enabled=_b("BOOK_FEED_ENABLED", True),
+            book_ws=_s(
+                "BOOK_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+            ),
+            balance_refresh_seconds=_f("BALANCE_REFRESH_SECONDS", 5.0),
+            status_log_interval_seconds=_f("STATUS_LOG_INTERVAL_SECONDS", 1.0),
             hedge_enabled=_b("HEDGE_ENABLED", False),
             hedge_price=_f("HEDGE_PRICE", 0.01),
             hedge_size_usdc=_f("HEDGE_SIZE_USDC", 1.0),
@@ -220,6 +240,10 @@ class Config:
                 errors.append("STOPLOSS_SOFT_SECS_TO_END must be >= 0")
         if self.poll_interval_seconds <= 0:
             errors.append("POLL_INTERVAL_SECONDS must be > 0")
+        if self.balance_refresh_seconds < 0:
+            errors.append("BALANCE_REFRESH_SECONDS must be >= 0")
+        if self.status_log_interval_seconds < 0:
+            errors.append("STATUS_LOG_INTERVAL_SECONDS must be >= 0")
         if self.price_source not in ("ask", "mid", "last"):
             errors.append("PRICE_SOURCE must be one of: ask, mid, last")
         if not self.dry_run and not self.private_key:

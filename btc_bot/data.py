@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import requests
 
+from .bookfeed import MarketBookFeed
 from .config import Config
 from .pricefeed import ChainlinkPriceFeed
 from .util import iso_to_epoch, with_retry
@@ -49,19 +50,40 @@ class MarketData:
             ChainlinkPriceFeed(
                 symbol=f"{cfg.asset.lower()}/usd",
                 ws_url=cfg.live_price_ws,
+                refresh_seconds=0.5,
                 logger=logger,
             )
             if cfg.live_price_enabled
             else None
         )
+        # Live order books over WebSocket (millisecond updates). When it has
+        # no data (not connected yet / websocket-client missing) every call
+        # falls back to the HTTP book fetch, so it is always safe.
+        self.bookfeed = (
+            MarketBookFeed(ws_url=cfg.book_ws, logger=logger)
+            if cfg.book_feed_enabled
+            else None
+        )
+        # The active market is cached per 5-minute window: the slug is
+        # deterministic, so there is no need to hit Gamma every tick.
+        self._cached_market: Optional[Market] = None
 
     def start_feed(self) -> None:
         if self.feed is not None:
             self.feed.start()
+        if self.bookfeed is not None:
+            self.bookfeed.start()
 
     def stop_feed(self) -> None:
         if self.feed is not None:
             self.feed.stop()
+        if self.bookfeed is not None:
+            self.bookfeed.stop()
+
+    def watch_market_books(self, market: "Market") -> None:
+        """Point the live book feed at this window's tokens (on rollover)."""
+        if self.bookfeed is not None:
+            self.bookfeed.set_assets([market.token_up, market.token_down])
 
     # -- low level ----------------------------------------------------------
     def _get_json(self, url: str, params: Optional[dict] = None):
@@ -94,14 +116,21 @@ class MarketData:
         rollover the next market can take a second to appear; we return None in
         that case and the caller simply waits and tries again.
         """
-        slug = f"{self.cfg.slug_prefix}{self.current_window_ts()}"
+        window_ts = self.current_window_ts()
+        cached = self._cached_market
+        if cached is not None and cached.window_start_ts == window_ts:
+            return cached   # same window — no need to ask Gamma again
+
+        slug = f"{self.cfg.slug_prefix}{window_ts}"
         data = self._get_json(f"{self.cfg.gamma_host}/markets", params={"slug": slug})
         if not data:
             return None
         m = data[0]
         if m.get("closed") is True:
             return None
-        return self._parse_market(m)
+        market = self._parse_market(m)
+        self._cached_market = market
+        return market
 
     def _parse_market(self, m: dict) -> Market:
         outcomes = _loads_list(m.get("outcomes"))           # ["Up", "Down"]
@@ -135,7 +164,11 @@ class MarketData:
 
     # -- CLOB prices --------------------------------------------------------
     def get_book_top(self, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-        """Return (best_bid, best_ask) for a token from the order book."""
+        """Return (best_bid, best_ask) — live WebSocket book, HTTP fallback."""
+        if self.bookfeed is not None:
+            top = self.bookfeed.get_top(token_id)
+            if top is not None:
+                return top
         book = self._get_json(
             f"{self.cfg.clob_host}/book", params={"token_id": token_id}
         )
@@ -146,6 +179,10 @@ class MarketData:
         return best_bid, best_ask
 
     def get_midpoint(self, token_id: str) -> Optional[float]:
+        if self.bookfeed is not None:
+            top = self.bookfeed.get_top(token_id)
+            if top is not None and top[0] is not None and top[1] is not None:
+                return (top[0] + top[1]) / 2
         d = self._get_json(
             f"{self.cfg.clob_host}/midpoint", params={"token_id": token_id}
         )
@@ -153,6 +190,10 @@ class MarketData:
         return float(mid) if mid is not None else None
 
     def get_last_price(self, token_id: str) -> Optional[float]:
+        if self.bookfeed is not None:
+            last = self.bookfeed.get_last_trade(token_id)
+            if last is not None:
+                return last
         d = self._get_json(
             f"{self.cfg.clob_host}/last-trade-price", params={"token_id": token_id}
         )

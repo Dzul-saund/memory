@@ -73,6 +73,27 @@ next `<asset>-updown-5m-*` market and the per-window trade flag resets.
 - the coin's current price (Chainlink via Polymarket, Coinbase spot fallback);
 - your Polymarket USDC balance.
 
+### Speed: how fast the bot reacts
+
+The data path is fully event-driven, so a price move is seen in **milliseconds**
+and the decision loop runs **5× per second** (`POLL_INTERVAL_SECONDS=0.2`):
+
+* **Order books over WebSocket** (`BOOK_FEED_ENABLED=true`) — the CLOB pushes
+  every bid/ask change for the current window's Up/Down tokens the moment it
+  happens; no more `GET /book` HTTP polling (~300-700 ms per cycle before).
+  If the socket drops or `websocket-client` is missing, the bot silently falls
+  back to HTTP — slower, but nothing breaks.
+* **Market lookup cached per window** — the slug is deterministic, so Gamma is
+  asked once per 5-minute window, not every second.
+* **Balance cached** (`BALANCE_REFRESH_SECONDS=5`) — it only changes when the
+  bot trades, and it is force-refreshed right after every order.
+* **Chainlink live price** streams in a background thread (as before).
+
+Net effect: a tick that used to spend 0.7-2 s on sequential HTTP now completes
+in well under a millisecond, and the only remaining latency on a buy is the
+order POST itself. The status line is throttled to one per second
+(`STATUS_LOG_INTERVAL_SECONDS`) so the log stays readable at 5 ticks/second.
+
 > **Note on "target price" and the live price.** The market resolves off the
 > **Chainlink** price stream (price at window open vs. close). The bot reads
 > the **exact** target (window open price) from Polymarket's own feed
@@ -200,7 +221,10 @@ annotated list). The most important ones:
 | `STOPLOSS_ENABLED` | `true` | sell a losing position (soft 0.50/8s, hard 0.46) |
 | `MIN_BALANCE_USDC` | `1.0` | stop the bot at/below this balance |
 | `RUN_DURATION_SECONDS` | `86400` | total runtime (24h) |
-| `POLL_INTERVAL_SECONDS` | `1.0` | check frequency |
+| `POLL_INTERVAL_SECONDS` | `0.2` | decision frequency (5× per second) |
+| `BOOK_FEED_ENABLED` | `true` | millisecond bid/ask over WebSocket (HTTP fallback) |
+| `BALANCE_REFRESH_SECONDS` | `5` | balance cache TTL (refreshed after each order) |
+| `STATUS_LOG_INTERVAL_SECONDS` | `1.0` | status line at most once per this many seconds |
 | `PRICE_SOURCE` | `ask` | `ask` / `mid` / `last` |
 | `TRADE_LOG_CSV` | `botN_trades.csv` | CSV trade log path (`""` disables) |
 | `BTC_PRICE_URL` | per coin | Coinbase spot fallback URL, must match `ASSET` |
@@ -247,6 +271,7 @@ btc_bot/
   config.py    configuration from env / .env
   util.py      retry/backoff + helpers
   data.py      read-only market data (Gamma + CLOB + coin price) — no credentials
+  bookfeed.py  live order books over the CLOB WebSocket (millisecond bid/ask)
   strategy.py  pure buy/no-buy decision  — fully unit-tested, no I/O
   trader.py    live + dry-run order placement & balance (py-clob-client)
   tradelog.py  append-only CSV log of settled trades
