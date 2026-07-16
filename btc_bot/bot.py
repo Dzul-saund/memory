@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 
 from .config import Config
 from .data import Market, MarketData
+from .prob import VolEstimator, fair_up_probability
 from .strategy import evaluate
 from .trader import build_trader
 from .tradelog import TradeLogger
@@ -52,6 +53,14 @@ class Bot:
         self._balance: Optional[float] = None
         self._balance_ts = 0.0
         self._last_status_log = 0.0
+
+        # Rolling volatility of the live price -> the model's own P(Up).
+        # Volatility is a property of the COIN, not of one window, so the
+        # estimator runs across window rollovers.
+        self.vol = VolEstimator(
+            lookback_seconds=cfg.model_vol_lookback_seconds
+        )
+        self.model_prob_up: Optional[float] = None
 
     # -- public entry points ------------------------------------------------
     def run(self) -> None:
@@ -183,19 +192,32 @@ class Bot:
         btc = self.data.get_live_price()
         balance = self._get_balance(now)
 
+        # Fair-probability model: feed the vol estimator and compute our own
+        # P(Up). Only the EXACT strike is trusted — an approximate one would
+        # make the distance (and the probability) look better than it is.
+        self.vol.add(now, btc)
+        self.model_prob_up = None
+        if cfg.model_filter_enabled and self.strike_is_exact:
+            self.model_prob_up = fair_up_probability(
+                btc, self.strike, self.vol.sigma_1s(), time_to_end
+            )
+
         # The loop can spin several times a second; keep the log readable by
         # printing the status line at most once per status_log_interval.
         if now - self._last_status_log >= cfg.status_log_interval_seconds:
             self._last_status_log = now
             self.log.info(
                 "t-%3ds | Up px=%s (bid %s/ask %s) | Down px=%s (bid %s/ask %s) | "
-                "%s $%s target %s$%s | bal $%.2f | bought=%s",
+                "%s $%s target %s$%s | P(Up)=%s | bal $%.2f | bought=%s",
                 int(time_to_end),
                 fmt(up_price), fmt(up_bid), fmt(up_ask),
                 fmt(dn_price), fmt(dn_bid), fmt(dn_ask),
                 cfg.asset.upper(), fmt_money(btc),
                 "" if self.strike_is_exact else "~",
-                fmt_money(self.strike), balance,
+                fmt_money(self.strike),
+                ("n/a" if self.model_prob_up is None
+                 else f"{self.model_prob_up:.1%}"),
+                balance,
                 self.bought_this_window,
             )
 
@@ -226,6 +248,11 @@ class Bot:
             early_require_rising=cfg.early_require_rising,
             up_rising=up_rising,
             down_rising=dn_rising,
+            model_prob_up=self.model_prob_up,
+            min_model_prob=(
+                cfg.model_min_prob if cfg.model_filter_enabled else 0.0
+            ),
+            model_strict=cfg.model_strict,
         )
 
         if decision.should_buy:
@@ -363,6 +390,7 @@ class Bot:
                 "target_open": pos.get("target_open"),
                 "btc_at_entry": pos.get("btc_at_entry"),
                 "secs_to_end_at_entry": pos.get("secs_to_end_at_entry"),
+                "model_prob_at_entry": pos.get("model_prob_at_entry"),
                 "result": "WON" if won else "LOST",
                 "settle_price": last,
                 "payout": payout,
@@ -436,6 +464,12 @@ class Bot:
             }
         )
         # Track the position so it can be settled when this window resolves.
+        side_model_prob = None
+        if self.model_prob_up is not None:
+            side_model_prob = (
+                self.model_prob_up if decision.outcome == "Up"
+                else 1.0 - self.model_prob_up
+            )
         self.open_position = {
             "slug": market.slug,
             "outcome": decision.outcome,
@@ -447,6 +481,9 @@ class Bot:
             "target_open": self.strike,
             "btc_at_entry": btc,
             "secs_to_end_at_entry": int(time_to_end),
+            "model_prob_at_entry": (
+                round(side_model_prob, 4) if side_model_prob is not None else ""
+            ),
         }
 
         # Optional: arm the opposite-side lottery hedge (rests at hedge_price).
@@ -667,6 +704,7 @@ class Bot:
                 "target_open": pos.get("target_open"),
                 "btc_at_entry": pos.get("btc_at_entry"),
                 "secs_to_end_at_entry": pos.get("secs_to_end_at_entry"),
+                "model_prob_at_entry": pos.get("model_prob_at_entry"),
                 "result": "STOPLOSS",
                 "settle_price": price,
                 "payout": proceeds,
@@ -700,6 +738,16 @@ class Bot:
                 if cfg.early_require_rising else "",
                 int(cfg.early_threshold_seconds),
                 cfg.price_min, cfg.price_max,
+            )
+        if cfg.model_filter_enabled:
+            self.log.info(
+                "Model filter ON: buy only when own P(side) >= %.2f%% "
+                "(P = Phi(distance/(sigma*sqrt(t))), sigma from last %ds of "
+                "the live price; %s).",
+                cfg.model_min_prob * 100.0,
+                int(cfg.model_vol_lookback_seconds),
+                "strict: no estimate = no buy" if cfg.model_strict
+                else "non-strict: no estimate = band rules only",
             )
         if cfg.min_target_distance_usdc > 0:
             self.log.info(
@@ -762,6 +810,7 @@ class Bot:
                     "target_open": p.get("target_open"),
                     "btc_at_entry": p.get("btc_at_entry"),
                     "secs_to_end_at_entry": p.get("secs_to_end_at_entry"),
+                    "model_prob_at_entry": p.get("model_prob_at_entry"),
                     "result": "UNSETTLED",
                     "settle_price": p.get("last_price"),
                 }

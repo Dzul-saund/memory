@@ -20,6 +20,14 @@ Early/late split (optional, `early_threshold` > 0 enables it):
     lookback — see the trend flags the caller passes in).
   * `early_threshold` seconds or less left: the normal PRICE_MIN..PRICE_MAX
     band applies (default 0.98..0.99) with no trend requirement.
+
+Fair-probability model filter (optional, `min_model_prob` > 0 enables it):
+  The caller passes the model's independent estimate of P(Up) (see prob.py).
+  A side is only bought when the model's probability FOR THAT SIDE is at
+  least `min_model_prob` — i.e. the quoted 0.98/0.99 must be backed by the
+  math, not just by a thin order book. When the model has no estimate yet
+  (cold start, no exact strike): `model_strict=True` blocks the buy (safe
+  default), `model_strict=False` falls back to the price-band rules alone.
 """
 from __future__ import annotations
 
@@ -61,6 +69,9 @@ def evaluate(
     early_require_rising: bool = True, # early regime: price must be rising
     up_rising: Optional[bool] = None,  # is the Up price rising? None = unknown
     down_rising: Optional[bool] = None,
+    model_prob_up: Optional[float] = None,  # model's fair P(Up); None = unknown
+    min_model_prob: float = 0.0,       # 0 disables the model filter
+    model_strict: bool = True,         # no model estimate -> no buy
 ) -> Decision:
     """Return whether/what to buy for the current market snapshot."""
     if already_bought:
@@ -102,6 +113,29 @@ def evaluate(
                     f"price is {'not rising' if rising is False else 'trend unknown yet'}",
                 )
 
+        # Fair-probability model filter: the quoted price must be backed by
+        # the math for this side, not just by a thin order book.
+        model_note = ""
+        if min_model_prob > 0:
+            side_prob = None
+            if model_prob_up is not None:
+                side_prob = model_prob_up if name == "Up" else 1.0 - model_prob_up
+            if side_prob is None:
+                if model_strict:
+                    return Decision(
+                        False,
+                        f"{name} price {price:.3f} in band but the model has "
+                        f"no estimate yet (strict mode: no buy)",
+                    )
+            elif side_prob < min_model_prob:
+                return Decision(
+                    False,
+                    f"{name} price {price:.3f} in band but model P({name})="
+                    f"{side_prob:.2%} < required {min_model_prob:.2%}",
+                )
+            else:
+                model_note = f", model P({name})={side_prob:.2%}"
+
         # Optional cushion: BTC must have moved >= min_target_distance away from
         # the window's open price, in this outcome's favour (Up wants BTC above
         # the open, Down wants it below). This screens out near-ties at expiry.
@@ -125,7 +159,7 @@ def evaluate(
                 f"{name} price {price:.3f} in [{eff_price_min:.2f},{price_max:.2f}], "
                 f"cushion ${cushion:+.2f} >= ${min_target_distance:.2f}, "
                 f"t-{time_to_end:.0f}s remaining"
-                + (" [early: rising]" if early else ""),
+                + (" [early: rising]" if early else "") + model_note,
                 outcome=name,
                 token_id=token,
                 price=price,
@@ -135,7 +169,7 @@ def evaluate(
             True,
             f"{name} price {price:.3f} in [{eff_price_min:.2f},{price_max:.2f}] "
             f"with t-{time_to_end:.0f}s remaining"
-            + (" [early: rising]" if early else ""),
+            + (" [early: rising]" if early else "") + model_note,
             outcome=name,
             token_id=token,
             price=price,

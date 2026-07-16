@@ -21,7 +21,8 @@ FIELDS = [
     "target_open",        # approx BTC strike at window open
     "btc_at_entry",
     "secs_to_end_at_entry",
-    "result",             # WON / LOST / UNSETTLED
+    "model_prob_at_entry",  # model's own P(bought side) at entry, if available
+    "result",             # WON / LOST / UNSETTLED / STOPLOSS
     "settle_price",       # last observed price of the bought side
     "payout",
     "pnl",

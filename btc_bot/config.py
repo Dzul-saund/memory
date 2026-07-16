@@ -64,6 +64,21 @@ class Config:
     # (it climbed, or is holding at the top; a falling price never qualifies).
     trend_lookback_seconds: float = 30.0
 
+    # --- fair-probability model (independent P(Up) check) ---------------------
+    # The bot computes its own probability that the coin closes above the
+    # strike — P(Up) = Phi(distance / (sigma * sqrt(time_left))) — from the
+    # live Chainlink stream (see prob.py). A side is bought only when the
+    # model's probability for it is >= model_min_prob, so a quoted 0.98/0.99
+    # must be backed by the math, not just a thin order book. Break-even at
+    # an entry price of 0.99 is 99.0%, hence the 0.995 default margin.
+    model_filter_enabled: bool = True
+    model_min_prob: float = 0.995
+    # sigma is the RMS of ~1s returns over this rolling window.
+    model_vol_lookback_seconds: float = 120.0
+    # strict: no model estimate (cold start / no exact strike) -> no buy.
+    # Set false to fall back to the plain price-band rules in that case.
+    model_strict: bool = True
+
     # --- speed ---------------------------------------------------------------
     # Live order books over the CLOB WebSocket: bid/ask updates arrive in
     # milliseconds instead of polling GET /book over HTTP each tick. Needs
@@ -158,6 +173,10 @@ class Config:
             early_price_min=_f("EARLY_PRICE_MIN", 0.99),
             early_require_rising=_b("EARLY_REQUIRE_RISING", True),
             trend_lookback_seconds=_f("TREND_LOOKBACK_SECONDS", 30.0),
+            model_filter_enabled=_b("MODEL_FILTER_ENABLED", True),
+            model_min_prob=_f("MODEL_MIN_PROB", 0.995),
+            model_vol_lookback_seconds=_f("MODEL_VOL_LOOKBACK_SECONDS", 120.0),
+            model_strict=_b("MODEL_STRICT", True),
             book_feed_enabled=_b("BOOK_FEED_ENABLED", True),
             book_ws=_s(
                 "BOOK_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -242,6 +261,11 @@ class Config:
             errors.append("POLL_INTERVAL_SECONDS must be > 0")
         if self.balance_refresh_seconds < 0:
             errors.append("BALANCE_REFRESH_SECONDS must be >= 0")
+        if self.model_filter_enabled:
+            if not (0 < self.model_min_prob < 1):
+                errors.append("MODEL_MIN_PROB must be in (0, 1), e.g. 0.995")
+            if self.model_vol_lookback_seconds < 10:
+                errors.append("MODEL_VOL_LOOKBACK_SECONDS must be >= 10")
         if self.status_log_interval_seconds < 0:
             errors.append("STATUS_LOG_INTERVAL_SECONDS must be >= 0")
         if self.price_source not in ("ask", "mid", "last"):

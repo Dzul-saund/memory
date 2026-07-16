@@ -213,3 +213,62 @@ def test_early_rising_not_required_when_flag_off():
                          time_to_end=200, early_require_rising=False,
                          up_rising=None))
     assert d.should_buy
+
+
+# --- fair-probability model filter --------------------------------------------
+def modelargs(**overrides):
+    """bot4-style late-regime entry with the model filter on (>= 99.5%)."""
+    args = base(time_window=600.0, price_min=0.98, price_max=0.99,
+                up_price=0.98, down_price=0.02, time_to_end=60,
+                min_model_prob=0.995, model_strict=True)
+    args.update(overrides)
+    return args
+
+
+def test_model_filter_allows_confident_up():
+    d = evaluate(**modelargs(model_prob_up=0.998))
+    assert d.should_buy and d.outcome == "Up"
+    assert "model P(Up)=99.80%" in d.reason
+
+
+def test_model_filter_blocks_unconfident_up():
+    # Market quotes 0.98 but the math says only 97% — the dangerous entry.
+    d = evaluate(**modelargs(model_prob_up=0.97))
+    assert not d.should_buy and "model P(Up)=97.00%" in d.reason
+
+
+def test_model_filter_checks_the_down_side():
+    # P(Up)=0.3% -> P(Down)=99.7% >= 99.5% — Down is allowed.
+    d = evaluate(**modelargs(up_price=0.02, down_price=0.98,
+                             model_prob_up=0.003))
+    assert d.should_buy and d.outcome == "Down"
+    d = evaluate(**modelargs(up_price=0.02, down_price=0.98,
+                             model_prob_up=0.02))   # P(Down)=98% — blocked
+    assert not d.should_buy
+
+
+def test_model_strict_blocks_when_no_estimate():
+    d = evaluate(**modelargs(model_prob_up=None))
+    assert not d.should_buy and "no estimate" in d.reason
+
+
+def test_model_non_strict_falls_back_to_band_rules():
+    d = evaluate(**modelargs(model_prob_up=None, model_strict=False))
+    assert d.should_buy and d.outcome == "Up"
+
+
+def test_model_filter_disabled_when_threshold_zero():
+    d = evaluate(**modelargs(model_prob_up=0.5, min_model_prob=0.0))
+    assert d.should_buy
+
+
+def test_model_filter_combines_with_early_rule():
+    # > 120s left: needs 0.99 price, rising trend AND model confidence.
+    d = evaluate(**modelargs(up_price=0.99, down_price=0.01, time_to_end=200,
+                             early_threshold=120.0, up_rising=True,
+                             model_prob_up=0.999))
+    assert d.should_buy
+    d = evaluate(**modelargs(up_price=0.99, down_price=0.01, time_to_end=200,
+                             early_threshold=120.0, up_rising=True,
+                             model_prob_up=0.99))
+    assert not d.should_buy

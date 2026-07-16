@@ -73,6 +73,36 @@ next `<asset>-updown-5m-*` market and the per-window trade flag resets.
 - the coin's current price (Chainlink via Polymarket, Coinbase spot fallback);
 - your Polymarket USDC balance.
 
+### Fair-probability model (the bot's own percentage)
+
+The quoted 0.98/0.99 is just what the crowd pays — not always the real
+probability. Each tick the bot computes its **own** estimate from first
+principles:
+
+```
+P(Up) = Φ( (price − target) / (σ · √seconds_left) )
+```
+
+* **price** — live Chainlink price (streamed);
+* **target** — the exact window-open price from Polymarket;
+* **σ** — the coin's live volatility: RMS of ~1-second moves over the last
+  `MODEL_VOL_LOOKBACK_SECONDS` (120s), so the model notices the market
+  speeding up or calming down within a minute or two;
+* **Φ** — standard normal CDF.
+
+With the filter on (`MODEL_FILTER_ENABLED=true`) a side is bought **only when
+the model's probability for it is ≥ `MODEL_MIN_PROB`** (0.995). Break-even at
+an entry price of 0.99 is a 99.0% win rate, so the threshold keeps a safety
+margin above it — entries where the quoted 0.99 is *not* backed by the math
+(the ones that reverse in the last seconds) are skipped. The estimate is shown
+every second in the status line (`P(Up)=99.3%`), included in every BUY reason,
+and written to the trade CSV (`model_prob_at_entry`) so you can verify the
+model against actual outcomes.
+
+`MODEL_STRICT=true` (default) also blocks buying while the model has no
+estimate yet — the first ~30 seconds after startup while σ history
+accumulates. Set `MODEL_FILTER_ENABLED=false` to turn the whole thing off.
+
 ### Speed: how fast the bot reacts
 
 The data path is fully event-driven, so a price move is seen in **milliseconds**
@@ -215,6 +245,10 @@ annotated list). The most important ones:
 | `EARLY_PRICE_MIN` | `0.99` | early band lower bound (only 0.99 by default) |
 | `EARLY_REQUIRE_RISING` | `true` | early buys also need a rising price |
 | `TREND_LOOKBACK_SECONDS` | `30` | "rising" = now at/above the price this many seconds ago |
+| `MODEL_FILTER_ENABLED` | `true` | buy only when the bot's own P(side) confirms the price |
+| `MODEL_MIN_PROB` | `0.995` | minimum model probability for the bought side |
+| `MODEL_VOL_LOOKBACK_SECONDS` | `120` | window for the live σ (volatility) estimate |
+| `MODEL_STRICT` | `true` | no model estimate yet → no buy (cold-start safety) |
 | `TIME_WINDOW_SECONDS` | `600` | only buy when ≤ this many seconds remain (600 ≥ window = no limit) |
 | `MIN_TARGET_DISTANCE_USDC` | `0` | only buy when the coin is ≥ this many USD from the open (0 = off) |
 | `TRADE_SIZE_USDC` | `50.0` | spend per trade (Polymarket min ≈ $5) |
@@ -272,6 +306,7 @@ btc_bot/
   util.py      retry/backoff + helpers
   data.py      read-only market data (Gamma + CLOB + coin price) — no credentials
   bookfeed.py  live order books over the CLOB WebSocket (millisecond bid/ask)
+  prob.py      fair-probability model: live σ estimate + P(Up) (pure math)
   strategy.py  pure buy/no-buy decision  — fully unit-tested, no I/O
   trader.py    live + dry-run order placement & balance (py-clob-client)
   tradelog.py  append-only CSV log of settled trades
