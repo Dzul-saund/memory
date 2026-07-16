@@ -10,13 +10,22 @@ latest Chainlink price. The main loop reads a cached value (instant, never froze
 by per-tick HTTP latency). If ``websocket-client`` isn't installed, or the feed
 can't connect, the caller falls back to spot — so this is always optional.
 
-Protocol (reverse-engineered from the site):
+Protocol (reverse-engineered from the site, re-verified live):
   * subscribe: ``{"action":"subscribe","subscriptions":[
       {"topic":"crypto_prices_chainlink","type":"update",
        "filters":"{\\"symbol\\":\\"btc/usd\\"}"}]}``
-  * the server replies with a snapshot ``{"payload":{"data":[{timestamp,value}...]}}``
-    whose last point is the current price; incremental ``payload.value`` updates
-    may also arrive. Re-subscribing refreshes the snapshot ~1×/s.
+  * the server replies with ONE snapshot ``{"payload":{"data":[{timestamp,value}...]}}``
+    whose last point is the current price — and then sends NOTHING further
+    (no streaming), so the only way to stay current is to re-subscribe.
+  * Chainlink publishes ~1 point per second, and the newest point is already
+    ~0.9s old when the server hands it out (Polymarket's own pipeline delay —
+    the site is subject to it too).
+
+Hence the feed re-subscribes every ``refresh_seconds`` (default 0.25s; the
+server comfortably tolerates 4 snapshot requests/s) so each new Chainlink
+point is picked up within ~a quarter second of appearing — the bot sees the
+price no later than the site does. Points carry their own timestamps; an
+out-of-order/older point never overwrites a newer one.
 """
 from __future__ import annotations
 
@@ -40,17 +49,18 @@ class ChainlinkPriceFeed:
         self,
         symbol: str = "btc/usd",
         ws_url: str = LIVE_DATA_WS,
-        refresh_seconds: float = 1.0,
+        refresh_seconds: float = 0.25,
         logger=None,
     ):
         self.symbol = symbol.lower()
         self.ws_url = ws_url
-        self.refresh = max(0.5, refresh_seconds)
+        self.refresh = max(0.2, refresh_seconds)   # be nice to the server
         self.log = logger
         self.available = websocket is not None
         self._lock = threading.Lock()
         self._value: Optional[float] = None
-        self._ts = 0.0
+        self._ts = 0.0            # when we RECEIVED the value (staleness check)
+        self._point_ts = 0.0      # the point's OWN timestamp (ordering guard)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -100,15 +110,29 @@ class ChainlinkPriceFeed:
             return
         payload = d.get("payload") or {}
         value = None
+        point_ts = None
         data = payload.get("data")
         if isinstance(data, list) and data:
             value = data[-1].get("value")
+            point_ts = data[-1].get("timestamp")
         elif isinstance(payload.get("value"), (int, float)):
             value = payload["value"]
-        if isinstance(value, (int, float)):
-            with self._lock:
-                self._value = float(value)
-                self._ts = time.time()
+            point_ts = payload.get("timestamp")
+        if not isinstance(value, (int, float)):
+            return
+        try:
+            point_ts = float(point_ts) if point_ts is not None else None
+        except (TypeError, ValueError):
+            point_ts = None
+        with self._lock:
+            # Never let an older point overwrite a newer one (snapshots can
+            # arrive out of order when polling several times per second).
+            if point_ts is not None:
+                if point_ts < self._point_ts:
+                    return
+                self._point_ts = point_ts
+            self._value = float(value)
+            self._ts = time.time()
 
     def _run(self) -> None:
         backoff = 1.0
@@ -121,7 +145,7 @@ class ChainlinkPriceFeed:
                     origin="https://polymarket.com",
                 )
                 ws.send(self._sub_msg())
-                ws.settimeout(1.0)
+                ws.settimeout(0.2)   # short recv timeout -> resubscribe on time
                 backoff = 1.0
                 last_sub = last_ping = time.time()
                 while not self._stop.is_set():

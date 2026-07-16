@@ -134,6 +134,10 @@ class Config:
     # spot if disabled or websocket-client isn't installed.
     live_price_enabled: bool = True
     live_price_ws: str = "wss://ws-live-data.polymarket.com"
+    # The live-data server only answers with snapshots (no streaming), so the
+    # feed re-polls this often. 0.25s picks up each new Chainlink point (they
+    # appear ~1/s) within a quarter second — the bot is never behind the site.
+    live_price_refresh_seconds: float = 0.25
     chain_id: int = 137
     btc_price_url: str = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
@@ -203,6 +207,7 @@ class Config:
             poly_host=_s("POLY_HOST", "https://polymarket.com"),
             live_price_enabled=_b("LIVE_PRICE_ENABLED", True),
             live_price_ws=_s("LIVE_PRICE_WS", "wss://ws-live-data.polymarket.com"),
+            live_price_refresh_seconds=_f("LIVE_PRICE_REFRESH_SECONDS", 0.25),
             chain_id=_i("CHAIN_ID", 137),
             btc_price_url=_s(
                 "BTC_PRICE_URL", "https://api.coinbase.com/v2/prices/BTC-USD/spot"

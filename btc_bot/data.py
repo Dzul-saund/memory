@@ -50,7 +50,7 @@ class MarketData:
             ChainlinkPriceFeed(
                 symbol=f"{cfg.asset.lower()}/usd",
                 ws_url=cfg.live_price_ws,
-                refresh_seconds=0.5,
+                refresh_seconds=cfg.live_price_refresh_seconds,
                 logger=logger,
             )
             if cfg.live_price_enabled
