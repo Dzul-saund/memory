@@ -42,6 +42,7 @@ Fast Monitor v7 — «якорь + быстрый слой» для ПЯТИ м�
 import asyncio
 import json
 import math
+import sys
 import time
 import argparse
 import statistics
@@ -662,6 +663,25 @@ async def monitor(args):
         print(line)
 
 
+def choose_coin_interactively() -> str:
+    """Меню для запуска двойным кликом (когда флаг --coin не передан)."""
+    order = ["btc", "eth", "sol", "xrp", "doge"]
+    print("Какую монету мониторить?")
+    for i, c in enumerate(order, 1):
+        print(f"  {i}. {COINS[c]['name']}")
+    while True:
+        try:
+            s = input("Введи номер (1-5) или имя (btc/eth/sol/xrp/doge) "
+                      "и нажми Enter: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\nвыход")
+        if s.isdigit() and 1 <= int(s) <= len(order):
+            return order[int(s) - 1]
+        if s in COINS:
+            return s
+        print("Не понял. Примеры: 2  или  eth")
+
+
 async def main():
     ap = argparse.ArgumentParser(
         description="Крипто-монитор v7: якорь + быстрый слой, 5 монет")
@@ -694,6 +714,15 @@ async def main():
     ap.add_argument("--no-bybit", action="store_true")
     args = ap.parse_args()
 
+    # Запуск двойным кликом (без --coin в командной строке): спросить меню
+    # и включить автоцель, чтобы всё работало без единого флага.
+    if "--coin" not in sys.argv[1:] and sys.stdin is not None \
+            and sys.stdin.isatty():
+        args.coin = choose_coin_interactively()
+        if args.target is None and not args.auto_target:
+            args.auto_target = True
+            print("(цель раунда фиксируется автоматически на границе 5 минут)")
+
     global COIN
     COIN = COINS[args.coin]
     print(f"=== Fast Monitor v7 — {COIN['name']}/USD ===")
@@ -709,3 +738,13 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nостановлено")
+    except SystemExit as e:
+        # При запуске двойным кликом окно закрывается мгновенно — дать
+        # прочитать сообщение об ошибке (например, "pip install websockets").
+        if e.code not in (0, None):
+            print(e)
+        if sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input("\nНажми Enter, чтобы закрыть окно...")
+            except (EOFError, KeyboardInterrupt):
+                pass
