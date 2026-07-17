@@ -282,6 +282,29 @@ cumulative_pnl, balance_after
 
 ---
 
+## Fast Monitor (standalone, 5 coins)
+
+`fast_monitor.py` is a standalone real-time price monitor that runs AHEAD of
+the Polymarket chart: it aggregates 7 exchange feeds (Coinbase, Kraken,
+Bitstamp, Pyth stream, Binance, OKX, Bybit) into an anchored consensus price
+with a ~0.4s nowcast, per-source latency diagnostics, live σ and a P(UP)
+signal for the 5-minute rounds. One engine, five coins:
+
+```bash
+pip install websockets
+python fast_monitor.py --coin btc  --auto-target
+python fast_monitor.py --coin eth  --auto-target
+python fast_monitor.py --coin sol  --auto-target
+python fast_monitor.py --coin xrp  --auto-target
+python fast_monitor.py --coin doge --auto-target
+```
+
+It is independent from the trading bots (they talk to Polymarket's own feeds,
+which the market resolves on; the monitor talks to the exchanges directly, so
+it sees moves earlier than the site displays them).
+
+---
+
 ## Backtesting
 
 `backtest.py` replays the *classic* band strategy on **real historical data**
