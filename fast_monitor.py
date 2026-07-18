@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """
-Fast Monitor v8 — быстрее ДОБЫВАЕТ цену и точнее её считает. 5 монет.
+Fast Monitor v9 — якорь уровня = поток Polymarket/Chainlink. 5 монет.
 
-Главная цель v8 — не «чаще печатать», а сократить путь от сделки на бирже
-до цифры у нас и повысить точность самой цифры:
+ГЛАВНОЕ В v9 — исправлена «ошибка выходного дня». Раньше уровень цены
+задавала медиана долларовых пар (Coinbase/Kraken/Bitstamp/Pyth). В активные
+дни арбитраж склеивает все биржи, и это работало идеально. Но в тихие часы
+(выходные, ночь) тонкие долларовые пары отъезжают от мирового уровня на
+несколько долларов и стоят так минутами — а раунд Polymarket решается по
+Chainlink, который взвешен к крупным объёмам. Отсюда «цена на сайте стоит,
+а монитор на несколько долларов в стороне».
+
+Теперь ЯКОРЬ УРОВНЯ — сам поток Polymarket (Chainlink, тот же, что рисует
+их график и по которому раунд закрывается): в статике цифра совпадает с
+сайтом до цента В ЛЮБОЙ день недели. Биржи остались тем, чем должны быть:
+БЫСТРЫМ СЛОЕМ — они дают движение на миллисекунды раньше, чем его покажет
+сайт, каждая через своё EMA-смещение к якорю. Если поток Polymarket вдруг
+недоступен — автоматический откат на старую USD-медиану (ничего не ломается).
+
+Остальное из v8 — быстрее ДОБЫВАЕТ цену и точнее её считает:
 
   1. СЖАТИЕ ВЫКЛЮЧЕНО (compression=None) на всех WebSocket. По умолчанию
      websockets договаривается о permessage-deflate: каждая цитата сначала
@@ -120,16 +134,18 @@ COIN = COINS["btc"]          # выбирается в main() через --coin
 
 # ------------------------- состояние -------------------------
 
-USD_SOURCES = ("coinbase", "kraken", "bitstamp", "pyth")   # формируют якорь
+PM = "polymarket"            # якорь уровня: поток Chainlink с сайта Polymarket
+USD_SOURCES = ("coinbase", "kraken", "bitstamp", "pyth")   # запасной якорь
 FAST_EXTRA = ("binance", "okx", "bybit")                   # USDT, через смещение
-ALL_SOURCES = USD_SOURCES + FAST_EXTRA
+ALL_SOURCES = (PM,) + USD_SOURCES + FAST_EXTRA
 
 prices = {ex: None for ex in ALL_SOURCES}
 last_update = {ex: 0.0 for ex in prices}
 net_lag = {ex: None for ex in ALL_SOURCES}   # EMA задержки доставки, мс
 
-SHORT = {"coinbase": "cb", "kraken": "kr", "bitstamp": "bs",
-         "pyth": "py", "binance": "bn", "okx": "ok", "bybit": "bb"}
+SHORT = {"polymarket": "pm", "coinbase": "cb", "kraken": "kr",
+         "bitstamp": "bs", "pyth": "py", "binance": "bn", "okx": "ok",
+         "bybit": "bb"}
 
 UPDATE_EVENT = asyncio.Event()   # будит вывод при любом обновлении цены
 
@@ -226,6 +242,71 @@ def _iso_ms(s):
 
 
 # ------------------------- подключения к источникам -------------------------
+
+async def polymarket_ws():
+    """Якорь уровня: поток Chainlink с сайта Polymarket.
+
+    Тот же WebSocket, из которого сайт берёт движущуюся цену и по которому
+    раунд закрывается. Сервер не стримит — отвечает снимком на подписку,
+    поэтому подписка шлётся ~4 раза/с (сервер это спокойно держит; сайт
+    делает то же самое ~1 раз/с). Устаревший снимок никогда не затирает
+    более свежую точку (проверка по метке времени самой точки).
+    """
+    url = "wss://ws-live-data.polymarket.com"
+    sub = json.dumps({"action": "subscribe", "subscriptions": [{
+        "topic": "crypto_prices_chainlink", "type": "update",
+        "filters": json.dumps({"symbol": f"{COIN['name'].lower()}/usd"})}]})
+    rc = Reconnector("polymarket")
+    last_pt = 0.0
+    while True:
+        try:
+            async with websockets.connect(
+                    url, compression=None, open_timeout=8,
+                    user_agent_header="Mozilla/5.0",
+                    origin="https://polymarket.com") as ws:
+                out(f"[polymarket] подключено (якорь уровня: Chainlink "
+                    f"{COIN['name']}/USD — как на сайте)")
+                rc.ok()
+                last_sub = 0.0
+                while True:
+                    now = time.time()
+                    if now - last_sub >= 0.25:
+                        await ws.send(sub)
+                        last_sub = now
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not isinstance(raw, str) or not raw.startswith("{"):
+                        continue
+                    try:
+                        d = json.loads(raw)
+                    except Exception:
+                        continue
+                    payload = d.get("payload") or {}
+                    data = payload.get("data")
+                    value = pt = None
+                    if isinstance(data, list) and data:
+                        value = data[-1].get("value")
+                        pt = data[-1].get("timestamp")
+                    elif isinstance(payload.get("value"), (int, float)):
+                        value = payload["value"]
+                        pt = payload.get("timestamp")
+                    if not isinstance(value, (int, float)):
+                        continue
+                    try:
+                        pt = float(pt) if pt is not None else None
+                    except (TypeError, ValueError):
+                        pt = None
+                    if pt is not None:
+                        if pt < last_pt:
+                            continue      # снимок старее уже принятой точки
+                        last_pt = pt
+                        note_lag("polymarket", pt)
+                    set_price("polymarket", float(value))
+        except Exception as e:
+            await rc.fail(e)
+
 
 async def coinbase_ws():
     url = "wss://ws-feed.exchange.coinbase.com"
@@ -509,9 +590,12 @@ async def pyth_feed():
 pyth_poll = pyth_feed          # совместимость со старым именем
 
 
-def feed_tasks(no_pyth=False, no_binance=False, no_okx=False, no_bybit=False):
+def feed_tasks(no_pyth=False, no_binance=False, no_okx=False, no_bybit=False,
+               no_pm=False):
     """Все фоновые задачи ценовых фидов (для импорта ботом)."""
     tasks = [coinbase_ws(), kraken_ws(), bitstamp_ws()]
+    if not no_pm:
+        tasks.append(polymarket_ws())
     if not no_binance:
         tasks.append(binance_ws())
     if not no_okx:
@@ -568,9 +652,14 @@ async def official_target_task(round_minutes, dp):
 # ------------------------- цена: якорь + быстрый слой -------------------------
 
 class Consensus:
-    """Живая цена = быстрые фиды, дебиасированные к устойчивому якорю.
+    """Живая цена = быстрые фиды, дебиасированные к якорю уровня.
 
-    Якорь: медиана свежих USD-источников с отсевом выбросов (уровень цены).
+    ЯКОРЬ: поток Polymarket/Chainlink — та же цифра, что на сайте и по
+    которой закрывается раунд. В статике живая цена сходится к ней до
+    цента в любой день недели (тонкие выходные пары больше не уводят
+    уровень). Если поток Polymarket недоступен — запасной якорь: медиана
+    свежих USD-источников с отсевом выбросов (поведение v8).
+
     Для каждого источника ведётся EMA-смещение к якорю; живая цена —
     взвешенное среднее (цена − смещение), вес = exp(−возраст/тау).
     Интерфейс: compute(t) -> (цена, принятые, выбросы).
@@ -606,19 +695,30 @@ class Consensus:
         if not fresh:
             return (self.anchor, {}, {}) if self.anchor else (None, {}, {})
 
-        # 1) якорь: медиана USD-источников с отсевом выбросов
-        usd = {ex: p for ex, (p, _) in fresh.items() if ex in USD_SOURCES}
-        if usd:
-            med = statistics.median(usd.values())
-            good = [p for p in usd.values() if abs(p - med) / med <= self.outlier]
-            self.anchor = statistics.median(good) if good else med
+        # 1) якорь: поток Polymarket (уровень сайта). Запасной путь —
+        #    медиана USD-источников с отсевом выбросов (как в v8).
+        pm = fresh.get(PM)
+        if pm is not None:
+            self.anchor = pm[0]
+        else:
+            usd = {ex: p for ex, (p, _) in fresh.items()
+                   if ex in USD_SOURCES}
+            if usd:
+                med = statistics.median(usd.values())
+                good = [p for p in usd.values()
+                        if abs(p - med) / med <= self.outlier]
+                self.anchor = statistics.median(good) if good else med
         if self.anchor is None:
             return None, {}, {}
         anchor = self.anchor
 
-        # 2) смещения источников к якорю
+        # 2) смещения источников к якорю (сам якорь — без смещения и
+        #    всегда «прогрет»: он и есть уровень)
         for ex, (p, _) in fresh.items():
-            self._update_offset(ex, p - anchor, t)
+            if ex != PM:
+                self._update_offset(ex, p - anchor, t)
+        if pm is not None:
+            self.off[PM] = [0.0, t, float("-inf")]
 
         # 3) быстрый слой: взвешенное среднее дебиасированных цен
         accepted, rejected = {}, {}
@@ -880,7 +980,7 @@ def choose_coin_interactively() -> str:
 
 async def main():
     ap = argparse.ArgumentParser(
-        description="Крипто-монитор v8: быстрее добывает цену, точнее считает")
+        description="Крипто-монитор v9: якорь уровня — поток Polymarket")
     ap.add_argument("--coin", choices=sorted(COINS), default="btc",
                     help="какую монету мониторить (по умолчанию btc)")
     ap.add_argument("--target", type=float, default=None,
@@ -910,6 +1010,9 @@ async def main():
     ap.add_argument("--no-binance", action="store_true")
     ap.add_argument("--no-okx", action="store_true")
     ap.add_argument("--no-bybit", action="store_true")
+    ap.add_argument("--no-polymarket", action="store_true",
+                    help="не использовать поток Polymarket как якорь "
+                         "(откат на USD-медиану, поведение v8)")
     args = ap.parse_args()
 
     # Запуск двойным кликом (без --coin в командной строке): спросить меню
@@ -924,11 +1027,12 @@ async def main():
 
     global COIN
     COIN = COINS[args.coin]
-    out(f"=== Fast Monitor v8 — {COIN['name']}/USD ===")
+    out(f"=== Fast Monitor v9 — {COIN['name']}/USD ===")
 
     tasks = [monitor(args),
              *feed_tasks(no_pyth=args.no_pyth, no_binance=args.no_binance,
-                         no_okx=args.no_okx, no_bybit=args.no_bybit)]
+                         no_okx=args.no_okx, no_bybit=args.no_bybit,
+                         no_pm=args.no_polymarket)]
     # точная цель с Polymarket — всегда, кроме ручного --target
     if args.target is None:
         tasks.append(official_target_task(args.round_minutes, COIN["dp"]))
