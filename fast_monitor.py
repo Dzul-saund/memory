@@ -1,32 +1,52 @@
 #!/usr/bin/env python3
 """
-Fast Monitor v7 — «якорь + быстрый слой» для ПЯТИ монет: BTC, ETH, SOL, XRP, DOGE.
+Fast Monitor v8 — быстрее ДОБЫВАЕТ цену и точнее её считает. 5 монет.
 
-Это v6 (btc_fast_monitor_v6), обобщённый на несколько монет + ещё быстрее:
+Главная цель v8 — не «чаще печатать», а сократить путь от сделки на бирже
+до цифры у нас и повысить точность самой цифры:
 
-  1. --coin btc|eth|sol|xrp|doge — один и тот же движок для любой монеты.
-     Все источники подобраны и проверены для каждой пары:
-       * Coinbase / Kraken / Bitstamp / Pyth — USD-якорь;
-       * Binance / OKX / Bybit — быстрый USDT-слой через EMA-смещение.
-     Тонкость: на Kraken Dogecoin называется XDG/USD — учтено в таблице.
+  1. СЖАТИЕ ВЫКЛЮЧЕНО (compression=None) на всех WebSocket. По умолчанию
+     websockets договаривается о permessage-deflate: каждая цитата сначала
+     распаковывается, а сжатие на стороне биржи ещё и подталкивает её
+     копить сообщения в пачки. Без сжатия цитата летит сырой — минус
+     миллисекунды на КАЖДОМ обновлении.
 
-  2. НОВЫЙ ИСТОЧНИК Bybit (orderbook.1, спот): обновления каждые ~10-40мс —
-     третий скоростной фид в пару к Binance и OKX. Чем больше независимых
-     быстрых фидов, тем чаще самый первый тик движения приходит к нам
-     раньше, чем куда-либо ещё (и тем устойчивее консенсус, если один из
-     фидов заблокирован в твоей стране — движок работает на тех, что есть).
+  2. OKX ПЕРЕВЕДЁН НА bbo-tbt — лучший bid/ask «тик-в-тик» каждые ~10мс
+     вместо снимков books5 раз в ~100мс. Если канал вдруг недоступен —
+     автоматический откат на старый books5 (ничего не ломается).
 
-  3. Порог сигнала --min-diff теперь АВТО: 0.5 базисного пункта от цены
-     (для BTC при $64k это те же ~$3, что были в v6; для DOGE — ~$0.000036).
-     Можно задать вручную, как раньше. Точность вывода тоже подстраивается
-     под монету (BTC 2 знака, XRP 5, DOGE 6).
+  3. МИКРОЦЕНА ВМЕСТО СЕРЕДИНЫ. Везде, где биржа даёт объёмы заявок,
+     считается microprice = (bid*V_ask + ask*V_bid) / (V_bid + V_ask):
+     если на покупку стоит больше объёма, чем на продажу, реальная цена
+     уже смещена вверх — микроцена видит это ДО того, как сдвинется mid.
+     Это и точность, и небольшое опережение. Где объёмов нет — обычный mid.
 
-  4. Переподключение с экспоненциальной паузой (2с -> 30с макс) и без
-     спама: если источник недоступен (например, Binance за геоблоком),
-     об ошибке сообщается один раз, дальше он молча пробует фоном.
+  4. ПЕЧАТЬ В ОТДЕЛЬНОМ ПОТОКЕ. Консоль Windows медленная и блокирует
+     процесс (а выделение текста мышью вообще замораживает вывод). Теперь
+     строки уходят в очередь, пишет их фоновый поток — приём данных с бирж
+     и расчёты никогда не ждут консоль. Это реальное ускорение ДОБЫЧИ,
+     а не печати.
 
-Всё остальное — двухслойная цена (якорь-медиана + дебиасированный быстрый
-слой), событийный вывод, наукаст nc=, σ и P(UP)-сигнал — ровно как в v6.
+  5. ТОЧНАЯ ЦЕЛЬ С POLYMARKET. Цель раунда берётся из их же API
+     (тот самый openPrice, что показывает сайт) — сразу при запуске, даже
+     посреди раунда, и на каждой границе. Пока точная не пришла, на
+     границе мгновенно ставится предварительная по консенсусу, затем
+     уточняется. P(UP) появляется сразу и считается от той же черты,
+     что и на сайте, — это и есть «точность цены» для наших вероятностей.
+
+  6. ДИАГНОСТИКА ДОБЫЧИ: раз в ~5с печатается «сеть.мс» — реальная
+     задержка доставки от биржи до нас (по серверным меткам времени бирж,
+     сглажено EMA). Сразу видно, какой источник тащит цену быстрее всех.
+     Отрицательные числа = часы ПК чуть спешат; важна разница между
+     источниками, а не абсолют.
+
+  7. Быстрый слой стал резче: тау веса 300мс (было 400) — теперь у нас
+     три фида с задержкой ≤40мс (Binance, Bybit, OKX tbt), можно доверять
+     самым свежим цитатам сильнее.
+
+Всё остальное — из v7: 5 монет (--coin btc|eth|sol|xrp|doge), Bybit,
+двухслойная цена (якорь + быстрый слой), наукаст nc=, σ, P(UP)-сигнал,
+меню при запуске двойным кликом, переподключения без спама.
 
 Требуется Python 3.10+ и websockets.
 
@@ -37,11 +57,13 @@ Fast Monitor v7 — «якорь + быстрый слой» для ПЯТИ м�
     python fast_monitor.py --coin sol  --auto-target
     python fast_monitor.py --coin xrp  --auto-target
     python fast_monitor.py --coin doge --auto-target
+(или просто двойной клик — спросит монету и всё включит сам)
 """
 
 import asyncio
 import json
 import math
+import queue
 import sys
 import time
 import argparse
@@ -50,7 +72,7 @@ import threading
 import urllib.request
 import http.client
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import websockets
@@ -104,6 +126,7 @@ ALL_SOURCES = USD_SOURCES + FAST_EXTRA
 
 prices = {ex: None for ex in ALL_SOURCES}
 last_update = {ex: 0.0 for ex in prices}
+net_lag = {ex: None for ex in ALL_SOURCES}   # EMA задержки доставки, мс
 
 SHORT = {"coinbase": "cb", "kraken": "kr", "bitstamp": "bs",
          "pyth": "py", "binance": "bn", "okx": "ok", "bybit": "bb"}
@@ -121,6 +144,56 @@ def set_price(ex, px):
     UPDATE_EVENT.set()
 
 
+def note_lag(ex, server_ms):
+    """EMA задержки «биржа -> мы» по серверной метке времени сообщения."""
+    try:
+        lag = now_ms() - float(server_ms)
+    except (TypeError, ValueError):
+        return
+    prev = net_lag.get(ex)
+    net_lag[ex] = lag if prev is None else prev + 0.2 * (lag - prev)
+
+
+def mid(bid, ask, bid_sz=None, ask_sz=None):
+    """Микроцена (объёмо-взвешенный mid); без объёмов — обычный mid."""
+    b, a = float(bid), float(ask)
+    try:
+        vb, va = float(bid_sz), float(ask_sz)
+        if vb > 0 and va > 0:
+            return (b * va + a * vb) / (vb + va)
+    except (TypeError, ValueError):
+        pass
+    return (b + a) / 2
+
+
+# ------------------------- печать без блокировок -------------------------
+# Консоль Windows медленная и умеет замораживать процесс (выделение мышью).
+# Все строки уходят в очередь; пишет их отдельный поток — приём данных с
+# бирж и расчёты никогда не ждут консоль.
+
+_PRINT_Q: "queue.Queue[str]" = queue.Queue()
+_printer_started = False
+
+
+def _print_worker():
+    while True:
+        line = _PRINT_Q.get()
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def out(line: str) -> None:
+    global _printer_started
+    if not _printer_started:
+        _printer_started = True
+        threading.Thread(target=_print_worker, name="printer",
+                         daemon=True).start()
+    _PRINT_Q.put(line)
+
+
 class Reconnector:
     """Переподключение без спама: пауза растёт 2с -> 30с, ошибка печатается
     один раз, при успешном коннекте счётчик сбрасывается."""
@@ -136,11 +209,20 @@ class Reconnector:
 
     async def fail(self, err):
         if not self.said:
-            print(f"[{self.tag}] обрыв: {err}; повторяю фоном "
-                  f"(молча, пауза до 30с)")
+            out(f"[{self.tag}] обрыв: {err}; повторяю фоном "
+                f"(молча, пауза до 30с)")
             self.said = True
         await asyncio.sleep(self.delay)
         self.delay = min(self.delay * 2, 30.0)
+
+
+def _iso_ms(s):
+    """ISO-времена Coinbase ('2026-07-17T18:00:00.123456Z') -> мс epoch."""
+    try:
+        return datetime.fromisoformat(
+            s.replace("Z", "+00:00")).timestamp() * 1000
+    except Exception:
+        return None
 
 
 # ------------------------- подключения к источникам -------------------------
@@ -153,18 +235,24 @@ async def coinbase_ws():
     rc = Reconnector("coinbase")
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=20,
+                                          compression=None) as ws:
                 await ws.send(sub)
-                print(f"[coinbase] подключено ({COIN['coinbase']}, mid bid/ask)")
+                out(f"[coinbase] подключено ({COIN['coinbase']}, микроцена)")
                 rc.ok()
                 async for msg in ws:
                     d = json.loads(msg)
                     if d.get("type") == "ticker":
                         bid, ask = d.get("best_bid"), d.get("best_ask")
                         if bid and ask:
-                            set_price("coinbase", (float(bid) + float(ask)) / 2)
+                            set_price("coinbase", mid(
+                                bid, ask,
+                                d.get("best_bid_size"), d.get("best_ask_size")))
                         elif d.get("price"):
                             set_price("coinbase", float(d["price"]))
+                        ts = _iso_ms(d.get("time", ""))
+                        if ts:
+                            note_lag("coinbase", ts)
         except Exception as e:
             await rc.fail(e)
 
@@ -178,9 +266,10 @@ async def kraken_ws():
     rc = Reconnector("kraken")
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=20,
+                                          compression=None) as ws:
                 await ws.send(sub)
-                print(f"[kraken] подключено ({COIN['kraken']}, bbo-триггер)")
+                out(f"[kraken] подключено ({COIN['kraken']}, микроцена, bbo)")
                 rc.ok()
                 async for msg in ws:
                     d = json.loads(msg)
@@ -188,7 +277,8 @@ async def kraken_ws():
                         t = d["data"][-1]
                         bid, ask = t.get("bid"), t.get("ask")
                         if bid and ask:
-                            set_price("kraken", (float(bid) + float(ask)) / 2)
+                            set_price("kraken", mid(
+                                bid, ask, t.get("bid_qty"), t.get("ask_qty")))
                         elif t.get("last"):
                             set_price("kraken", float(t["last"]))
         except Exception as e:
@@ -202,9 +292,10 @@ async def bitstamp_ws():
     rc = Reconnector("bitstamp")
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=20,
+                                          compression=None) as ws:
                 await ws.send(sub)
-                print(f"[bitstamp] подключено ({COIN['bitstamp']}, mid стакана)")
+                out(f"[bitstamp] подключено ({COIN['bitstamp']}, микроцена)")
                 rc.ok()
                 async for msg in ws:
                     d = json.loads(msg)
@@ -212,8 +303,12 @@ async def bitstamp_ws():
                         data = d.get("data", {})
                         bids, asks = data.get("bids"), data.get("asks")
                         if bids and asks:
-                            set_price("bitstamp",
-                                      (float(bids[0][0]) + float(asks[0][0])) / 2)
+                            set_price("bitstamp", mid(
+                                bids[0][0], asks[0][0],
+                                bids[0][1], asks[0][1]))
+                            mts = data.get("microtimestamp")
+                            if mts:
+                                note_lag("bitstamp", float(mts) / 1000.0)
         except Exception as e:
             await rc.fail(e)
 
@@ -223,44 +318,68 @@ async def binance_ws():
     rc = Reconnector("binance")
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                print(f"[binance] подключено ({COIN['binance']} bookTicker)")
+            async with websockets.connect(url, ping_interval=20,
+                                          compression=None) as ws:
+                out(f"[binance] подключено ({COIN['binance']} bookTicker, "
+                    f"микроцена)")
                 rc.ok()
                 async for msg in ws:
                     d = json.loads(msg)
                     bid, ask = d.get("b"), d.get("a")
                     if bid and ask:
-                        set_price("binance", (float(bid) + float(ask)) / 2)
+                        set_price("binance", mid(bid, ask,
+                                                 d.get("B"), d.get("A")))
         except Exception as e:
             await rc.fail(e)
 
 
 async def okx_ws():
-    """OKX books5: топ-5 стакана, обновления ~каждые 100мс."""
+    """OKX bbo-tbt: лучший bid/ask тик-в-тик (~10мс). Откат на books5."""
     url = "wss://ws.okx.com:8443/ws/v5/public"
-    sub = json.dumps({"op": "subscribe",
-                      "args": [{"channel": "books5", "instId": COIN["okx"]}]})
+    channel = "bbo-tbt"
     rc = Reconnector("okx")
     while True:
+        sub = json.dumps({"op": "subscribe",
+                          "args": [{"channel": channel,
+                                    "instId": COIN["okx"]}]})
         try:
-            async with websockets.connect(url, ping_interval=None) as ws:
+            async with websockets.connect(url, ping_interval=None,
+                                          compression=None) as ws:
                 await ws.send(sub)
-                print(f"[okx] подключено ({COIN['okx']} books5)")
+                out(f"[okx] подключено ({COIN['okx']} {channel})")
                 rc.ok()
+                silent_deadline = time.time() + 12   # канал должен ожить
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=15)
                     except asyncio.TimeoutError:
                         await ws.send("ping")     # OKX требует ping < 30с
+                        if silent_deadline and time.time() > silent_deadline:
+                            raise RuntimeError(f"нет данных по {channel}")
                         continue
                     if msg == "pong":
                         continue
                     d = json.loads(msg)
-                    if d.get("arg", {}).get("channel") == "books5" and d.get("data"):
+                    if d.get("event") == "error":
+                        raise RuntimeError(d.get("msg") or "subscribe error")
+                    if d.get("arg", {}).get("channel") == channel \
+                            and d.get("data"):
                         bk = d["data"][0]
                         if bk.get("bids") and bk.get("asks"):
-                            set_price("okx", (float(bk["bids"][0][0]) +
-                                              float(bk["asks"][0][0])) / 2)
+                            set_price("okx", mid(
+                                bk["bids"][0][0], bk["asks"][0][0],
+                                bk["bids"][0][1], bk["asks"][0][1]))
+                            note_lag("okx", bk.get("ts"))
+                            silent_deadline = None
+                    if silent_deadline and time.time() > silent_deadline:
+                        raise RuntimeError(f"нет данных по {channel}")
+        except RuntimeError as e:
+            # канал не отдаёт данные / отклонён — откат на старый books5
+            if channel == "bbo-tbt":
+                out(f"[okx] {e}; переключаюсь на books5")
+                channel = "books5"
+                continue
+            await rc.fail(e)
         except Exception as e:
             await rc.fail(e)
 
@@ -273,11 +392,12 @@ async def bybit_ws():
     rc = Reconnector("bybit")
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None) as ws:
+            async with websockets.connect(url, ping_interval=None,
+                                          compression=None) as ws:
                 await ws.send(sub)
-                print(f"[bybit] подключено ({COIN['bybit']} orderbook.1)")
+                out(f"[bybit] подключено ({COIN['bybit']} orderbook.1)")
                 rc.ok()
-                bid = ask = None
+                bid = ask = bid_sz = ask_sz = None
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=15)
@@ -291,11 +411,12 @@ async def bybit_ws():
                         continue
                     # массив пуст, если сторона не менялась — держим прежнюю
                     if data.get("b"):
-                        bid = float(data["b"][0][0])
+                        bid, bid_sz = float(data["b"][0][0]), data["b"][0][1]
                     if data.get("a"):
-                        ask = float(data["a"][0][0])
+                        ask, ask_sz = float(data["a"][0][0]), data["a"][0][1]
                     if bid is not None and ask is not None:
-                        set_price("bybit", (bid + ask) / 2)
+                        set_price("bybit", mid(bid, ask, bid_sz, ask_sz))
+                        note_lag("bybit", d.get("ts"))
         except Exception as e:
             await rc.fail(e)
 
@@ -316,14 +437,22 @@ def _pyth_latest_url():
 
 def _pyth_parse(d):
     p = d["parsed"][0]["price"]
-    return float(p["price"]) * 10 ** int(p["expo"])
+    px = float(p["price"]) * 10 ** int(p["expo"])
+    pub_ms = None
+    try:
+        pub_ms = float(p.get("publish_time")) * 1000.0
+    except (TypeError, ValueError):
+        pass
+    return px, pub_ms
 
 
 def _pyth_worker(loop):
     """Фоновый поток: сначала SSE-стрим, после 3 неудач — откат на опрос."""
-    def push(px):
+    def push(px, pub_ms):
         prices["pyth"] = px
         last_update["pyth"] = now_ms()
+        if pub_ms:
+            note_lag("pyth", pub_ms)
         loop.call_soon_threadsafe(UPDATE_EVENT.set)
 
     sse_fails = 0
@@ -338,34 +467,34 @@ def _pyth_worker(loop):
             if r.status != 200:
                 raise RuntimeError(f"HTTP {r.status}")
             if not announced:
-                print(f"[pyth] подключено ({COIN['name']}/USD агрегат, поток)")
+                out(f"[pyth] подключено ({COIN['name']}/USD агрегат, поток)")
                 announced = True
             while True:
                 line = r.readline()
                 if not line:
                     raise RuntimeError("поток закрыт")
                 if line.startswith(b"data:"):
-                    push(_pyth_parse(json.loads(line[5:])))
+                    push(*_pyth_parse(json.loads(line[5:])))
                     sse_fails = 0
         except Exception as e:
             sse_fails += 1
             if sse_fails >= 3:
-                print(f"[pyth] поток недоступен ({e}); перехожу на опрос")
+                out(f"[pyth] поток недоступен ({e}); перехожу на опрос")
             time.sleep(2)
 
     last_err = None
     while True:
         try:
             with urllib.request.urlopen(_pyth_latest_url(), timeout=3) as r:
-                push(_pyth_parse(json.loads(r.read())))
+                push(*_pyth_parse(json.loads(r.read())))
             if not announced:
-                print(f"[pyth] подключено ({COIN['name']}/USD агрегат, опрос)")
+                out(f"[pyth] подключено ({COIN['name']}/USD агрегат, опрос)")
                 announced = True
             last_err = None
             time.sleep(0.3)
         except Exception as e:
             if str(e) != last_err:
-                print(f"[pyth] ошибка: {e}; продолжаю без Pyth, повторяю фоном")
+                out(f"[pyth] ошибка: {e}; продолжаю без Pyth, повторяю фоном")
                 last_err = str(e)
             time.sleep(2)
 
@@ -394,6 +523,48 @@ def feed_tasks(no_pyth=False, no_binance=False, no_okx=False, no_bybit=False):
     return tasks
 
 
+# ------------------- точная цель раунда с Polymarket -------------------
+# Тот же openPrice, что показывает сайт (и по которому раунд решается).
+# Подхватывается сразу при запуске (даже посреди раунда) и на каждой границе.
+
+ROUND_TARGET = {"start_ts": None, "value": None, "exact": False}
+
+
+def _fetch_official_target(start_ts):
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
+    url = (f"https://polymarket.com/api/crypto/crypto-price"
+           f"?symbol={COIN['name']}&eventStartTime={iso}&variant=fiveminute")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        d = json.loads(r.read())
+    op = d.get("openPrice")
+    return float(op) if op is not None else None
+
+
+async def official_target_task(round_minutes, dp):
+    period = round_minutes * 60
+    while True:
+        now = time.time()
+        start_ts = int(now - now % period)
+        if ROUND_TARGET["start_ts"] == start_ts and ROUND_TARGET["exact"]:
+            # точная цель этого раунда уже есть — ждём границу
+            await asyncio.sleep(min(2.0, period - (now % period) + 0.2))
+            continue
+        v = None
+        try:
+            v = await asyncio.to_thread(_fetch_official_target, start_ts)
+        except Exception:
+            pass
+        # раунд мог смениться, пока ждали ответ — тогда значение устарело
+        now2 = time.time()
+        if v is not None and int(now2 - now2 % period) == start_ts:
+            ROUND_TARGET.update(start_ts=start_ts, value=v, exact=True)
+            out(f"--- цель раунда (точная, как на Polymarket): "
+                f"{v:,.{dp}f} ---")
+        else:
+            await asyncio.sleep(1.5)   # openPrice появляется через пару секунд
+
+
 # ------------------------- цена: якорь + быстрый слой -------------------------
 
 class Consensus:
@@ -406,7 +577,7 @@ class Consensus:
     """
 
     def __init__(self, outlier_bps=25.0, stale_ms=3000, fast_ms=1500.0,
-                 weight_tau_ms=400.0, offset_halflife_s=60.0,
+                 weight_tau_ms=300.0, offset_halflife_s=60.0,
                  warmup_s=5.0, tick_s=0.25):
         self.outlier = outlier_bps / 10_000
         self.stale_ms = stale_ms
@@ -553,20 +724,23 @@ async def monitor(args):
     await asyncio.sleep(2)
     dp = COIN["dp"]
     name = COIN["name"]
+    period = args.round_minutes * 60
     cons = Consensus(outlier_bps=args.outlier_bps,
                      offset_halflife_s=args.offset_halflife)
     vol = VolEstimator(window_s=args.vol_window, tick_s=0.25)
     nc = Nowcast()
-    target = args.target
+    manual_target = args.target
+    consensus_target = None
     prev_price = None
     prev_signal = None
     prev_left = seconds_left_in_round(args.round_minutes)
     last_print = 0.0
     last_vol = 0.0
-    print(f"nc = прогноз цены через {args.lead:.1f}с (наукаст)")
+    last_lag_report = 0.0
+    out(f"nc = прогноз цены через {args.lead:.1f}с (наукаст)")
     if args.min_diff is None:
-        print("порог сигнала: авто = 0.5 б.п. от цены "
-              "(задать вручную: --min-diff)")
+        out("порог сигнала: авто = 0.5 б.п. от цены "
+            "(задать вручную: --min-diff)")
 
     while True:
         # просыпаемся сразу при новых данных, максимум ждём 0.25с
@@ -587,8 +761,8 @@ async def monitor(args):
         prev_left = left
 
         if price is None:
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  "
-                  f"нет свежих данных...")
+            out(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  "
+                f"нет свежих данных...")
             continue
 
         if t - last_vol >= 250:                # σ считаем на сетке 0.25с
@@ -601,12 +775,34 @@ async def monitor(args):
                     else price * 0.5 / 10_000)
 
         if new_round:
+            consensus_target = None
             if args.auto_target:
-                target = round(price, dp)
-                print(f"--- новый раунд: цель зафиксирована {target:,.{dp}f} ---")
-            elif args.target is not None:
-                print("--- новый раунд: обнови --target с Polymarket "
-                      "(или запусти с --auto-target) ---")
+                consensus_target = round(price, dp)
+                out(f"--- новый раунд: цель {consensus_target:,.{dp}f} "
+                    f"(предварительная, по консенсусу; жду точную "
+                    f"с Polymarket) ---")
+            elif manual_target is not None:
+                out("--- новый раунд: обнови --target с Polymarket ---")
+
+        # приоритет цели: вручную > точная с Polymarket > консенсус
+        now_s = time.time()
+        round_start = int(now_s - now_s % period)
+        if manual_target is not None:
+            target = manual_target
+        elif (ROUND_TARGET["exact"]
+                and ROUND_TARGET["start_ts"] == round_start):
+            target = ROUND_TARGET["value"]
+        else:
+            target = consensus_target
+
+        # диагностика добычи: реальная задержка доставки с каждой биржи
+        if t - last_lag_report >= 5000:
+            last_lag_report = t
+            parts = [f"{SHORT[ex]}{net_lag[ex]:+5.0f}" for ex in ALL_SOURCES
+                     if net_lag.get(ex) is not None]
+            if parts:
+                out("    сеть.мс (биржа->мы, EMA): " + " ".join(parts) +
+                    "   [минус = часы ПК спешат; важна разница]")
 
         arrow = " "
         if prev_price is not None:
@@ -653,14 +849,14 @@ async def monitor(args):
                 mark = "^" if signal == "UP" else "v"
                 line += (f"   >>> СИГНАЛ: {signal} {mark} "
                          f"(P={prob:.0%}, ${abs(diff):.{dp}f})")
-                print("\a", end="")
+                line += "\a"
             elif signal:
                 line += f"   [сигнал {signal} активен]"
             elif prev_signal and signal is None:
                 line += "   [сигнал снят]"
             prev_signal = signal
 
-        print(line)
+        out(line)
 
 
 def choose_coin_interactively() -> str:
@@ -684,13 +880,15 @@ def choose_coin_interactively() -> str:
 
 async def main():
     ap = argparse.ArgumentParser(
-        description="Крипто-монитор v7: якорь + быстрый слой, 5 монет")
+        description="Крипто-монитор v8: быстрее добывает цену, точнее считает")
     ap.add_argument("--coin", choices=sorted(COINS), default="btc",
                     help="какую монету мониторить (по умолчанию btc)")
     ap.add_argument("--target", type=float, default=None,
-                    help="цель текущего раунда (цена с Polymarket)")
+                    help="цель текущего раунда вручную (иначе берётся "
+                         "автоматически: точная с Polymarket)")
     ap.add_argument("--auto-target", action="store_true",
-                    help="фиксировать цель по консенсусу на границе раунда")
+                    help="фиксировать предварительную цель по консенсусу "
+                         "на границе раунда (точная подтянется сама)")
     ap.add_argument("--round-minutes", type=int, default=5)
     ap.add_argument("--conf", type=float, default=0.80,
                     help="порог вероятности для сигнала (0.5..1)")
@@ -721,16 +919,20 @@ async def main():
         args.coin = choose_coin_interactively()
         if args.target is None and not args.auto_target:
             args.auto_target = True
-            print("(цель раунда фиксируется автоматически на границе 5 минут)")
+            print("(цель раунда подтянется сама: точная с Polymarket, "
+                  "консенсус как запасной)")
 
     global COIN
     COIN = COINS[args.coin]
-    print(f"=== Fast Monitor v7 — {COIN['name']}/USD ===")
+    out(f"=== Fast Monitor v8 — {COIN['name']}/USD ===")
 
-    await asyncio.gather(
-        monitor(args),
-        *feed_tasks(no_pyth=args.no_pyth, no_binance=args.no_binance,
-                    no_okx=args.no_okx, no_bybit=args.no_bybit))
+    tasks = [monitor(args),
+             *feed_tasks(no_pyth=args.no_pyth, no_binance=args.no_binance,
+                         no_okx=args.no_okx, no_bybit=args.no_bybit)]
+    # точная цель с Polymarket — всегда, кроме ручного --target
+    if args.target is None:
+        tasks.append(official_target_task(args.round_minutes, COIN["dp"]))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
