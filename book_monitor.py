@@ -231,13 +231,35 @@ async def discover_market(asset: str):
 # ------------------------- поток книги -------------------------
 
 class LatencyStats:
+    """Задержка с автокалибровкой часов.
+
+    «Сырое» значение (recv − серверная метка) включает сдвиг часов ПК —
+    у многих Windows-машин это сотни мс в любую сторону, поэтому сырая
+    цифра бывает даже отрицательной. Берём за БАЗУ минимальное сырое
+    значение за последние ~10 минут (самое быстрое сообщение ≈ чистый
+    путь + сдвиг часов) и показываем ОТНОСИТЕЛЬНУЮ доставку: насколько
+    каждое событие пришло медленнее лучшего. Это честный джиттер канала,
+    не зависящий от часов."""
+
     def __init__(self):
-        self.samples = deque(maxlen=1000)
+        self.samples = deque(maxlen=1000)   # относительные значения
         self.events = 0
         self.msgs = 0
+        self._min_by_min = deque(maxlen=10)  # (минута, мин. сырое значение)
 
-    def add(self, lat_ms: float):
-        self.samples.append(lat_ms)
+    def base(self) -> float:
+        return min((v for _, v in self._min_by_min), default=0.0)
+
+    def add(self, raw_lat_ms: float) -> float:
+        m = int(time.time() // 60)
+        if self._min_by_min and self._min_by_min[-1][0] == m:
+            if raw_lat_ms < self._min_by_min[-1][1]:
+                self._min_by_min[-1] = (m, raw_lat_ms)
+        else:
+            self._min_by_min.append((m, raw_lat_ms))
+        rel = raw_lat_ms - self.base()
+        self.samples.append(rel)
+        return rel
 
     def line(self, span_s: float) -> str:
         if not self.samples:
@@ -246,8 +268,9 @@ class LatencyStats:
         med = xs[len(xs) // 2]
         p95 = xs[int(len(xs) * 0.95) - 1] if len(xs) >= 20 else xs[-1]
         return (f"сводка за {span_s:.0f}с: {self.msgs / span_s:.1f} сообщ/с, "
-                f"{self.events} событий | лаг мс: медиана {med:.0f}, "
-                f"p95 {p95:.0f}, макс {xs[-1]:.0f}, мин {xs[0]:.0f}")
+                f"{self.events} событий | доставка отн. лучшей, мс: "
+                f"медиана {med:.0f}, p95 {p95:.0f}, макс {xs[-1]:.0f} | "
+                f"база {self.base():+.0f}мс = сдвиг часов ПК + мин. путь")
 
 
 def fmt_top(book: Book, depth: int, dp: int = 2):
@@ -264,68 +287,90 @@ def fmt_top(book: Book, depth: int, dp: int = 2):
 
 async def run_market(market, args, stats: LatencyStats):
     """Одно 5-минутное окно: подписка, инкрементальные обновления, вывод.
+
+    Открывается args.connections параллельных WS-сессий на один и тот же
+    поток; каждое событие обрабатывается по ПЕРВОЙ прилетевшей копии,
+    дубли отбрасываются (дедупликация по содержимому). Две независимые
+    TCP-сессии почти никогда не тормозят одновременно — это срезает
+    хвостовые всплески задержки (классика HFT: connection diversity).
     Возвращается, когда окно закончилось (пора перекатываться)."""
     names = {market["up"]: "Up  ", market["down"]: "Down"}
     books = {market["up"]: Book(), market["down"]: Book()}
     sub = json.dumps({"assets_ids": list(books), "type": "market"})
     end_ts = market["window_ts"] + WINDOW_SECONDS
-    backoff = 0.5
-    said_err = False
 
     out(f"── {market['question']} | окно до "
         f"{datetime.fromtimestamp(end_ts).strftime('%H:%M:%S')} ──")
 
-    while time.time() < end_ts + 2:
-        try:
-            async with websockets.connect(
-                    CLOB_WS, compression=None, open_timeout=8,
-                    user_agent_header="Mozilla/5.0") as ws:
-                await ws.send(sub)
-                out(f"[clob-ws] подписка отправлена (Up + Down), жду снимок")
-                backoff = 0.5
-                said_err = False
-                last_ping = time.time()
-                while time.time() < end_ts + 2:
-                    if time.time() - last_ping >= 10:
-                        await ws.send("PING")
-                        last_ping = time.time()
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        continue
-                    recv = now_ms()
-                    if not isinstance(raw, str) or not raw.startswith(("{", "[")):
-                        continue
-                    try:
-                        data = json.loads(raw)
-                    except Exception:
-                        continue
-                    stats.msgs += 1
-                    events = data if isinstance(data, list) else [data]
-                    for ev in events:
-                        if isinstance(ev, dict):
-                            _handle(ev, recv, books, names, stats, args)
-        except Exception as e:
-            if time.time() >= end_ts:
-                break
-            if not said_err:
-                out(f"[clob-ws] обрыв: {e}; переподключаюсь (молча)")
-                said_err = True
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 10.0)
+    seen: set = set()
+    seen_q: deque = deque(maxlen=8192)
+
+    async def conn_loop(idx: int):
+        backoff = 0.5
+        said_err = False
+        while time.time() < end_ts + 2:
+            try:
+                async with websockets.connect(
+                        CLOB_WS, compression=None, open_timeout=8,
+                        user_agent_header="Mozilla/5.0") as ws:
+                    await ws.send(sub)
+                    if idx == 0:
+                        out(f"[clob-ws] подписка (Up + Down), "
+                            f"сессий: {args.connections}, жду снимок")
+                    backoff = 0.5
+                    said_err = False
+                    last_ping = time.time()
+                    while time.time() < end_ts + 2:
+                        if time.time() - last_ping >= 10:
+                            await ws.send("PING")
+                            last_ping = time.time()
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(),
+                                                         timeout=0.5)
+                        except asyncio.TimeoutError:
+                            continue
+                        recv = now_ms()
+                        if not isinstance(raw, str) \
+                                or not raw.startswith(("{", "[")):
+                            continue
+                        h = hash(raw)
+                        if h in seen:
+                            continue         # копия с другой сессии — позже
+                        if len(seen_q) == seen_q.maxlen:
+                            seen.discard(seen_q[0])
+                        seen.add(h)
+                        seen_q.append(h)
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        stats.msgs += 1
+                        events = data if isinstance(data, list) else [data]
+                        for ev in events:
+                            if isinstance(ev, dict):
+                                _handle(ev, recv, books, names, stats, args)
+            except Exception as e:
+                if time.time() >= end_ts:
+                    break
+                if not said_err:
+                    out(f"[clob-ws#{idx}] обрыв: {e}; переподключаюсь (молча)")
+                    said_err = True
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+    await asyncio.gather(*(conn_loop(i) for i in range(args.connections)))
 
 
 def _handle(ev: dict, recv: float, books, names, stats: LatencyStats, args):
     etype = ev.get("event_type") or ev.get("type")
-    lat = None
+    lat_s = ""
     ts = ev.get("timestamp")
     if ts is not None:
         try:
-            lat = recv - float(ts)
-            stats.add(lat)
+            rel = stats.add(recv - float(ts))
+            lat_s = f" | +{rel:3.0f}мс"
         except (TypeError, ValueError):
             pass
-    lat_s = f" | лаг {lat:4.0f}мс" if lat is not None else ""
 
     if etype == "book":
         book = books.get(str(ev.get("asset_id")))
@@ -437,6 +482,9 @@ def main():
     ap.add_argument("--interval", type=float, default=0.1,
                     help="мин. пауза между строками топа на сторону, сек "
                          "(данные обновляются всегда; 0 = печатать всё)")
+    ap.add_argument("--connections", type=int, default=2, choices=(1, 2, 3),
+                    help="параллельных WS-сессий; событие берётся из той, "
+                         "что доставила первой (по умолч. 2)")
     ap.add_argument("--trades-only", action="store_true",
                     help="печатать только сделки (без изменений топа)")
     args = ap.parse_args()
