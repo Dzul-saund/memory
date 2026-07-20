@@ -94,7 +94,9 @@ class Bot:
                         break
                 if self.stop_reason:
                     break
-                time.sleep(self.cfg.poll_interval_seconds)
+                # Event-driven: wake the moment the order book changes;
+                # poll_interval_seconds is only the fallback heartbeat.
+                self.data.wait_book_update(self.cfg.poll_interval_seconds)
         except KeyboardInterrupt:
             self.stop_reason = "interrupted by user (Ctrl-C)"
 

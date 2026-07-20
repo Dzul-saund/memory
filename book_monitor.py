@@ -48,6 +48,7 @@ Polymarket Book Monitor v1 — книга заявок Up/Down с минимал
 
 import argparse
 import asyncio
+import gc
 import json
 import queue
 import statistics
@@ -62,6 +63,14 @@ try:
     import websockets
 except ImportError:
     raise SystemExit("Установите зависимость:  pip install websockets")
+
+# orjson (написан на Rust) разбирает JSON в ~5-10 раз быстрее стандартного.
+# Необязателен: без него работает stdlib. Установка:  pip install orjson
+try:
+    import orjson
+    loads = orjson.loads
+except Exception:  # noqa: BLE001
+    loads = json.loads
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -319,36 +328,47 @@ async def run_market(market, args, stats: LatencyStats):
                             f"сессий: {args.connections}, жду снимок")
                     backoff = 0.5
                     said_err = False
-                    last_ping = time.time()
-                    while time.time() < end_ts + 2:
-                        if time.time() - last_ping >= 10:
+
+                    async def _pinger():
+                        while True:
+                            await asyncio.sleep(10)
                             await ws.send("PING")
-                            last_ping = time.time()
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(),
-                                                         timeout=0.5)
-                        except asyncio.TimeoutError:
-                            continue
-                        recv = now_ms()
-                        if not isinstance(raw, str) \
-                                or not raw.startswith(("{", "[")):
-                            continue
-                        h = hash(raw)
-                        if h in seen:
-                            continue         # копия с другой сессии — позже
-                        if len(seen_q) == seen_q.maxlen:
-                            seen.discard(seen_q[0])
-                        seen.add(h)
-                        seen_q.append(h)
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-                        stats.msgs += 1
-                        events = data if isinstance(data, list) else [data]
-                        for ev in events:
-                            if isinstance(ev, dict):
-                                _handle(ev, recv, books, names, stats, args)
+
+                    async def _closer():
+                        await asyncio.sleep(max(0.0, end_ts + 2 - time.time()))
+                        await ws.close()
+
+                    aux = (asyncio.create_task(_pinger()),
+                           asyncio.create_task(_closer()))
+                    try:
+                        # `async for` — без wait_for: ноль лишних задач и
+                        # таймеров на каждое сообщение, минимальный оверхед.
+                        async for raw in ws:
+                            recv = now_ms()
+                            if not isinstance(raw, str) \
+                                    or not raw.startswith(("{", "[")):
+                                continue
+                            h = hash(raw)
+                            if h in seen:
+                                continue     # копия с другой сессии — позже
+                            if len(seen_q) == seen_q.maxlen:
+                                seen.discard(seen_q[0])
+                            seen.add(h)
+                            seen_q.append(h)
+                            try:
+                                data = loads(raw)
+                            except Exception:
+                                continue
+                            stats.msgs += 1
+                            events = (data if isinstance(data, list)
+                                      else [data])
+                            for ev in events:
+                                if isinstance(ev, dict):
+                                    _handle(ev, recv, books, names,
+                                            stats, args)
+                    finally:
+                        for t in aux:
+                            t.cancel()
             except Exception as e:
                 if time.time() >= end_ts:
                     break
@@ -493,9 +513,23 @@ def main():
             and sys.stdin.isatty():
         args.coin = choose_coin_interactively()
 
-    out(f"=== Book Monitor v1 — {COINS[args.coin]} Up/Down 5m ===")
+    out(f"=== Book Monitor v2 — {COINS[args.coin]} Up/Down 5m ===")
     out("источник: wss://ws-subscriptions-clob.polymarket.com/ws/market "
         "(push-поток самого сайта; снимок + каждая дельта + каждая сделка)")
+    if loads is json.loads:
+        out("подсказка: pip install orjson — разбор сообщений в ~5-10 раз "
+            "быстрее (необязательно)")
+
+    # Тюнинг сборщика мусора: убрать редкие паузы в несколько мс.
+    # Долгоживущие объекты замораживаются, пороги поколений подняты —
+    # GC почти не сканирует горячий цикл.
+    gc.collect()
+    try:
+        gc.freeze()
+    except Exception:  # noqa: BLE001 - на старых Python freeze нет
+        pass
+    gc.set_threshold(50000, 100, 100)
+
     asyncio.run(main_async(args))
 
 

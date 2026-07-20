@@ -89,6 +89,9 @@ class MarketBookFeed:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_rx = 0.0
+        # Fires on every applied book update so the bot can react to the
+        # market EVENT-DRIVEN (milliseconds) instead of on its poll tick.
+        self.update_event = threading.Event()
 
     # -- public ---------------------------------------------------------------
     def start(self) -> None:
@@ -137,6 +140,14 @@ class MarketBookFeed:
             book = self._books.get(str(token_id))
             return book.last_trade if book is not None else None
 
+    def wait_update(self, timeout: float) -> bool:
+        """Block until the next applied book update (or timeout). Lets the
+        bot's decision loop run the instant the market moves."""
+        fired = self.update_event.wait(timeout)
+        if fired:
+            self.update_event.clear()
+        return fired
+
     # -- internals --------------------------------------------------------------
     def _healthy(self) -> bool:
         return (
@@ -162,6 +173,7 @@ class MarketBookFeed:
             for ev in events:
                 if isinstance(ev, dict):
                     self._apply_event(ev)
+        self.update_event.set()   # wake the decision loop right now
 
     def _apply_event(self, ev: dict) -> None:
         etype = ev.get("event_type") or ev.get("type")

@@ -85,6 +85,15 @@ class MarketData:
         if self.bookfeed is not None:
             self.bookfeed.set_assets([market.token_up, market.token_down])
 
+    def wait_book_update(self, timeout: float) -> bool:
+        """Sleep until the order book actually changes (or timeout passes).
+        Event-driven reaction: the decision loop wakes in milliseconds on a
+        real market event instead of on a fixed poll grid."""
+        if self.bookfeed is not None and self.bookfeed.available:
+            return self.bookfeed.wait_update(timeout)
+        time.sleep(timeout)
+        return False
+
     # -- low level ----------------------------------------------------------
     def _get_json(self, url: str, params: Optional[dict] = None):
         def _do():

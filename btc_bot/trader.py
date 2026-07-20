@@ -12,6 +12,8 @@ bot can run fully in dry-run with only ``requests`` installed.
 """
 from __future__ import annotations
 
+import threading
+import time
 from typing import Callable, Optional
 
 from .config import Config
@@ -57,6 +59,38 @@ class LiveTrader:
         self.client = client
         self.cfg = cfg
         self.log = logger
+        self._start_http_keepalive()
+
+    def _start_http_keepalive(self) -> None:
+        """Keep the CLOB HTTP/2 connection pool warm.
+
+        py-clob-client-v2 reuses one httpx pool, but an idle TLS connection
+        gets dropped by the server/NAT after tens of seconds — and then the
+        FIRST order after a quiet stretch pays a fresh TLS handshake
+        (+100-300 ms exactly when speed matters). A tiny GET through the
+        same pool every 10s keeps the socket hot so every order goes out on
+        an established connection.
+        """
+        try:
+            from py_clob_client_v2.http_helpers import helpers as _h
+            http_client = _h._http_client
+        except Exception:  # noqa: BLE001 - internals changed: skip silently
+            return
+
+        host = self.cfg.clob_host.rstrip("/")
+
+        def _keepalive():
+            while True:
+                try:
+                    http_client.get(host + "/", timeout=3)
+                except Exception:  # noqa: BLE001 - never disturb trading
+                    pass
+                time.sleep(10)
+
+        threading.Thread(target=_keepalive, name="clob-keepalive",
+                         daemon=True).start()
+        self.log.info("CLOB keep-alive ON: orders go out on a warm "
+                      "connection (no TLS handshake before an order).")
 
     def get_balance(self) -> float:
         """USDC collateral balance, in dollars."""
