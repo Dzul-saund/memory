@@ -49,14 +49,56 @@ import time
 from collections import deque
 from datetime import datetime
 
+
+def _fatal(msg: str):
+    """Показать понятную ошибку и НЕ закрывать окно (для двойного клика)."""
+    print("\n" + "=" * 64)
+    print("EDGE BOT НЕ ЗАПУСТИЛСЯ:")
+    print(msg)
+    print("=" * 64)
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            input("\nНажми Enter, чтобы закрыть окно...")
+    except Exception:
+        pass
+    raise SystemExit(1)
+
+
 # --- твои два бота: импортируем, НЕ меняем ------------------------------------
-import fast_monitor as fm       # бот цены (Consensus, VolEstimator, p_up, фиды)
-import book_monitor as bm       # бот стакана (Book, discover_market, CLOB_WS)
+# edge_bot ДОЛЖЕН лежать в ОДНОЙ ПАПКЕ с fast_monitor.py и book_monitor.py.
+# Импортируем из папки самого скрипта, чтобы двойной клик тоже работал.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import fast_monitor as fm   # бот цены (Consensus, VolEstimator, p_up, фиды)
+except Exception as e:          # noqa: BLE001
+    _fatal("не найден бот ЦЕНЫ 'fast_monitor.py'.\n"
+           "Положи edge_bot.py в ту же папку, где лежит fast_monitor.py "
+           "(это монитор цены на 5 монет, НЕ v6-turbo).\n"
+           f"Причина: {e}")
+try:
+    import book_monitor as bm   # бот стакана (Book, discover_market, CLOB_WS)
+except Exception as e:          # noqa: BLE001
+    _fatal("не найден бот СТАКАНА 'book_monitor.py'.\n"
+           "Положи edge_bot.py в ту же папку, где лежит book_monitor.py.\n"
+           f"Причина: {e}")
+
+# Проверка, что это ПРАВИЛЬНЫЙ fast_monitor (v9, 5 монет), а не v6-turbo:
+# нужны official_target_task и ROUND_TARGET, которых в турбо-версии нет.
+for _need in ("Consensus", "VolEstimator", "p_up", "feed_tasks",
+              "official_target_task", "ROUND_TARGET", "COINS",
+              "seconds_left_in_round"):
+    if not hasattr(fm, _need):
+        _fatal("рядом лежит НЕ тот монитор цены.\n"
+               "Нужен fast_monitor.py на 5 монет (btc/eth/sol/xrp/doge) — "
+               "тот, что с автоцелью с Polymarket.\n"
+               f"В нём не хватает '{_need}'. Возьми fast_monitor.py из "
+               "архива memorybot_9_0_max.zip.")
 
 try:
     import websockets
 except ImportError:
-    raise SystemExit("Установите зависимость:  pip install websockets")
+    _fatal("не установлена библиотека websockets.\n"
+           "Открой терминал в этой папке и выполни:  pip install websockets")
 
 try:
     import orjson
