@@ -17,5 +17,6 @@ env/
 # Runtime artifacts
 trades.csv
 *_trades.csv
+edge_*_paper.csv
 backtest_results.csv
 backtest_cache.json
