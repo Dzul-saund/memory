@@ -282,6 +282,42 @@ cumulative_pnl, balance_after
 
 ---
 
+## Edge Bot (paper measurement — combines both monitors)
+
+`edge_bot.py` ties the two monitors together and **measures, without risking
+money**, whether the "buy the stale quote" idea actually pays from your
+location. It imports the price bot (`fast_monitor`) and the book bot
+(`book_monitor`) unchanged and runs both feeds in one process.
+
+Each tick it compares the **fair value** of UP/DOWN — `Φ(diff/(σ√t))` from the
+price bot, measured against the exact Polymarket round target — with the **live
+best ask** from the book bot. When a side's fair value exceeds its ask by more
+than the edge threshold *and that edge is fresh* (it just opened after a BTC
+move, not a stale model-vs-market disagreement), it opens a **paper** position.
+
+It honestly models the race that decides profitability:
+
+* on a signal, the fill is checked `--order-latency-ms` later — if the quote is
+  gone by then, it's a **miss** (the market maker cancelled first); only if the
+  size survives do you fill;
+* set `--order-latency-ms` to your real order latency (home ~150-250ms, VPS
+  us-east ~20-50ms) and the paper results become a prediction of live results.
+
+Every signal, fill/miss and exit is written to `edge_<coin>_paper.csv`. Run it
+a week, then read the CSV: fill rate and cumulative P&L answer the question
+definitively. No real orders are ever sent.
+
+```bash
+pip install websockets          # orjson optional (faster)
+python edge_bot.py --coin btc --order-latency-ms 200
+```
+
+Guards against false edges: a warmup period (σ/offsets settle), both books must
+have a snapshot, and the freshness filter rejects persistent gaps (which are
+usually the model being wrong, not a real stale quote).
+
+---
+
 ## Fast Monitor (standalone, 5 coins)
 
 `fast_monitor.py` is a standalone real-time price monitor that runs AHEAD of
