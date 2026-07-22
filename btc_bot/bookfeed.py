@@ -35,6 +35,14 @@ try:  # optional dependency — the bot still runs (on HTTP) without it
 except Exception:  # pragma: no cover
     websocket = None
 
+# orjson (необязателен): разбор сообщений в ~5-10 раз быстрее stdlib.
+try:
+    import orjson
+    _loads = orjson.loads
+except Exception:  # noqa: BLE001
+    _loads = json.loads
+
+
 CLOB_MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # Connection considered dead if nothing (incl. PONGs) arrived for this long.
@@ -165,7 +173,7 @@ class MarketBookFeed:
         if not raw.startswith(("{", "[")):
             return   # PONG / keepalive text
         try:
-            data = json.loads(raw)
+            data = _loads(raw)
         except Exception:  # noqa: BLE001
             return
         events = data if isinstance(data, list) else [data]

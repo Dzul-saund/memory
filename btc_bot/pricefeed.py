@@ -39,6 +39,14 @@ try:  # optional dependency — the bot still runs (on spot) without it
 except Exception:  # pragma: no cover
     websocket = None
 
+# orjson (необязателен): разбор сообщений в ~5-10 раз быстрее stdlib.
+try:
+    import orjson
+    _loads = orjson.loads
+except Exception:  # noqa: BLE001
+    _loads = json.loads
+
+
 LIVE_DATA_WS = "wss://ws-live-data.polymarket.com"
 
 
@@ -105,7 +113,7 @@ class ChainlinkPriceFeed:
         if not raw or not raw.startswith("{"):
             return
         try:
-            d = json.loads(raw)
+            d = _loads(raw)
         except Exception:  # noqa: BLE001
             return
         payload = d.get("payload") or {}

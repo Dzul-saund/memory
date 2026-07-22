@@ -88,6 +88,15 @@ def main(argv=None) -> int:
         print(exc, file=sys.stderr)
         return 2
 
+    # Тюнинг сборщика мусора: без редких пауз в несколько мс.
+    import gc
+    gc.collect()
+    try:
+        gc.freeze()
+    except Exception:
+        pass
+    gc.set_threshold(50000, 100, 100)
+
     bot = Bot(cfg)
     try:
         if args.setup_allowances:

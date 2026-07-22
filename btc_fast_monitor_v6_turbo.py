@@ -50,6 +50,20 @@ try:
 except ImportError:
     raise SystemExit("Установите зависимость:  pip install websockets")
 
+# --- необязательные ускорители (ставятся сами, без них всё работает) ---------
+# orjson: разбор JSON в ~5-10 раз быстрее (Rust).  pip install orjson
+try:
+    import orjson
+    loads = orjson.loads
+except Exception:  # noqa: BLE001
+    loads = json.loads
+# uvloop: движок asyncio в 2-4 раза быстрее (только Linux/VPS). pip install uvloop
+try:
+    import uvloop
+    uvloop.install()
+except Exception:  # noqa: BLE001
+    pass
+
 # ------------------------- состояние -------------------------
 
 USD_SOURCES = ("coinbase", "kraken", "bitstamp", "pyth")  # формируют якорь
@@ -114,7 +128,7 @@ async def coinbase_ws():
                 await ws.send(sub)
                 out("[coinbase] подключено (BTC/USD, mid bid/ask)")
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("type") == "ticker":
                         bid, ask = d.get("best_bid"), d.get("best_ask")
                         if bid and ask:
@@ -139,7 +153,7 @@ async def kraken_ws():
                 await ws.send(sub)
                 out("[kraken] подключено (BTC/USD, bbo-триггер)")
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("channel") == "ticker" and d.get("data"):
                         t = d["data"][-1]
                         bid, ask = t.get("bid"), t.get("ask")
@@ -163,7 +177,7 @@ async def bitstamp_ws():
                 await ws.send(sub)
                 out("[bitstamp] подключено (BTC/USD, mid стакана)")
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("event") == "data":
                         data = d.get("data", {})
                         bids, asks = data.get("bids"), data.get("asks")
@@ -183,7 +197,7 @@ async def binance_ws():
                                           compression=None) as ws:
                 out("[binance] подключено (BTC/USDT bookTicker)")
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     bid, ask = d.get("b"), d.get("a")
                     if bid and ask:
                         set_price("binance", (float(bid) + float(ask)) / 2)
@@ -216,7 +230,7 @@ async def okx_ws():
                         continue
                     if msg == "pong":
                         continue
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("event") == "error":
                         raise RuntimeError(d.get("msg") or "subscribe error")
                     if d.get("arg", {}).get("channel") == channel \
@@ -257,7 +271,7 @@ async def bybit_ws():
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
                         continue
-                    d = json.loads(msg)
+                    d = loads(msg)
                     data = d.get("data")
                     if not (isinstance(data, dict) and d.get("topic", "")
                             .startswith("orderbook.1.")):
@@ -314,7 +328,7 @@ def _pyth_worker(loop):
                 if not line:
                     raise RuntimeError("поток закрыт")
                 if line.startswith(b"data:"):
-                    push(_pyth_parse(json.loads(line[5:])))
+                    push(_pyth_parse(loads(line[5:])))
                     sse_fails = 0
         except Exception as e:
             sse_fails += 1
@@ -326,7 +340,7 @@ def _pyth_worker(loop):
     while True:
         try:
             with urllib.request.urlopen(PYTH_LATEST, timeout=3) as r:
-                push(_pyth_parse(json.loads(r.read())))
+                push(_pyth_parse(loads(r.read())))
             if not announced:
                 out("[pyth] подключено (BTC/USD агрегат, опрос)")
                 announced = True
@@ -662,6 +676,14 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Тюнинг сборщика мусора: убрать редкие паузы в несколько мс
+    import gc
+    gc.collect()
+    try:
+        gc.freeze()
+    except Exception:
+        pass
+    gc.set_threshold(50000, 100, 100)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

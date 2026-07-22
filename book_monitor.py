@@ -66,6 +66,13 @@ except ImportError:
 
 # orjson (написан на Rust) разбирает JSON в ~5-10 раз быстрее стандартного.
 # Необязателен: без него работает stdlib. Установка:  pip install orjson
+# uvloop: движок asyncio в 2-4 раза быстрее (Linux/VPS).  pip install uvloop
+try:
+    import uvloop
+    uvloop.install()
+except Exception:  # noqa: BLE001
+    pass
+
 try:
     import orjson
     loads = orjson.loads

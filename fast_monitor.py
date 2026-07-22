@@ -93,6 +93,20 @@ try:
 except ImportError:
     raise SystemExit("Установите зависимость:  pip install websockets")
 
+# --- необязательные ускорители (ставятся сами, без них всё работает) ---------
+# orjson: разбор JSON в ~5-10 раз быстрее (Rust).  pip install orjson
+try:
+    import orjson
+    loads = orjson.loads
+except Exception:  # noqa: BLE001
+    loads = json.loads
+# uvloop: движок asyncio в 2-4 раза быстрее (только Linux/VPS). pip install uvloop
+try:
+    import uvloop
+    uvloop.install()
+except Exception:  # noqa: BLE001
+    pass
+
 # ------------------------- монеты -------------------------
 # Все идентификаторы проверены по API бирж; Pyth ID — из hermes.pyth.network.
 
@@ -280,7 +294,7 @@ async def polymarket_ws():
                     if not isinstance(raw, str) or not raw.startswith("{"):
                         continue
                     try:
-                        d = json.loads(raw)
+                        d = loads(raw)
                     except Exception:
                         continue
                     payload = d.get("payload") or {}
@@ -322,7 +336,7 @@ async def coinbase_ws():
                 out(f"[coinbase] подключено ({COIN['coinbase']}, микроцена)")
                 rc.ok()
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("type") == "ticker":
                         bid, ask = d.get("best_bid"), d.get("best_ask")
                         if bid and ask:
@@ -353,7 +367,7 @@ async def kraken_ws():
                 out(f"[kraken] подключено ({COIN['kraken']}, микроцена, bbo)")
                 rc.ok()
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("channel") == "ticker" and d.get("data"):
                         t = d["data"][-1]
                         bid, ask = t.get("bid"), t.get("ask")
@@ -379,7 +393,7 @@ async def bitstamp_ws():
                 out(f"[bitstamp] подключено ({COIN['bitstamp']}, микроцена)")
                 rc.ok()
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("event") == "data":
                         data = d.get("data", {})
                         bids, asks = data.get("bids"), data.get("asks")
@@ -405,7 +419,7 @@ async def binance_ws():
                     f"микроцена)")
                 rc.ok()
                 async for msg in ws:
-                    d = json.loads(msg)
+                    d = loads(msg)
                     bid, ask = d.get("b"), d.get("a")
                     if bid and ask:
                         set_price("binance", mid(bid, ask,
@@ -440,7 +454,7 @@ async def okx_ws():
                         continue
                     if msg == "pong":
                         continue
-                    d = json.loads(msg)
+                    d = loads(msg)
                     if d.get("event") == "error":
                         raise RuntimeError(d.get("msg") or "subscribe error")
                     if d.get("arg", {}).get("channel") == channel \
@@ -485,7 +499,7 @@ async def bybit_ws():
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
                         continue
-                    d = json.loads(msg)
+                    d = loads(msg)
                     data = d.get("data")
                     if not (isinstance(data, dict) and d.get("topic", "")
                             .startswith("orderbook.1.")):
@@ -555,7 +569,7 @@ def _pyth_worker(loop):
                 if not line:
                     raise RuntimeError("поток закрыт")
                 if line.startswith(b"data:"):
-                    push(*_pyth_parse(json.loads(line[5:])))
+                    push(*_pyth_parse(loads(line[5:])))
                     sse_fails = 0
         except Exception as e:
             sse_fails += 1
@@ -567,7 +581,7 @@ def _pyth_worker(loop):
     while True:
         try:
             with urllib.request.urlopen(_pyth_latest_url(), timeout=3) as r:
-                push(*_pyth_parse(json.loads(r.read())))
+                push(*_pyth_parse(loads(r.read())))
             if not announced:
                 out(f"[pyth] подключено ({COIN['name']}/USD агрегат, опрос)")
                 announced = True
@@ -620,7 +634,7 @@ def _fetch_official_target(start_ts):
            f"?symbol={COIN['name']}&eventStartTime={iso}&variant=fiveminute")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=4) as r:
-        d = json.loads(r.read())
+        d = loads(r.read())
     op = d.get("openPrice")
     return float(op) if op is not None else None
 
@@ -1040,6 +1054,14 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Тюнинг сборщика мусора: убрать редкие паузы в несколько мс
+    import gc
+    gc.collect()
+    try:
+        gc.freeze()
+    except Exception:
+        pass
+    gc.set_threshold(50000, 100, 100)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
