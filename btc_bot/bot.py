@@ -276,6 +276,13 @@ class Bot:
         self.bought_this_window = False
         self.price_history.clear()   # a new window means new tokens/prices
         self.data.watch_market_books(market)   # re-point the live book feed
+        # Pre-sign this window's BUY orders in the background so the eventual
+        # order send is just a POST (no signing / metadata fetch on the hot
+        # path). No-op in dry-run. Covers the whole price band for both sides.
+        self.trader.presign_window(
+            [market.token_up, market.token_down],
+            self.cfg.price_min, self.cfg.price_max, self.cfg.trade_size_usdc,
+        )
         # Read the EXACT target (window open price) from Polymarket's own feed;
         # fall back to Coinbase spot only if that call fails. _refresh_strike
         # keeps trying each tick until the exact value is in hand.

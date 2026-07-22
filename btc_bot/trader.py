@@ -59,7 +59,51 @@ class LiveTrader:
         self.client = client
         self.cfg = cfg
         self.log = logger
+        # Предподписанные BUY-ордера: (token, цена_2зн, размер) -> signed.
+        # Подпись (create_order) — самая медленная часть отправки (~5мс
+        # ECDSA + при первом ордере на токен ещё и сетевые запросы neg_risk
+        # /tick_size на ~100-300мс). Готовим их в фоне на старте окна, чтобы
+        # в момент решения осталась только мгновенная post_order (отправка).
+        self._presigned = {}
+        self._presign_lock = threading.Lock()
         self._start_http_keepalive()
+
+    # -- предподписание -----------------------------------------------------
+    def presign_window(self, tokens, price_min, price_max, trade_size):
+        """Фоново заготовить подписанные BUY-ордера на все цены полосы для
+        токенов текущего окна. FAK-ордера с expiration=0 не протухают, так
+        что подпись в начале окна годна до самого конца."""
+        if not getattr(self.cfg, "presign_enabled", True):
+            return
+        cents = range(int(round(price_min * 100)), int(round(price_max * 100)) + 1)
+        jobs = [(str(tok), c / 100.0) for tok in tokens if tok for c in cents]
+
+        def _work():
+            fresh = {}
+            for token_id, price in jobs:
+                size = float(int(trade_size / price))
+                if size <= 0:
+                    continue
+                try:
+                    signed = self._build_signed(token_id, price, size, "BUY")
+                except Exception as exc:  # noqa: BLE001 - не мешать торговле
+                    self.log.debug("presign %s@%.2f failed: %s",
+                                   token_id[:8], price, exc)
+                    continue
+                fresh[(token_id, round(price, 2), size)] = signed
+            with self._presign_lock:
+                self._presigned = fresh
+            if fresh:
+                self.log.info("Pre-signed %d BUY orders for this window "
+                              "(order send is now just a POST).", len(fresh))
+
+        threading.Thread(target=_work, name="presign", daemon=True).start()
+
+    def _build_signed(self, token_id, price, size, side):
+        from py_clob_client_v2.clob_types import OrderArgsV2
+        order = OrderArgsV2(token_id=token_id, price=round(price, 2),
+                            size=round(size, 2), side=side)
+        return self.client.create_order(order)
 
     def _start_http_keepalive(self) -> None:
         """Keep the CLOB HTTP/2 connection pool warm.
@@ -125,6 +169,18 @@ class LiveTrader:
         """
         from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
 
+        order_type = OrderType.GTC if resting else OrderType.FAK
+
+        # Быстрый путь: заранее подписанный FAK-ордер на ровно эти
+        # (токен, цена, размер) — отправляем без подписи. Только точное
+        # совпадение; иначе (и для resting) — обычная подпись на месте.
+        if not resting:
+            key = (str(token_id), round(price, 2), float(int(round(size))))
+            with self._presign_lock:
+                signed = self._presigned.pop(key, None)  # разово: salt не повтор
+            if signed is not None:
+                return self.client.post_order(signed, order_type)
+
         order = OrderArgsV2(
             token_id=token_id,
             price=round(price, 2),
@@ -132,7 +188,6 @@ class LiveTrader:
             side="BUY",
         )
         signed = self.client.create_order(order)
-        order_type = OrderType.GTC if resting else OrderType.FAK
         return self.client.post_order(signed, order_type)
 
     def sell(self, token_id: str, price: float, size: float, resting: bool = False):
@@ -227,6 +282,9 @@ class DryRunTrader:
 
     def setup_allowances(self):
         return {"dry_run": True, "status": "noop"}
+
+    def presign_window(self, *args, **kwargs):
+        return None   # в dry-run подписывать нечего
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,10 @@ class Config:
     # `websocket-client`; falls back to HTTP automatically when unavailable.
     book_feed_enabled: bool = True
     book_ws: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    # Предподписывать BUY-ордера в фоне на старте окна: в момент решения
+    # отправка ордера — только POST, без ~5мс подписи и без разовых
+    # сетевых запросов neg_risk/tick_size на горячем пути. Только live.
+    presign_enabled: bool = True
     # How long a fetched balance stays fresh. The balance only changes when WE
     # trade (the bot refreshes it immediately after every order), so there is
     # no need to ask the exchange every tick.
@@ -182,6 +186,7 @@ class Config:
             model_vol_lookback_seconds=_f("MODEL_VOL_LOOKBACK_SECONDS", 120.0),
             model_strict=_b("MODEL_STRICT", True),
             book_feed_enabled=_b("BOOK_FEED_ENABLED", True),
+            presign_enabled=_b("PRESIGN_ENABLED", True),
             book_ws=_s(
                 "BOOK_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
             ),
