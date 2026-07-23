@@ -58,6 +58,12 @@ Chainlink, который взвешен к крупным объёмам. От�
      три фида с задержкой ≤40мс (Binance, Bybit, OKX tbt), можно доверять
      самым свежим цитатам сильнее.
 
+  8. CONNECTION DIVERSITY (--dupe, по умолч. 2). К каждой бирже открывается
+     несколько параллельных соединений; тик берётся из того, что пришёл
+     первым. Две независимые TCP-сессии почти никогда не тормозят вместе,
+     поэтому самый первый тик движения ловится раньше — срезаются
+     хвостовые задержки добычи. + orjson/uvloop/GC-тюнинг (ставятся сами).
+
 Всё остальное — из v7: 5 монет (--coin btc|eth|sol|xrp|doge), Bybit,
 двухслойная цена (якорь + быстрый слой), наукаст nc=, σ, P(UP)-сигнал,
 меню при запуске двойным кликом, переподключения без спама.
@@ -605,19 +611,29 @@ pyth_poll = pyth_feed          # совместимость со старым и
 
 
 def feed_tasks(no_pyth=False, no_binance=False, no_okx=False, no_bybit=False,
-               no_pm=False):
-    """Все фоновые задачи ценовых фидов (для импорта ботом)."""
-    tasks = [coinbase_ws(), kraken_ws(), bitstamp_ws()]
+               no_pm=False, dupe=1):
+    """Все фоновые задачи ценовых фидов (для импорта ботом).
+
+    dupe = сколько ПАРАЛЛЕЛЬНЫХ соединений открывать к каждому потоковому
+    источнику (connection diversity). Две независимые TCP-сессии почти
+    никогда не тормозят одновременно, поэтому самый первый тик движения
+    приходит по той, что оказалась быстрее в этот миг — это срезает
+    хвостовые задержки добычи. set_price идемпотентен (та же цена дважды =
+    безвредно), так что дубли просто ускоряют, не искажая данные.
+    """
+    dupe = max(1, int(dupe))
+    ws_feeds = [coinbase_ws, kraken_ws, bitstamp_ws]
     if not no_pm:
-        tasks.append(polymarket_ws())
+        ws_feeds.append(polymarket_ws)
     if not no_binance:
-        tasks.append(binance_ws())
+        ws_feeds.append(binance_ws)
     if not no_okx:
-        tasks.append(okx_ws())
+        ws_feeds.append(okx_ws)
     if not no_bybit:
-        tasks.append(bybit_ws())
+        ws_feeds.append(bybit_ws)
+    tasks = [f() for f in ws_feeds for _ in range(dupe)]
     if not no_pyth:
-        tasks.append(pyth_feed())
+        tasks.append(pyth_feed())   # Pyth — поток в отдельном треде, 1 хватает
     return tasks
 
 
@@ -1027,6 +1043,9 @@ async def main():
     ap.add_argument("--no-polymarket", action="store_true",
                     help="не использовать поток Polymarket как якорь "
                          "(откат на USD-медиану, поведение v8)")
+    ap.add_argument("--dupe", type=int, default=2, choices=(1, 2, 3),
+                    help="параллельных соединений к каждому источнику; тик "
+                         "берётся из того, что пришёл первым (по умолч. 2)")
     args = ap.parse_args()
 
     # Запуск двойным кликом (без --coin в командной строке): спросить меню
@@ -1043,10 +1062,13 @@ async def main():
     COIN = COINS[args.coin]
     out(f"=== Fast Monitor v9 — {COIN['name']}/USD ===")
 
+    if args.dupe > 1:
+        out(f"connection diversity: {args.dupe} параллельных соединения к "
+            f"каждой бирже — тик берётся из самого быстрого")
     tasks = [monitor(args),
              *feed_tasks(no_pyth=args.no_pyth, no_binance=args.no_binance,
                          no_okx=args.no_okx, no_bybit=args.no_bybit,
-                         no_pm=args.no_polymarket)]
+                         no_pm=args.no_polymarket, dupe=args.dupe)]
     # точная цель с Polymarket — всегда, кроме ручного --target
     if args.target is None:
         tasks.append(official_target_task(args.round_minutes, COIN["dp"]))
