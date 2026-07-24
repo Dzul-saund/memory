@@ -507,14 +507,28 @@ async def combine(args, book: BookState):
             trader.summary()
 
 
+def _price_feed_tasks(args):
+    """Запустить ценовые фиды, передав только те параметры, которые
+    поддерживает ИМЕННО ТВОЙ fast_monitor (у старых версий нет dupe/no_pm)."""
+    import inspect
+    want = {"no_pyth": args.no_pyth, "no_binance": args.no_binance,
+            "no_okx": args.no_okx, "no_bybit": args.no_bybit,
+            "no_pm": args.no_polymarket, "dupe": args.dupe}
+    try:
+        supported = set(inspect.signature(fm.feed_tasks).parameters)
+    except (TypeError, ValueError):
+        supported = set()
+    kwargs = {k: v for k, v in want.items() if k in supported}
+    return fm.feed_tasks(**kwargs)
+
+
 async def main_async(args):
     fm.COIN = fm.COINS[args.coin]
+    book = BookState()
     tasks = [
-        combine(args, (book := BookState())),
+        combine(args, book),
         book_feed(book, args.coin, args.connections),
-        *fm.feed_tasks(no_pyth=args.no_pyth, no_binance=args.no_binance,
-                       no_okx=args.no_okx, no_bybit=args.no_bybit,
-                       no_pm=args.no_polymarket, dupe=args.dupe),
+        *_price_feed_tasks(args),
     ]
     await asyncio.gather(*tasks)
 
