@@ -51,7 +51,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(message)s",
+        # .%(msecs)03d добавляет миллисекунды ко времени каждой строки лога
+        format="%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
 
