@@ -4,7 +4,7 @@
 Открывается ОДНО окно, разделённое на три панели (как тайловый терминал):
 
   ┌───────────────────────────┬───────────────────────────┐
-  │ 1. ТРЕЙДЕР (run.py)       │ 2. ЦЕНА (fast_monitor)    │
+  │ 1. POLYMARKET (pm_view)   │ 2. ЦЕНА (fast_monitor)    │
   │    решения, позиция,      ├───────────────────────────┤
   │    баланс                 │ 3. КНИГА (book_monitor)   │
   └───────────────────────────┴───────────────────────────┘
@@ -29,6 +29,7 @@
     python dashboard.py                  # btc, трейдер в dry-run
     python dashboard.py --coin eth       # другая монета во всех трёх
     python dashboard.py --no-trader      # только два монитора
+    python dashboard.py --trader-bot     # вместо зеркала — торговый бот run.py
     python dashboard.py --live           # трейдер реальными деньгами
     python dashboard.py --layout grid    # другая раскладка панелей
 Клавиши: q или Ctrl-C — выход;  1/2/3 — развернуть панель на весь экран;
@@ -291,12 +292,14 @@ class Shared:
             pup = f"P(UP) {self.pup or '—'}%"
             up = f"Up {self.up_bid or '—'}/{self.up_ask or '—'}"
             dn = f"Down {self.dn_bid or '—'}/{self.dn_ask or '—'}"
-            bal = f"bal ${self.bal or '—'}"
-            pos = f"куплено:{self.bought or '—'}"
+            has_trader = self.bal is not None or self.bought is not None
+            bal = f"bal ${self.bal}" if self.bal is not None else ""
+            pos = f"куплено:{self.bought}" if self.bought is not None else ""
             sig = f" СИГНАЛ:{self.signal}" if self.signal else ""
             trd = f" | сделка {self.last_trade}" if self.last_trade else ""
-        s = (f" {p} │ {tgt} │ ост {left} │ {pup} │ {up}  {dn} │ "
-             f"{bal} {pos}{sig}{trd}")
+        tail = f" │ {bal} {pos}".rstrip() if (bal or pos) else ""
+        s = (f" {p} │ {tgt} │ ост {left} │ {pup} │ {up}  {dn}"
+             f"{tail}{sig}{trd}")
         return s[:width].ljust(width)
 
 
@@ -476,12 +479,21 @@ def parse_env_file(path: str) -> dict:
     return env
 
 
+TRADER_BOT = False   # --trader-bot: вернуть старую панель run.py
+
+
 def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int):
     price = Pane("price", f"ЦЕНА — fast_monitor ({coin.upper()})",
                  [PY, "-u", "fast_monitor.py", "--coin", coin, "--auto-target"],
                  None, PANE_COLORS[0])
     trader = None
-    if include_trader:
+    if include_trader and not TRADER_BOT:
+        # ЗЕРКАЛО POLYMARKET: цена, Целевая цена и UP/DOWN в центах ровно
+        # как на сайте. Никакой торговли и никакой симуляции — только показ.
+        trader = Pane("market", f"POLYMARKET — рынок как на сайте ({coin.upper()})",
+                      [PY, "-u", "pm_view.py", "--coin", coin,
+                       "--depth", str(book_depth)], None, PANE_COLORS[1])
+    elif include_trader:
         argv = [PY, "-u", "run.py"]
         env = None
         preset = PRESETS.get(coin)
@@ -519,6 +531,8 @@ def main(argv=None) -> int:
                       help="трейдер в симуляции (по умолчанию)")
     mode.add_argument("--live", action="store_true",
                       help="трейдер реальными деньгами (нужны креды)")
+    ap.add_argument("--trader-bot", action="store_true",
+                    help="в первой панели показать торговый бот run.py вместо зеркала Polymarket")
     ap.add_argument("--no-trader", action="store_true",
                     help="только два монитора (цена + книга)")
     ap.add_argument("--layout", choices=["columns", "grid"], default="columns",
@@ -534,6 +548,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     enable_windows_vt()
+    global TRADER_BOT
+    TRADER_BOT = args.trader_bot
     panes = build_panes(args.coin, args.live, not args.no_trader,
                         args.book_depth)
 
