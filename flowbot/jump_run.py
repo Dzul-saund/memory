@@ -59,6 +59,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--ping-ms", type=float,
                    help="задать RTT вручную, мс (иначе меряем; ориентир 90)")
     p.add_argument("--hours", type=float, help="сколько работать, часов (деф. 24)")
+    p.add_argument("--record", metavar="FILE",
+                   help="писать всё, что видит бот, в JSONL — потом прогнать "
+                        "через replay.py и подобрать пороги на реальной истории")
     p.add_argument("--env-file", help="загрузить пресет .env (перекрывает .env)")
     p.add_argument("--allow-multiple", action="store_true",
                    help="разрешить вторую копию на той же монете (по умолчанию "
@@ -113,6 +116,8 @@ def main(argv=None) -> int:
         cfg.jump_max_ladder_legs = args.max_legs
     if args.no_ladder:
         cfg.jump_ladder_enabled = False
+    if args.record:
+        cfg.record_path = args.record
     if args.ping_ms is not None:
         cfg.ping_ms = args.ping_ms
     if args.hours is not None:

@@ -200,6 +200,9 @@ class FlowConfig:
     tick_max_wait_seconds: float = 0.2      # запасной такт, если книга молчит
     max_consecutive_errors: int = 12
     trade_log_csv: str = "flowbot_trades.csv"   # "" отключает
+    # Запись всего, что видел бот, в JSONL — сырьё для проигрывания и подбора
+    # порогов на РЕАЛЬНОЙ истории вместо догадок. "" отключает.
+    record_path: str = ""
 
     # --- фиды ----------------------------------------------------------------
     no_pyth: bool = False
@@ -278,6 +281,7 @@ class FlowConfig:
                 "flowbot_trades.csv" if os.getenv("FLOW_TRADE_LOG_CSV") is None
                 else os.getenv("FLOW_TRADE_LOG_CSV").strip()
             ),
+            record_path=(_s("JUMP_RECORD_PATH", "") or ""),
             no_pyth=_b("FLOW_NO_PYTH", False),
             no_binance=_b("FLOW_NO_BINANCE", False),
             no_okx=_b("FLOW_NO_OKX", False),

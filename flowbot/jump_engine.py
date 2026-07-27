@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import List, Optional
@@ -43,6 +44,10 @@ class JumpEngine(FlowEngine):
         self._window_key: Optional[float] = None
         self._round_pnl = 0.0
         self.rounds = 0
+        self._rec = None
+        if cfg.record_path:
+            self._rec = open(cfg.record_path, "a", encoding="utf-8")
+            self.log.info("запись рынка: %s", cfg.record_path)
 
     # ======================================================================
     #  Фоновые задачи: сверх фидов нужен ещё таргет раунда
@@ -115,6 +120,7 @@ class JumpEngine(FlowEngine):
         for leg in self.legs:
             leg["last_bid"] = ub if leg["outcome"] == "Up" else db
 
+        self._record(snap)
         action = self.strategy.on_tick(snap)
         self._log_status(snap, action)
 
@@ -247,6 +253,7 @@ class JumpEngine(FlowEngine):
         # ушёл к 1.0, и есть победитель раунда.
         winner = self._winning_side()
         resolved = self._book_resolved()
+        self._record_settle(winner, resolved)
         if not resolved:
             # Книга не схлопнулась: например Up 0.62 / Down 0.35. Объявлять по
             # ней победителя нельзя — это ставка 62/38, а не факт. Считаем ноги
@@ -290,6 +297,46 @@ class JumpEngine(FlowEngine):
         self.legs = []
         self.strategy.reset_round()
         self._round_pnl = 0.0
+
+    # ======================================================================
+    #  Запись всего, что видел бот (сырьё для проигрывания)
+    # ======================================================================
+    def _record(self, snap: JumpSnapshot) -> None:
+        """Одна строка JSONL на такт — ровно тот снимок, что видит стратегия.
+
+        Это и есть «память» системы: по такой записи можно потом прогнать
+        ЛЮБЫЕ пороги на реальной истории вместо того, чтобы подбирать их на
+        глаз по десятку сделок. Пишем только то, что реально было известно в
+        этот момент — никакого заглядывания вперёд.
+        """
+        if not self._rec:
+            return
+        try:
+            self._rec.write(json.dumps({
+                "t": round(snap.t, 3), "slug": (self.market or {}).get("slug"),
+                "left": round(snap.seconds_left, 2),
+                "price": snap.coin_price, "target": snap.target,
+                "jump": round(snap.jump_usd, 4), "sigma": snap.sigma_1s,
+                "ub": snap.up_bid, "ua": snap.up_ask,
+                "db": snap.down_bid, "da": snap.down_ask,
+                "uf": round(snap.up_flow, 3), "df": round(snap.down_flow, 3),
+            }, separators=(",", ":")) + "\n")
+        except Exception:  # noqa: BLE001 - запись не должна ронять торговлю
+            pass
+
+    def _record_settle(self, winner: Optional[str], resolved: bool) -> None:
+        """Итог раунда — без него проигрывание не знает, кто выиграл."""
+        if not self._rec:
+            return
+        try:
+            self._rec.write(json.dumps({
+                "type": "settle", "slug": (self.market or {}).get("slug"),
+                "winner": winner, "resolved": resolved,
+                "t": round(time.time(), 3),
+            }, separators=(",", ":")) + "\n")
+            self._rec.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- ждём, пока книга схлопнется к 0/1 ------------------------------------
     def _stream_deadline(self, end_ts: float) -> float:
@@ -408,6 +455,12 @@ class JumpEngine(FlowEngine):
         self.log.info("=" * 72)
 
     def _summary(self) -> None:
+        if self._rec:
+            try:
+                self._rec.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._rec = None
         self.log.info("=" * 72)
         self.log.info("скачковая система остановлена: %s",
                       self.stop_reason or "—")
