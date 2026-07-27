@@ -1,39 +1,50 @@
 #!/usr/bin/env python3
-"""dashboard.py — ОДНО окно, ТРИ монитора. Единая система.
+"""dashboard.py — ОДНО окно, ЧЕТЫРЕ системы. Единый организм.
 
-Открывается ОДНО окно, разделённое на три панели (как тайловый терминал):
+Открывается ОДНО окно, разделённое на панели (как тайловый терминал):
 
   ┌───────────────────────────┬───────────────────────────┐
   │ 1. POLYMARKET (pm_view)   │ 2. ЦЕНА (fast_monitor)    │
-  │    решения, позиция,      ├───────────────────────────┤
-  │    баланс                 │ 3. КНИГА (book_monitor)   │
-  └───────────────────────────┴───────────────────────────┘
-  ▏ОБЩЕЕ СОСТОЯНИЕ: BTC … цель … diff … | Up …/… Down …/… | bal … ▕
+  │    цены как на сайте      ├───────────────────────────┤
+  │                           │ 3. КНИГА (book_monitor)   │
+  ├───────────────────────────┴───────────────────────────┤
+  │ 4. СКАЧКОВАЯ СИСТЕМА (jump_trader) — сделки           │
+  └───────────────────────────────────────────────────────┘
+  ▏ОБЩЕЕ СОСТОЯНИЕ: BTC … цель … diff … | Up …/… Down …/… | поз … P&L … ▕
+
+Первые три панели — ПОКАЗЫВАЮТ. Четвёртая — ТОРГУЕТ: она подключена к тем же
+данным, что и остальные три (цена из fast_monitor, книга из book_monitor,
+таргет раунда с Polymarket), и на резком скачке цены сама открывает сделку.
+По умолчанию — dry-run (симуляция, без реальных ордеров); реальные ордера
+только с --live. Правила сделок — в JUMP.md.
 
 ╔══ ПОЧЕМУ СКОРОСТЬ И ТОЧНОСТЬ НЕ ПОСТРАДАЛИ ══════════════════════════════╗
-║ Три системы остаются ОТДЕЛЬНЫМИ процессами ОС — их код не изменён и НЕ   ║
-║ слит в общий цикл. Мы лишь читаем их вывод через каналы (pipe) и рисуем  ║
-║ в трёх панелях одного окна. Приём данных с бирж и книги идёт в их        ║
-║ собственных процессах ровно с той же скоростью; отрисовка живёт в ЭТОМ   ║
-║ процессе и на них не влияет вообще.                                      ║
+║ Системы остаются ОТДЕЛЬНЫМИ процессами ОС — их код не изменён и НЕ слит  ║
+║ в общий цикл. Мы лишь читаем их вывод через каналы (pipe) и рисуем в     ║
+║ панелях одного окна. Приём данных с бирж и книги идёт в их собственных   ║
+║ процессах ровно с той же скоростью; отрисовка живёт в ЭТОМ процессе и на ║
+║ них не влияет вообще. Четвёртая система тоже держит СВОИ соединения с    ║
+║ биржами и книгой — она не ждёт, пока что-то отрисуется.                  ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
-Единый организм: один старт, ОДНА монета во всех трёх, общая строка
-состояния (собирается из всех трёх потоков), один выход (q или Ctrl-C
-гасит все три), авто-рестарт упавшей системы (--restart).
+Единый организм: один старт, ОДНА монета во всех, общая строка состояния
+(собирается из всех потоков), один выход (q или Ctrl-C гасит все),
+авто-рестарт упавшей системы (--restart).
 
 Требований нет — чистый Python (ANSI). Работает в Windows Terminal,
 в старом conhost (Win10+), в Linux/macOS-терминале и по SSH на VPS.
 
 Запуск:
-    python dashboard.py                  # btc, трейдер в dry-run
-    python dashboard.py --coin eth       # другая монета во всех трёх
-    python dashboard.py --no-trader      # только два монитора
-    python dashboard.py --trader-bot     # вместо зеркала — торговый бот run.py
-    python dashboard.py --live           # трейдер реальными деньгами
+    python dashboard.py                  # btc, 4 панели, торговля в dry-run
+    python dashboard.py --coin eth       # другая монета во всех системах
+    python dashboard.py --no-jump        # только три монитора, без торговли
+    python dashboard.py --no-trader      # без зеркала Polymarket
+    python dashboard.py --trader-bot     # вместо зеркала — старый бот run.py
+    python dashboard.py --live           # РЕАЛЬНЫЕ деньги (нужны креды)
+    python dashboard.py --stake 2        # ставка скачковой системы, USDC
     python dashboard.py --layout grid    # другая раскладка панелей
-Клавиши: q или Ctrl-C — выход;  1/2/3 — развернуть панель на весь экран;
-         0 — вернуть три панели;  p — пауза прокрутки.
+Клавиши: q или Ctrl-C — выход;  1/2/3/4 — развернуть панель на весь экран;
+         0 — вернуть все панели;  p — пауза прокрутки.
 """
 from __future__ import annotations
 
@@ -66,8 +77,9 @@ HIDE_CUR = f"{ESC}[?25l"
 SHOW_CUR = f"{ESC}[?25h"
 CLEAR_ALL = f"{ESC}[2J"
 
-# цвета панелей (заголовок): цена — жёлтый, трейдер — зелёный, книга — голубой
-PANE_COLORS = [f"{ESC}[93m", f"{ESC}[92m", f"{ESC}[96m"]
+# цвета панелей (заголовок): цена — жёлтый, зеркало — зелёный, книга —
+# голубой, торгующая система — пурпурный (её видно сразу)
+PANE_COLORS = [f"{ESC}[93m", f"{ESC}[92m", f"{ESC}[96m", f"{ESC}[95m"]
 BORDER = f"{ESC}[90m"          # серые рамки
 STATUS_BG = f"{ESC}[44;97m"    # синяя строка состояния
 
@@ -220,6 +232,8 @@ class Shared:
         self.bal = self.bought = None
         self.signal = ""
         self.last_trade = ""
+        # 4-я система (скачковая): позиция, вложено за раунд, P&L, скачок
+        self.j_pos = self.j_spent = self.j_bal = self.j_pnl = self.j_jump = None
 
     # регулярки построены по реальному формату вывода трёх систем
     RE_PRICE = re.compile(r"BTC|ETH|SOL|XRP|DOGE")
@@ -237,6 +251,14 @@ class Shared:
     RE_TR_BOOK = re.compile(
         r"Up px=[\d.]+ \(bid ([\d.]+)/ask ([\d.]+)\).*?"
         r"Down px=[\d.]+ \(bid ([\d.]+)/ask ([\d.]+)\)")
+    # Строка состояния скачковой системы (jump_engine._log_status):
+    #   … | скачок +2.30$/3с | … | поз A0:Up@0.60×1.7 | вложено $1.00 | $99.00 | …
+    RE_J_JUMP = re.compile(r"скачок\s+([-+][\d.]+)\$")
+    # «вложено» бывает ОТРИЦАТЕЛЬНЫМ (раунд уже в плюсе) — минус обязателен
+    # в шаблоне, иначе строка не разберётся и в статусе застынут старые числа.
+    RE_J_POS = re.compile(
+        r"\|\s*поз\s+(.+?)\s*\|\s*вложено\s+\$(-?[\d.]+)\s*\|\s*\$(-?[\d.]+)")
+    RE_J_PNL = re.compile(r"итого\s+([-+][\d.]+)")
 
     def feed(self, key: str, line: str) -> None:
         try:
@@ -279,6 +301,17 @@ class Shared:
                     if m and self.up_bid is None:
                         self.up_bid, self.up_ask = m.group(1), m.group(2)
                         self.dn_bid, self.dn_ask = m.group(3), m.group(4)
+                elif key == "jump":
+                    m = self.RE_J_JUMP.search(line)
+                    if m:
+                        self.j_jump = m.group(1)
+                    m = self.RE_J_POS.search(line)
+                    if m:
+                        self.j_pos = m.group(1)
+                        self.j_spent, self.j_bal = m.group(2), m.group(3)
+                    m = self.RE_J_PNL.search(line)
+                    if m:
+                        self.j_pnl = m.group(1)
         except Exception:  # noqa: BLE001 - сводка не должна ломать приём
             pass
 
@@ -292,14 +325,26 @@ class Shared:
             pup = f"P(UP) {self.pup or '—'}%"
             up = f"Up {self.up_bid or '—'}/{self.up_ask or '—'}"
             dn = f"Down {self.dn_bid or '—'}/{self.dn_ask or '—'}"
-            has_trader = self.bal is not None or self.bought is not None
             bal = f"bal ${self.bal}" if self.bal is not None else ""
             pos = f"куплено:{self.bought}" if self.bought is not None else ""
             sig = f" СИГНАЛ:{self.signal}" if self.signal else ""
             trd = f" | сделка {self.last_trade}" if self.last_trade else ""
+            # Хвост от торгующей системы: что держим, сколько вложено, итог.
+            jump = []
+            if self.j_jump is not None:
+                jump.append(f"скачок {self.j_jump}$")
+            if self.j_pos is not None:
+                jump.append(f"поз {self.j_pos}")
+            if self.j_spent not in (None, "0.00") and not self.j_spent.startswith("-"):
+                jump.append(f"влож ${self.j_spent}")
+            if self.j_pnl is not None:
+                jump.append(f"P&L {self.j_pnl}")
+            if self.j_bal is not None:
+                jump.append(f"${self.j_bal}")
+            jtail = f" │ {' '.join(jump)}" if jump else ""
         tail = f" │ {bal} {pos}".rstrip() if (bal or pos) else ""
         s = (f" {p} │ {tgt} │ ост {left} │ {pup} │ {up}  {dn}"
-             f"{tail}{sig}{trd}")
+             f"{tail}{sig}{trd}{jtail}")
         return s[:width].ljust(width)
 
 
@@ -320,18 +365,39 @@ def layout_rects(n: int, w: int, h: int, mode: str, zoom: int):
     if n == 2:
         lw = w // 2
         return [(1, 1, body_h, lw), (1, lw + 1, body_h, w - lw)]
-    if mode == "grid":                         # 2 сверху, 1 широкая снизу
+    if n == 3:
+        if mode == "grid":                     # 2 сверху, 1 широкая снизу
+            top_h = body_h // 2
+            lw = w // 2
+            return [(1, 1, top_h, lw), (1, lw + 1, top_h, w - lw),
+                    (top_h + 1, 1, body_h - top_h, w)]
+        # columns (по умолчанию, как на фото): слева высокая, справа две
+        lw = max(30, int(w * 0.5))
+        rw = w - lw
         top_h = body_h // 2
-        lw = w // 2
-        return [(1, 1, top_h, lw), (1, lw + 1, top_h, w - lw),
-                (top_h + 1, 1, body_h - top_h, w)]
-    # columns (по умолчанию, как на фото): слева высокая, справа две
+        return [(1, 1, body_h, lw),
+                (1, lw + 1, top_h, rw),
+                (top_h + 1, lw + 1, body_h - top_h, rw)]
+
+    # Четыре системы. Порядок прямоугольников совпадает с порядком панелей:
+    # [зеркало, цена, книга, торговля].
     lw = max(30, int(w * 0.5))
     rw = w - lw
-    top_h = body_h // 2
-    return [(1, 1, body_h, lw),
-            (1, lw + 1, top_h, rw),
-            (top_h + 1, lw + 1, body_h - top_h, rw)]
+    if mode == "grid":                         # честные 2x2
+        top_h = body_h // 2
+        bot_h = body_h - top_h
+        return [(1, 1, top_h, lw), (1, lw + 1, top_h, rw),
+                (top_h + 1, lw + 1, bot_h, rw), (top_h + 1, 1, bot_h, lw)]
+    # columns: сверху прежние три панели, торговля — широкой полосой внизу.
+    # Ей отдана треть высоты: решения и сделки печатаются длинными строками,
+    # и в узкой колонке их пришлось бы читать по два переноса на строку.
+    trade_h = max(6, body_h // 3)
+    top_h = body_h - trade_h
+    rt = top_h // 2
+    return [(1, 1, top_h, lw),
+            (1, lw + 1, rt, rw),
+            (rt + 1, lw + 1, top_h - rt, rw),
+            (top_h + 1, 1, trade_h, w)]
 
 
 def draw_pane(buf, pane: Pane, rect, idx: int, paused: bool):
@@ -482,7 +548,27 @@ def parse_env_file(path: str) -> dict:
 TRADER_BOT = False   # --trader-bot: вернуть старую панель run.py
 
 
-def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int):
+def build_jump_pane(coin: str, live: bool, stake, max_round) -> Pane:
+    """4-я система: скачковая лестница. Единственная, кто реально торгует.
+
+    Работает поверх тех же источников, что и первые три панели (фиды
+    fast_monitor, книга book_monitor, таргет раунда с Polymarket), но своим
+    процессом и своими соединениями — чтобы отрисовка окна не могла её
+    притормозить.
+    """
+    argv = [PY, "-u", "jump_trader.py", "--coin", coin]
+    argv += ["--live"] if live else ["--dry-run"]
+    if stake is not None:
+        argv += ["--stake", str(stake)]
+    if max_round is not None:
+        argv += ["--max-round", str(max_round)]
+    title = (f"СДЕЛКИ — скачковая система ({coin.upper()}, "
+             f"{'LIVE' if live else 'dry-run'})")
+    return Pane("jump", title, argv, None, PANE_COLORS[3])
+
+
+def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int,
+                include_jump: bool = True, stake=None, max_round=None):
     price = Pane("price", f"ЦЕНА — fast_monitor ({coin.upper()})",
                  [PY, "-u", "fast_monitor.py", "--coin", coin, "--auto-target"],
                  None, PANE_COLORS[0])
@@ -514,9 +600,12 @@ def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int):
     book = Pane("book", f"КНИГА — book_monitor ({coin.upper()})",
                 [PY, "-u", "book_monitor.py", "--coin", coin,
                  "--depth", str(book_depth)], None, PANE_COLORS[2])
-    # Порядок панелей: ТРЕЙДЕР — в большую левую, ЦЕНА — в правую верхнюю,
-    # КНИГА — в правую нижнюю. Цвет закреплён за системой, а не за местом.
+    # Порядок панелей: ЗЕРКАЛО — в большую левую, ЦЕНА — в правую верхнюю,
+    # КНИГА — в правую нижнюю, СДЕЛКИ — широкой полосой внизу. Цвет закреплён
+    # за системой, а не за местом.
     panes = [trader, price, book] if trader is not None else [price, book]
+    if include_jump:
+        panes.append(build_jump_pane(coin, live, stake, max_round))
     return panes
 
 
@@ -534,7 +623,14 @@ def main(argv=None) -> int:
     ap.add_argument("--trader-bot", action="store_true",
                     help="в первой панели показать торговый бот run.py вместо зеркала Polymarket")
     ap.add_argument("--no-trader", action="store_true",
-                    help="только два монитора (цена + книга)")
+                    help="убрать зеркало Polymarket (оставить цену + книгу)")
+    ap.add_argument("--no-jump", action="store_true",
+                    help="не запускать 4-ю (торгующую) систему — только показ")
+    ap.add_argument("--stake", type=float,
+                    help="ставка скачковой системы, USDC (по умолч. 1)")
+    ap.add_argument("--max-round", type=float,
+                    help="потолок вложений скачковой системы за раунд, USDC "
+                         "(по умолч. 25)")
     ap.add_argument("--layout", choices=["columns", "grid"], default="columns",
                     help="раскладка: columns (как на фото) или grid")
     ap.add_argument("--book-depth", type=int, default=1,
@@ -551,7 +647,8 @@ def main(argv=None) -> int:
     global TRADER_BOT
     TRADER_BOT = args.trader_bot
     panes = build_panes(args.coin, args.live, not args.no_trader,
-                        args.book_depth)
+                        args.book_depth, include_jump=not args.no_jump,
+                        stake=args.stake, max_round=args.max_round)
 
     # --- самопроверка раскладки без запуска процессов ---
     if args.selftest:
@@ -565,6 +662,11 @@ def main(argv=None) -> int:
         STATE.feed("book", "Δтоп   Up   bid 0.44×11  ask 0.45×35")
         STATE.feed("book", "Δтоп   Down bid 0.55×35  ask 0.56×11")
         STATE.feed("trader", "t-289s | bal $50.00 | bought=False")
+        STATE.feed("jump", "t-176s | BTC 63,976 цель 63,978 | скачок +6.40$/3с "
+                           "| Up 0.44/0.45 Down 0.55/0.56 | поз A0:Up@0.45×2.2 "
+                           "| вложено $1.00 | $99.00 | держу до расчёта")
+        STATE.feed("jump", "ПРОДАНО (фиксация) [#0] Up — P&L +0.31 "
+                           "(раунд +0.31, итого +0.31)")
         sys.stdout.write(CLEAR_ALL
                          + render(panes, args.coin, args.layout, 0, False, size)
                          + f"{at(size[1], 1)}\n")
@@ -590,7 +692,7 @@ def main(argv=None) -> int:
                 if ch:
                     if ch in ("q", "Q", "\x03"):
                         break
-                    if ch in "123" and int(ch) <= len(panes):
+                    if ch in "1234" and int(ch) <= len(panes):
                         zoom = 0 if zoom == int(ch) else int(ch)
                         sys.stdout.write(CLEAR_ALL)
                     elif ch == "0":
@@ -651,7 +753,7 @@ def main(argv=None) -> int:
                         pass
         sys.stdout.write(SHOW_CUR + ALT_OFF)
         sys.stdout.flush()
-        print("Все три системы остановлены.")
+        print(f"Все системы остановлены ({len(panes)}).")
     return rc
 
 

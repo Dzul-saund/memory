@@ -1,40 +1,45 @@
 #!/usr/bin/env python3
-"""launch_all.py — три системы в трёх окнах, но как ЕДИНЫЙ организм.
+"""launch_all.py — четыре системы в отдельных окнах, но как ЕДИНЫЙ организм.
 
-Одной командой открывает в ТРЁХ отдельных окнах/экранах, на ОДНОЙ монете:
+Одной командой открывает в отдельных окнах/экранах, на ОДНОЙ монете:
 
   1) fast_monitor.py  — цена монеты чуть раньше сайта (Бот 1)
   2) book_monitor.py  — книга заявок Up/Down (Бот 2)
   3) pm_view.py       — ЗЕРКАЛО POLYMARKET: цена, Целевая цена и UP/DOWN
                         в центах ровно как на сайте, БЕЗ торговли
                         (старый торговый бот run.py: флаг --trader-bot)
+  4) jump_trader.py   — СКАЧКОВАЯ СИСТЕМА: единственная, кто реально
+                        торгует. Подключена к тем же данным, что и первые
+                        три. По умолчанию dry-run; правила — в JUMP.md,
+                        выключить — флаг --no-jump.
 
 ╔══ ГЛАВНОЕ: скорость и точность НЕ трогаем ═══════════════════════════════╗
-║ Каждая из трёх — ОТДЕЛЬНЫЙ процесс операционной системы. Мы НИЧЕГО в них ║
-║ не меняем и НЕ сливаем в один цикл — просто запускаем вместе. Поэтому    ║
+║ Каждая — ОТДЕЛЬНЫЙ процесс операционной системы. Мы НИЧЕГО в них не      ║
+║ меняем и НЕ сливаем в один цикл — просто запускаем вместе. Поэтому       ║
 ║ каждая работает ровно так же быстро и точно, как если бы ты запустил её  ║
 ║ вручную в своём окне. Никакого общего event-loop, никакой конкуренции.   ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
-«Единый организм» = один старт, ОДНА монета во всех трёх, и согласованная
-остановка: Ctrl-C в этом окне гасит все три разом. С флагом --restart
+«Единый организм» = один старт, ОДНА монета во всех, и согласованная
+остановка: Ctrl-C в этом окне гасит все разом. С флагом --restart
 упавшую систему поднимаем автоматически (организм сам себя лечит).
 
-Три экрана — под твою платформу:
-  * Windows           — три отдельных консольных окна;
-  * Linux (VPS/Цюрих) — сессия tmux `polymarket` с тремя панелями
+Экраны — под твою платформу:
+  * Windows           — отдельные консольные окна;
+  * Linux (VPS/Цюрих) — сессия tmux `polymarket` с панелями
                         (подключиться: tmux attach -t polymarket);
-  * macOS             — три окна Terminal;
-  * запасной вариант  — фоновые процессы + три лог-файла в logs/.
+  * macOS             — окна Terminal;
+  * запасной вариант  — фоновые процессы + лог-файлы в logs/.
 
 Примеры:
-    python launch_all.py                     # btc, трейдер в dry-run, 3 окна
+    python launch_all.py                     # btc, торговля в dry-run
     python launch_all.py --coin eth          # то же для ETH (пресет bot2.env)
     python launch_all.py --restart           # + авто-подъём упавшей системы
-    python launch_all.py --no-trader         # только два монитора (просто смотреть)
-    python launch_all.py --trader-bot        # вместо зеркала — торговый бот run.py
-    python launch_all.py --trader-bot --live # трейдер реальными деньгами (нужны креды)
-    python launch_all.py --background         # без окон: фоном + логи в logs/
+    python launch_all.py --no-jump           # без торговли, только мониторы
+    python launch_all.py --no-trader         # без зеркала Polymarket
+    python launch_all.py --trader-bot        # вместо зеркала — старый бот run.py
+    python launch_all.py --live --stake 2    # РЕАЛЬНЫЕ деньги, ставка $2
+    python launch_all.py --background        # без окон: фоном + логи в logs/
 """
 from __future__ import annotations
 
@@ -61,7 +66,8 @@ PRESETS = {"btc": "bot1.env", "eth": "bot2.env",
 TRADER_BOT = False   # --trader-bot: вернуть старую панель run.py
 
 
-def build_commands(coin: str, live: bool, include_trader: bool):
+def build_commands(coin: str, live: bool, include_trader: bool,
+                   include_jump: bool = True, stake=None, max_round=None):
     """Список (title, argv, env_overrides|None) — по одному на окно."""
     cmds = [
         ("Fast Monitor — цена",
@@ -69,6 +75,16 @@ def build_commands(coin: str, live: bool, include_trader: bool):
         ("Book Monitor — книга",
          [PY, "book_monitor.py", "--coin", coin], None),
     ]
+    if include_jump:
+        # 4-я система — единственная, кто реально торгует (см. JUMP.md).
+        jargv = [PY, "jump_trader.py", "--coin", coin]
+        jargv += ["--live"] if live else ["--dry-run"]
+        if stake is not None:
+            jargv += ["--stake", str(stake)]
+        if max_round is not None:
+            jargv += ["--max-round", str(max_round)]
+        cmds.append((f"Сделки — скачковая система "
+                     f"({'LIVE' if live else 'dry-run'})", jargv, None))
     if include_trader:
         # Первая панель — ЗЕРКАЛО POLYMARKET (pm_view.py): цена, Целевая цена,
         # UP/DOWN в центах ровно как на сайте, из тех же источников. Никакой
@@ -300,6 +316,12 @@ def main(argv=None) -> int:
                          "run.py вместо зеркала Polymarket")
     ap.add_argument("--no-trader", action="store_true",
                     help="запустить только два монитора (просто смотреть)")
+    ap.add_argument("--no-jump", action="store_true",
+                    help="не запускать 4-ю (торгующую) систему — только показ")
+    ap.add_argument("--stake", type=float,
+                    help="ставка скачковой системы, USDC (по умолч. 1)")
+    ap.add_argument("--max-round", type=float,
+                    help="потолок вложений скачковой системы за раунд, USDC")
     ap.add_argument("--restart", action="store_true",
                     help="авто-подъём упавшей системы (организм лечит сам себя)")
     backend = ap.add_mutually_exclusive_group()
@@ -318,7 +340,9 @@ def main(argv=None) -> int:
     global TRADER_BOT
     TRADER_BOT = args.trader_bot
     cmds = build_commands(args.coin, live=args.live,
-                          include_trader=not args.no_trader)
+                          include_trader=not args.no_trader,
+                          include_jump=not args.no_jump,
+                          stake=args.stake, max_round=args.max_round)
 
     print(f"=== launch_all: {args.coin.upper()} | "
           f"{'ТОЛЬКО МОНИТОРЫ' if args.no_trader else ('LIVE' if args.live else 'dry-run')}"

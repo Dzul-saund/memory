@@ -1,6 +1,9 @@
-# Secrets — NEVER commit your private key / API creds
+# Secrets — NEVER commit your private key / API creds.
+# ЛЮБОЙ .env в этом проекте содержит поля PRIVATE_KEY / FUNDER, поэтому
+# игнорируем их все, а не по одному имени: новый пресет иначе однажды
+# уедет в историю git вместе с ключом, и оттуда его уже не стереть.
 .env
-bot*.env
+*.env
 *.env.local
 
 # Python
