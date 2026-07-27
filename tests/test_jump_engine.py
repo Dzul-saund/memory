@@ -332,6 +332,48 @@ def test_settle_pays_only_the_winning_side():
     asyncio.run(scenario())
 
 
+def test_book_resolved_only_when_one_side_converged():
+    eng, _ = _engine()
+    _book(eng, 0.62, 0.63, 0.35, 0.36)      # рынок ещё спорит
+    assert eng._book_resolved() is False
+    _book(eng, 0.99, 1.00, 0.00, 0.01)      # схлопнулась
+    assert eng._book_resolved() is True
+
+
+def test_unconverged_book_is_marked_unsettled_not_won():
+    """Книга Up 0.62 / Down 0.35 — это ставка 62/38, а не факт победы.
+
+    Раньше движок объявлял победителем сторону с большим бидом и записывал
+    выплату $1 за шэр. Теперь такие ноги закрываются по последней цене и
+    помечаются UNSETTLED.
+    """
+    async def scenario():
+        eng, cfg = _engine()
+        _set_target(65_000.0)
+        _book(eng, 0.59, 0.60, 0.40, 0.41)
+        _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
+        eng._tick()
+        await _drain(eng)
+        leg = eng.legs[0]
+
+        _book(eng, 0.62, 0.63, 0.35, 0.36)   # окно кончилось, но книга спорит
+        eng._tick()
+        await _drain(eng)
+        eng._settle_open_position("тест")
+
+        # P&L посчитан по рынку (0.62), а не как выигрыш $1/шэр
+        expected = round(leg["shares"] * 0.62, 2) - leg["cost"]
+        assert eng.realized_pnl == pytest.approx(expected, abs=0.02)
+        assert eng.realized_pnl < leg["shares"] - leg["cost"], \
+            "не должно быть выплаты как за выигранный раунд"
+    asyncio.run(scenario())
+
+
+def test_stream_deadline_waits_past_window_end():
+    eng, cfg = _engine()
+    assert eng._stream_deadline(1000.0) == 1000.0 + cfg.jump_settle_wait_s
+
+
 def test_settle_without_legs_is_noop():
     eng, _ = _engine()
     eng._settle_open_position("пусто")

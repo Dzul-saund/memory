@@ -159,12 +159,25 @@ class FlowEngine:
             str(market["up"])[:10], str(market["down"])[:10],
         )
 
+    def _stream_deadline(self, end_ts: float) -> float:
+        """До какого момента слушать книгу. По умолчанию — секунда после окна."""
+        return end_ts + 1.0
+
+    def _book_resolved(self) -> bool:
+        """Книга уже схлопнулась к 0/1 (победитель раунда очевиден)?
+
+        База не умеет этого определять и всегда слушает до дедлайна.
+        Подкласс может прервать ожидание раньше.
+        """
+        return False
+
     async def _stream_window(self, market: dict) -> None:
         end_ts = market["window_ts"] + WINDOW_SECONDS
+        deadline = self._stream_deadline(end_ts)
         sub = json.dumps({"assets_ids": [market["up"], market["down"]],
                           "type": "market"})
         backoff = 0.5
-        while time.time() < end_ts + 1 and not self._stop:
+        while time.time() < deadline and not self._stop:
             try:
                 async with websockets.connect(
                         CLOB_WS, compression=None, open_timeout=8,
@@ -172,7 +185,7 @@ class FlowEngine:
                     await ws.send(sub)
                     backoff = 0.5
                     last_ping = time.time()
-                    while time.time() < end_ts + 1 and not self._stop:
+                    while time.time() < deadline and not self._stop:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                         except asyncio.TimeoutError:
@@ -181,8 +194,12 @@ class FlowEngine:
                                 last_ping = time.time()
                             continue
                         self._ingest(raw)
+                        # Окно кончилось и книга уже показала победителя —
+                        # больше ждать нечего.
+                        if time.time() >= end_ts and self._book_resolved():
+                            return
             except Exception as exc:  # noqa: BLE001
-                if time.time() >= end_ts:
+                if time.time() >= deadline:
                     break
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 10.0)

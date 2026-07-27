@@ -152,6 +152,14 @@ class FlowConfig:
     jump_max_round_usdc: float = 25.0       # потолок вложений в один раунд
     jump_max_leg_price: float = 0.95        # дороже — добор бессмыслен (шэры -> ∞)
 
+    # --- расчёт в конце раунда -----------------------------------------------
+    # Победителя определяем по книге, но сразу после конца окна она ещё не
+    # схлопнулась: бывает Up 0.62 / Down 0.35. Объявить по такой книге
+    # победителя — значит записать «выиграли $1 за шэр» по ставке 62/38.
+    # Поэтому ЖДЁМ схлопывания и только тогда закрываем раунд.
+    jump_settle_converge: float = 0.90      # одна сторона должна дойти до этого
+    jump_settle_wait_s: float = 12.0        # сколько ждать после конца окна
+
     # --- фиксация прибыли на дешёвой дорожке (B) -----------------------------
     # «купил по 0.05, выросли до 0.30, а рост кончился / до конца 5 секунд —
     #  продаёт». Работает только когда мы в плюсе.
@@ -220,6 +228,8 @@ class FlowConfig:
             jump_max_ladder_legs=_i("JUMP_MAX_LADDER_LEGS", 4),
             jump_max_round_usdc=_f("JUMP_MAX_ROUND_USDC", 25.0),
             jump_max_leg_price=_f("JUMP_MAX_LEG_PRICE", 0.95),
+            jump_settle_converge=_f("JUMP_SETTLE_CONVERGE", 0.90),
+            jump_settle_wait_s=_f("JUMP_SETTLE_WAIT_S", 12.0),
             jump_tp_enabled=_b("JUMP_TP_ENABLED", True),
             jump_tp_min_gain=_f("JUMP_TP_MIN_GAIN", 0.10),
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),

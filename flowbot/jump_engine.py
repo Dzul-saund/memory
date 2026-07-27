@@ -244,11 +244,33 @@ class JumpEngine(FlowEngine):
         # Кто выиграл, определяем по последнему биду: сторона, чей «процент»
         # ушёл к 1.0, и есть победитель раунда.
         winner = self._winning_side()
+        resolved = self._book_resolved()
+        if not resolved:
+            # Книга не схлопнулась: например Up 0.62 / Down 0.35. Объявлять по
+            # ней победителя нельзя — это ставка 62/38, а не факт. Считаем ноги
+            # по последней цене (сколько реально стоят), и помечаем UNSETTLED,
+            # чтобы такие строки не портили статистику как «выиграно».
+            top = self._top_bids()
+            self.log.warning(
+                "РАСЧЁТ (%s): книга не схлопнулась за %.0fс после конца окна "
+                "(Up %s / Down %s) — ноги закрываю по последней цене и помечаю "
+                "UNSETTLED, а не WON/LOST", reason, self.cfg.jump_settle_wait_s,
+                _p(top[0]) if top else "—", _p(top[1]) if top else "—")
+
         payout_total = 0.0
         n_legs = len(self.legs)
         for leg in list(self.legs):
-            won = winner is not None and leg["outcome"] == winner
-            payout = round(leg["shares"] * 1.0, 2) if won else 0.0
+            if resolved:
+                won = winner is not None and leg["outcome"] == winner
+                payout = round(leg["shares"] * 1.0, 2) if won else 0.0
+                result = "WON" if won else "LOST"
+                mark = leg.get("last_bid") or 0.0
+                tail = "ВЫИГРЫШ" if won else "проигрыш"
+            else:
+                mark = leg.get("last_bid") or 0.0
+                payout = round(leg["shares"] * mark, 2)
+                result = "UNSETTLED"
+                tail = f"не определён (по {mark:.2f})"
             pnl = round(payout - leg["cost"], 2)
             payout_total += payout
             self._book_pnl(pnl)
@@ -256,9 +278,8 @@ class JumpEngine(FlowEngine):
             self.log.warning(
                 "СЕТТЛ (%s) [%s#%d] %s %s — payout $%.2f | P&L %+.2f",
                 reason, leg["track"], leg["idx"], leg["outcome"],
-                "ВЫИГРЫШ" if won else "проигрыш", payout, pnl)
-            self._log_trade_row(_row(leg), "WON" if won else "LOST",
-                                leg.get("last_bid") or 0.0, payout, pnl)
+                tail, payout, pnl)
+            self._log_trade_row(_row(leg), result, mark, payout, pnl)
         self._invalidate_balance()
         self.log.warning(
             "── раунд закрыт: ног %d, выплата $%.2f, P&L раунда %+.2f "
@@ -267,6 +288,28 @@ class JumpEngine(FlowEngine):
         self.legs = []
         self.strategy.reset_round()
         self._round_pnl = 0.0
+
+    # -- ждём, пока книга схлопнется к 0/1 ------------------------------------
+    def _stream_deadline(self, end_ts: float) -> float:
+        return end_ts + self.cfg.jump_settle_wait_s
+
+    def _book_resolved(self) -> bool:
+        """Победитель уже виден: одна из сторон дошла до порога схлопывания."""
+        top = self._top_bids()
+        return top is not None and max(top) >= self.cfg.jump_settle_converge
+
+    def _top_bids(self):
+        """(bid Up, bid Down) — из книги, иначе последние виденные ногами."""
+        if self.market is None:
+            return None
+        ub, _ = self.book.best(self.market["up"])
+        db, _ = self.book.best(self.market["down"])
+        if ub is None and db is None:
+            marks = {lg["outcome"]: lg.get("last_bid") for lg in self.legs}
+            ub, db = marks.get("Up"), marks.get("Down")
+        if ub is None and db is None:
+            return None
+        return (ub or 0.0), (db or 0.0)
 
     def _winning_side(self) -> Optional[str]:
         """Сторона-победитель раунда по последним котировкам книги.
