@@ -45,16 +45,27 @@ def _book(eng, up_bid, up_ask, dn_bid, dn_ask):
                        "asks": [{"price": str(dn_ask), "size": "100"}]})
 
 
-def _set_jump(eng, price, dprice, horizon=3.0):
-    """Заставить PriceEngine показать скачок dprice долларов за horizon сек."""
+def _set_jump(eng, price, dprice, horizon=3.0, steps=16):
+    """Показать движение на dprice долларов за horizon секунд.
+
+    Наполняет ОБА механизма детекции — историю для move_usd ("window") и
+    экстремумы для swing — одной и той же серией цен, чтобы тест не зависел
+    от того, какой режим включён.
+    """
     pe = eng.price
-    pe._price = price
     pe._sigma = 5.0
-    t = time.time()
     pe.hist.clear()
-    pe.hist.append((t - horizon, price - dprice))
-    pe.hist.append((t - horizon / 2, price - dprice / 2))
-    pe.hist.append((t, price))
+    pe._lo.clear()
+    pe._hi.clear()
+    pe._sm3.clear()
+    t0 = time.time() - horizon
+    for i in range(steps + 1):
+        p = price - dprice + dprice * i / steps
+        ts = t0 + horizon * i / steps
+        pe._price = p
+        pe.hist.append((ts, p))
+        pe._update_swing(ts, p)
+    pe._price = price
 
 
 def _set_target(value, offset=0.0):
@@ -77,16 +88,117 @@ async def _drain(eng, timeout=4.0):
 #  move_usd — долларовый скачок вместо σ
 # ---------------------------------------------------------------------------
 def test_move_usd_reads_dollar_jump():
+    """Движение читается в долларах.
+
+    На РАВНОМЕРНОМ разгоне значение чуть меньше полного размаха: концы окна
+    берутся медианой узких подокон, а те лежат внутри краёв. Для детекции это
+    неважно (порог сравнивается с той же величиной), поэтому проверяем полосу,
+    а не точное число.
+    """
     eng, cfg = _engine()
     _set_jump(eng, price=65_000.0, dprice=12.0, horizon=cfg.jump_window_s)
     usd, bps = eng.price.move_usd(cfg.jump_window_s)
-    assert usd == pytest.approx(12.0, abs=0.01)
-    assert bps == pytest.approx(12.0 / 65_000.0 * 1e4, abs=0.01)
+    assert 10.5 <= usd <= 12.0
+    assert bps == pytest.approx(usd / 65_000.0 * 1e4, abs=0.01)
 
 
 def test_move_usd_without_history_is_zero():
     eng, cfg = _engine()
     assert eng.price.move_usd(cfg.jump_window_s) == (0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+#  swing — движение от локального экстремума, без окна
+# ---------------------------------------------------------------------------
+def _feed(eng, prices, dt=0.2):
+    """Прогнать серию цен через PriceEngine, как будто идут тики.
+
+    Наполняет и hist (для move_usd), и экстремумы (для swing) — иначе
+    сравнение режимов было бы нечестным: пустой hist даёт 0 всегда.
+    """
+    pe = eng.price
+    t = time.time() - dt * len(prices)
+    for i, p in enumerate(prices):
+        ts = t + i * dt
+        pe._price = p
+        pe.hist.append((ts, p))
+        pe._update_swing(ts, p)
+
+
+def test_swing_measures_move_from_local_low():
+    """Дно держится 2+ тика (реальное движение), затем рост на $6."""
+    eng, _ = _engine()
+    _feed(eng, [65_000, 64_998, 64_996, 64_996, 65_000, 65_002])
+    usd, _ = eng.price.swing()
+    assert usd == pytest.approx(6.0, abs=0.01)   # 65_002 − дно 64_996
+
+
+def test_swing_measures_fall_from_local_high():
+    eng, _ = _engine()
+    _feed(eng, [65_000, 65_004, 65_008, 65_008, 65_002, 64_999])
+    usd, _ = eng.price.swing()
+    assert usd == pytest.approx(-9.0, abs=0.01)  # 64_999 − пик 65_008
+
+
+def test_swing_catches_slow_move_that_window_misses():
+    """Ключевая разница: движение растянулось на 10с, окно в 3с его теряет."""
+    eng, cfg = _engine()
+    prices = [65_000 + i * 0.6 for i in range(21)]   # +$12 за 10 секунд
+    _feed(eng, prices, dt=0.5)
+    win, _ = eng.price.move_usd(cfg.jump_window_s)
+    sw, _ = eng.price.swing()
+    assert abs(win) < 5.0, "окно видит только хвост движения"
+    assert sw == pytest.approx(12.0, abs=0.2), "экстремум видит движение целиком"
+
+
+def test_swing_ignores_single_tick_spike():
+    """Одиночный выброс консенсуса не должен рисовать новое дно."""
+    eng, _ = _engine()
+    _feed(eng, [65_000, 65_000, 64_980, 65_000, 65_001])
+    usd, _ = eng.price.swing()
+    assert abs(usd) < 5.0, f"выброс просочился: {usd}"
+
+
+def test_reset_swing_reanchors_to_current_price():
+    eng, _ = _engine()
+    _feed(eng, [65_000, 64_996, 64_996, 65_002])
+    assert abs(eng.price.swing()[0]) > 5.0
+    eng.price.reset_swing()
+    assert eng.price.swing()[0] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_swing_forgets_extremum_past_lookback():
+    eng, _ = _engine(jump_swing_lookback_s=2.0)
+    _feed(eng, [65_000, 64_990, 65_000, 65_000, 65_000], dt=1.0)
+    usd, _ = eng.price.swing()
+    assert abs(usd) < 5.0, "дно старше окна поиска должно быть забыто"
+
+
+def test_engine_enters_on_swing_without_waiting():
+    """Движение от дна перевалило $5 — вход в тот же тик, без окна."""
+    async def scenario():
+        eng, _ = _engine(jump_trigger_mode="swing")
+        _set_target(65_000.0)
+        _book(eng, 0.59, 0.60, 0.40, 0.41)
+        _feed(eng, [65_000, 64_998, 64_996, 64_996, 65_000, 65_002])
+        eng._tick()
+        await _drain(eng)
+        assert len(eng.legs) == 1
+        assert eng.legs[0]["outcome"] == "Up"
+    asyncio.run(scenario())
+
+
+def test_entry_reanchors_so_same_move_does_not_fire_twice():
+    async def scenario():
+        eng, _ = _engine(jump_trigger_mode="swing")
+        _set_target(65_000.0)
+        _book(eng, 0.59, 0.60, 0.40, 0.41)
+        _feed(eng, [65_000, 64_998, 64_996, 64_996, 65_000, 65_002])
+        eng._tick()
+        await _drain(eng)
+        assert len(eng.legs) == 1
+        assert eng.price.swing()[0] == pytest.approx(0.0, abs=1e-9)
+    asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------

@@ -202,6 +202,13 @@ class JumpStrategy:
     # ======================================================================
     #  Вход
     # ======================================================================
+    def _horizon(self) -> str:
+        """Как подписывать движение в логе — зависит от режима детекции."""
+        c = self.cfg
+        if getattr(c, "jump_trigger_mode", "swing") == "swing":
+            return "от экстремума"
+        return f"за {c.jump_window_s:.0f}с"
+
     def _maybe_enter(self, s: JumpSnapshot) -> Action:
         c = self.cfg
         if s.coin_price is None:
@@ -209,15 +216,16 @@ class JumpStrategy:
         if s.seconds_left <= c.settle_hold_s:
             return Action(NONE, f"конец окна ({s.seconds_left:.0f}с) — "
                                 f"новых входов не открываю")
+        cooldown = c.jump_reentry_cooldown_s
         if (self._last_fill_t is not None
-                and s.t - self._last_fill_t < c.jump_window_s):
+                and s.t - self._last_fill_t < cooldown):
             return Action(NONE, f"пауза после сделки "
                                 f"({s.t - self._last_fill_t:.1f}<"
-                                f"{c.jump_window_s:.1f}с) — жду новый скачок")
+                                f"{cooldown:.1f}с) — жду новый скачок")
 
         jump = s.jump_usd
         if abs(jump) < c.jump_small_usd:
-            return Action(NONE, f"скачок ${jump:+.2f} за {c.jump_window_s:.0f}с "
+            return Action(NONE, f"движение ${jump:+.2f} {self._horizon()} "
                                 f"< ${c.jump_small_usd:.0f} — жду")
 
         side = "Up" if jump > 0 else "Down"
@@ -255,7 +263,7 @@ class JumpStrategy:
         return Action(
             ENTER, outcome=side, limit_price=round(ask, 2), size_usdc=stake,
             track=track,
-            reason=(f"СКАЧОК ${jump:+.2f} за {c.jump_window_s:.0f}с "
+            reason=(f"СКАЧОК ${jump:+.2f} {self._horizon()} "
                     f"({'вверх' if jump > 0 else 'вниз'}) → {side} @ {ask:.2f} "
                     f"[дорожка {track}: порог ${need:.0f}], ставка ${stake:.2f}"),
         )

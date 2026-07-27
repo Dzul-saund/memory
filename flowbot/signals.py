@@ -39,6 +39,18 @@ class PriceEngine:
         self._last_vol_ms = 0.0
         self._price: Optional[float] = None
         self._sigma: Optional[float] = None
+        # --- отслеживание движения от локального экстремума (swing) ---------
+        # Три последние сырые цены: медиана из них гасит одиночный выброс
+        # консенсуса, который иначе мгновенно «нарисовал» бы новый минимум
+        # и дал ложный сигнал на скачок.
+        self._sm3: Deque[float] = deque(maxlen=3)
+        self._smooth: Optional[float] = None
+        self._raw: Optional[float] = None
+        # Монотонные очереди: голова = минимум/максимум окна. Скользящий
+        # экстремум за O(1) на тик — без пересчёта всей истории, поэтому
+        # можно звать на КАЖДОМ обновлении книги, а не по таймеру.
+        self._lo: Deque[Tuple[float, float]] = deque()
+        self._hi: Deque[Tuple[float, float]] = deque()
 
     def update(self, t_ms: float) -> Optional[float]:
         price, _accepted, _rejected = self.cons.compute(t_ms)
@@ -60,7 +72,69 @@ class PriceEngine:
                    getattr(self.cfg, "jump_window_s", 0.0) + 1.0)
         while self.hist and t_s - self.hist[0][0] > keep:
             self.hist.popleft()
+        self._update_swing(t_s, price)
         return price
+
+    def _update_swing(self, t_s: float, price: float) -> None:
+        # В экстремумы кладём медиану трёх последних цен: одиночный выброс
+        # консенсуса так не станет «дном». А вот ТЕКУЩУЮ цену держим сырой —
+        # медиана отстаёт на тик, а весь смысл режима в мгновенной реакции.
+        self._raw = price
+        self._sm3.append(price)
+        p = statistics.median(self._sm3) if len(self._sm3) == 3 else price
+        self._smooth = p
+        horizon = getattr(self.cfg, "jump_swing_lookback_s", 60.0)
+        lo, hi = self._lo, self._hi
+        while lo and t_s - lo[0][0] > horizon:
+            lo.popleft()
+        while hi and t_s - hi[0][0] > horizon:
+            hi.popleft()
+        while lo and lo[-1][1] >= p:
+            lo.pop()
+        lo.append((t_s, p))
+        while hi and hi[-1][1] <= p:
+            hi.pop()
+        hi.append((t_s, p))
+
+    def swing(self) -> Tuple[float, float]:
+        """(движение от локального экстремума в ДОЛЛАРАХ, оно же в б.п.).
+
+        Отвечает на вопрос «на сколько цена уже ушла от своего недавнего дна
+        или пика», а не «на сколько она изменилась за последние N секунд».
+        Разница принципиальная: окно в N секунд ПРОПУСКАЕТ движение, которое
+        заняло N+1 секунду, а экстремум ловит его целиком и срабатывает ровно
+        на том тике, где движение перевалило порог — ждать нечего.
+
+        Знак: + цена выросла от дна, − упала от пика. Берём то направление,
+        где движение больше по модулю.
+
+        Дно/пик — despiked (медиана трёх), текущая цена — сырая: реагируем в
+        тот же тик. Защита от одиночного выброса в САМОЙ свежей цене — это
+        отсев выбросов в консенсусе fast_monitor (источник, ушедший от медианы
+        семи бирж дальше 25 б.п., в цену вообще не попадает).
+        """
+        p = self._raw
+        if p is None or not self._lo or not self._hi:
+            return 0.0, 0.0
+        up = p - self._lo[0][1]
+        down = self._hi[0][1] - p
+        move = up if up >= down else -down
+        return move, (move / p * 1e4 if p > 0 else 0.0)
+
+    def reset_swing(self) -> None:
+        """Заново привязать экстремум к текущей цене.
+
+        Зовётся после сделки и на границе раунда: движение уже отработано,
+        и старое дно не должно секунду спустя открыть вторую такую же сделку.
+        """
+        self._lo.clear()
+        self._hi.clear()
+        self._sm3.clear()
+        if self._price is not None:
+            self._smooth = self._raw = self._price
+            now = time.time()
+            self._lo.append((now, self._price))
+            self._hi.append((now, self._price))
 
     def price(self) -> Optional[float]:
         return self._price

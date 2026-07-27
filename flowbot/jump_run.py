@@ -40,8 +40,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="скачок для дешёвой стороны, $ (деф. 15)")
     p.add_argument("--split", type=float,
                    help="граница дорого/дёшево по проценту (деф. 0.51)")
+    p.add_argument("--trigger", choices=["swing", "window"],
+                   help="swing (деф.) — ловим движение от локального дна/пика "
+                        "сразу; window — сравниваем с ценой N секунд назад")
+    p.add_argument("--swing-lookback", type=float,
+                   help="как далеко назад искать экстремум, сек (деф. 60)")
     p.add_argument("--jump-window", type=float,
-                   help="за сколько секунд меряем скачок (деф. 3)")
+                   help="окно режима window, сек (деф. 3)")
     p.add_argument("--max-target-dist", type=float,
                    help="дешёвая сторона: макс. расстояние до таргета, $ (деф. 100)")
     p.add_argument("--max-round", type=float,
@@ -89,6 +94,10 @@ def main(argv=None) -> int:
         cfg.jump_big_usd = args.big
     if args.split is not None:
         cfg.jump_price_split = args.split
+    if args.trigger:
+        cfg.jump_trigger_mode = args.trigger
+    if args.swing_lookback is not None:
+        cfg.jump_swing_lookback_s = args.swing_lookback
     if args.jump_window is not None:
         cfg.jump_window_s = args.jump_window
     if args.max_target_dist is not None:

@@ -72,6 +72,9 @@ class JumpEngine(FlowEngine):
         if key != self._window_key:
             self._window_key = key
             self.strategy.reset_round()
+            # Новый раунд — новый отсчёт: дно прошлого окна не должно
+            # выглядеть «скачком» на первой же секунде этого.
+            self.price.reset_swing()
             self._round_pnl = 0.0
             self.rounds += 1
 
@@ -87,7 +90,13 @@ class JumpEngine(FlowEngine):
         up, dn = self.market["up"], self.market["down"]
         ub, ua = self.book.best(up)
         db, da = self.book.best(dn)
-        jump_usd, jump_bps = self.price.move_usd(cfg.jump_window_s)
+        # swing: движение от локального дна/пика — срабатывает в тот же тик,
+        # как только порог пройден. window: старое сравнение «сейчас против
+        # N секунд назад».
+        if cfg.jump_trigger_mode == "swing":
+            jump_usd, jump_bps = self.price.swing()
+        else:
+            jump_usd, jump_bps = self.price.move_usd(cfg.jump_window_s)
 
         snap = JumpSnapshot(
             t=time.time(),
@@ -174,6 +183,9 @@ class JumpEngine(FlowEngine):
             return
         self._invalidate_balance()
         self.n_trades += 1
+        # Движение отработано — переставляем экстремум на текущую цену, иначе
+        # то же самое дно секунду спустя открыло бы ещё одну такую же сделку.
+        self.price.reset_swing()
         leg = self.strategy.record_entry(outcome, fill, shares, cost,
                                          action.track, time.time())
         self.legs.append({
@@ -297,11 +309,13 @@ class JumpEngine(FlowEngine):
             pos = "—"
         tgt = (f" цель {snap.target:,.0f}" if snap.target is not None else
                " цель —")
+        how = ("экстр" if self.cfg.jump_trigger_mode == "swing"
+               else f"{self.cfg.jump_window_s:.0f}с")
         self.log.info(
-            "t-%3ds | %s %s%s | скачок %+.2f$/%.0fс | Up %s/%s Down %s/%s | "
+            "t-%3ds | %s %s%s | скачок %+.2f$/%s | Up %s/%s Down %s/%s | "
             "поз %s | вложено $%.2f | $%.2f | %s",
             int(snap.seconds_left), self.cfg.asset.upper(),
-            _m(snap.coin_price), tgt, snap.jump_usd, self.cfg.jump_window_s,
+            _m(snap.coin_price), tgt, snap.jump_usd, how,
             _p(snap.up_bid), _p(snap.up_ask), _p(snap.down_bid),
             _p(snap.down_ask), pos, self.strategy.net_out,
             self._get_balance(), action.reason,
@@ -313,10 +327,16 @@ class JumpEngine(FlowEngine):
         self.log.info("=" * 72)
         self.log.info("СКАЧКОВАЯ система — %s Up/Down 5m — %s",
                       c.asset.upper(), mode)
+        if c.jump_trigger_mode == "swing":
+            how = (f"движение от локального дна/пика (окно поиска экстремума "
+                   f"{c.jump_swing_lookback_s:.0f}с, срабатывает сразу)")
+        else:
+            how = f"движение за {c.jump_window_s:.0f}с"
+        self.log.info("детекция: %s", how)
         self.log.info(
-            "вход: скачок >=$%.0f за %.0fс, если %% стороны >= %.2f; "
-            "иначе нужен скачок >=$%.0f и не дальше $%.0f от таргета",
-            c.jump_small_usd, c.jump_window_s, c.jump_price_split,
+            "вход: скачок >=$%.0f, если %% стороны >= %.2f; иначе нужен "
+            "скачок >=$%.0f и не дальше $%.0f от таргета",
+            c.jump_small_usd, c.jump_price_split,
             c.jump_big_usd, c.jump_max_target_dist_usd)
         self.log.info(
             "ставка $%.2f; провал ниже %.2f → добор противоположной стороны на "

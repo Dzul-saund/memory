@@ -110,7 +110,18 @@ class FlowConfig:
     # =========================================================================
     # Здесь «резкое движение» меряется не в σ, а прямо в долларах цены монеты,
     # как просил юзер: «скачок 5 долларов» / «скачок 15 долларов».
-    jump_window_s: float = 3.0              # за сколько секунд меряем скачок
+    # КАК ловим скачок:
+    #   "swing"  — от локального дна/пика. Цена ушла на $5 от экстремума —
+    #              покупаем в тот же тик, сколько бы времени движение ни
+    #              заняло. Никакого окна, мониторинг непрерывный. (деф.)
+    #   "window" — классика: сравниваем цену сейчас и jump_window_s назад.
+    #              Движение, растянувшееся дольше окна, будет пропущено.
+    jump_trigger_mode: str = "swing"
+    # Как далеко назад может лежать экстремум (только для режима swing).
+    # Слишком большое значение = дном считается начало раунда, и «скачком»
+    # окажется медленный дрейф; слишком малое = вернётся эффект окна.
+    jump_swing_lookback_s: float = 60.0
+    jump_window_s: float = 3.0              # окно режима "window"
     jump_small_usd: float = 5.0             # дорогая дорожка (A): скачок >= $5
     jump_big_usd: float = 15.0              # дешёвая дорожка (B): скачок >= $15
     # Граница «дорого/дёшево» по проценту стороны. Строго: ask >= это -> A.
@@ -119,6 +130,10 @@ class FlowConfig:
     # этого от таргета раунда — иначе сторона безнадёжна и скачок не спасёт.
     jump_max_target_dist_usd: float = 100.0
     jump_stake_usdc: float = 1.0            # первая ставка в лестнице
+    # Пауза после сделки, чтобы одно и то же движение не открыло вторую
+    # позицию. В режиме swing экстремум и так переставляется после филла,
+    # поэтому паузе хватает секунды.
+    jump_reentry_cooldown_s: float = 1.0
 
     # --- лестница добора (докупаем противоположную сторону) ------------------
     # Когда наш процент проваливается ниже jump_price_split, берём другую
@@ -189,7 +204,10 @@ class FlowConfig:
             flow_confirm=_b("FLOW_FLOW_CONFIRM", True),
             flow_veto=_f("FLOW_FLOW_VETO", -0.6),
             flow_window_s=_f("FLOW_FLOW_WINDOW_S", 3.0),
+            jump_trigger_mode=(_s("JUMP_TRIGGER_MODE", "swing") or "swing").lower(),
+            jump_swing_lookback_s=_f("JUMP_SWING_LOOKBACK_S", 60.0),
             jump_window_s=_f("JUMP_WINDOW_S", 3.0),
+            jump_reentry_cooldown_s=_f("JUMP_REENTRY_COOLDOWN_S", 1.0),
             jump_small_usd=_f("JUMP_SMALL_USD", 5.0),
             jump_big_usd=_f("JUMP_BIG_USD", 15.0),
             jump_price_split=_f("JUMP_PRICE_SPLIT", 0.51),
@@ -261,6 +279,11 @@ class FlowConfig:
         errs = []
         if self.jump_stake_usdc <= 0:
             errs.append("JUMP_STAKE_USDC должен быть > 0")
+        if self.jump_trigger_mode not in ("swing", "window"):
+            errs.append(f"JUMP_TRIGGER_MODE должен быть swing или window, "
+                        f"а не {self.jump_trigger_mode!r}")
+        if self.jump_swing_lookback_s <= 0:
+            errs.append("JUMP_SWING_LOOKBACK_S должен быть > 0")
         if self.jump_window_s <= 0:
             errs.append("JUMP_WINDOW_S должен быть > 0")
         if self.jump_small_usd <= 0:
