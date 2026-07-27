@@ -64,6 +64,66 @@ def fair_up_probability(
     return norm_cdf(z)
 
 
+def norm_pdf(x: float) -> float:
+    """Плотность стандартного нормального распределения."""
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def price_sensitivity(
+    price: Optional[float],
+    strike: Optional[float],
+    sigma_1s: Optional[float],
+    seconds_left: float,
+) -> Optional[float]:
+    """Насколько сдвинется «процент» Up при движении монеты на $1.
+
+    Это производная dP/d(цена) от той же модели, что и fair_up_probability:
+
+        P = Phi(z),  z = (цена − таргет) / (sigma * sqrt(t))
+        dP/dцена = phi(z) / (sigma * sqrt(t))
+
+    Отсюда сразу видно, почему процент иногда НЕ реагирует на скачок цены:
+    phi(z) падает экспоненциально по мере удаления от таргета. При z=6
+    (цена ушла на шесть «сигм») phi(z) ~ 6e-9 — рынок уже всё решил, и любое
+    движение цены ничего не меняет. Максимум чувствительности — ровно на
+    таргете (z=0), где phi(0)=0.399.
+
+    Возвращает долю вероятности на доллар (0.01 = 1 цент на $1). None, если
+    посчитать не из чего.
+    """
+    if price is None or strike is None or seconds_left <= 0:
+        return None
+    if sigma_1s is None or sigma_1s <= 0:
+        return None
+    denom = sigma_1s * math.sqrt(seconds_left)
+    if denom <= 0:
+        return None
+    z = (price - strike) / denom
+    return norm_pdf(z) / denom
+
+
+def expected_shift(
+    price: Optional[float],
+    strike: Optional[float],
+    sigma_1s: Optional[float],
+    seconds_left: float,
+    move_usd: float,
+) -> Optional[float]:
+    """На сколько изменится «процент» Up, если монета сходит на move_usd.
+
+    Считаем ЧЕСТНО, через разность двух вероятностей, а не через производную:
+    на больших скачках линейное приближение сильно врёт (кривая Phi изгибается).
+    Знак результата совпадает со знаком move_usd.
+    """
+    p0 = fair_up_probability(price, strike, sigma_1s, seconds_left)
+    if p0 is None or price is None:
+        return None
+    p1 = fair_up_probability(price + move_usd, strike, sigma_1s, seconds_left)
+    if p1 is None:
+        return None
+    return p1 - p0
+
+
 class VolEstimator:
     """Rolling estimate of the per-sqrt-second dollar volatility.
 

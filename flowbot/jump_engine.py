@@ -21,6 +21,7 @@ from typing import List, Optional
 
 import fast_monitor
 
+from btc_bot.prob import expected_shift
 from btc_bot.util import floor2
 
 from .config import FlowConfig
@@ -103,6 +104,7 @@ class JumpEngine(FlowEngine):
             seconds_left=max(0.0, self.market["end_ts"] - time.time()),
             coin_price=price, target=self._target(),
             jump_usd=jump_usd, jump_bps=jump_bps,
+            sigma_1s=self.price.sigma_1s(),
             up_bid=ub, up_ask=ua, down_bid=db, down_ask=da,
             up_flow=self.book.flow(up, cfg.flow_window_s),
             down_flow=self.book.flow(dn, cfg.flow_window_s),
@@ -359,11 +361,17 @@ class JumpEngine(FlowEngine):
                " цель —")
         how = ("экстр" if self.cfg.jump_trigger_mode == "swing"
                else f"{self.cfg.jump_window_s:.0f}с")
+        # «чувств» — на сколько центов сдвинет процент скачок в jump_small_usd.
+        # Видно сразу, есть ли смысл вообще ждать сигнала в этой точке раунда.
+        sens = expected_shift(snap.coin_price, snap.target, snap.sigma_1s,
+                              max(snap.seconds_left, 0.5),
+                              self.cfg.jump_small_usd)
+        s_txt = f" чувств {abs(sens)*100:4.1f}¢" if sens is not None else ""
         self.log.info(
-            "t-%3ds | %s %s%s | скачок %+.2f$/%s | Up %s/%s Down %s/%s | "
+            "t-%3ds | %s %s%s | скачок %+.2f$/%s%s | Up %s/%s Down %s/%s | "
             "поз %s | вложено $%.2f | $%.2f | %s",
             int(snap.seconds_left), self.cfg.asset.upper(),
-            _m(snap.coin_price), tgt, snap.jump_usd, how,
+            _m(snap.coin_price), tgt, snap.jump_usd, how, s_txt,
             _p(snap.up_bid), _p(snap.up_ask), _p(snap.down_bid),
             _p(snap.down_ask), pos, self.strategy.net_out,
             self._get_balance(), action.reason,

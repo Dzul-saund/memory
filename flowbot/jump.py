@@ -41,6 +41,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from btc_bot.prob import expected_shift
+
 # Виды действий
 ENTER = "enter"     # первый вход в раунде
 LADDER = "ladder"   # добор противоположной стороны, перекрывающий минус
@@ -61,6 +63,7 @@ class JumpSnapshot:
     target: Optional[float]           # openPrice раунда (как на сайте)
     jump_usd: float                   # знаковый скачок за окно, $ (+вверх)
     jump_bps: float = 0.0
+    sigma_1s: Optional[float] = None  # волатильность, $ за корень секунды
     up_bid: Optional[float] = None
     up_ask: Optional[float] = None
     down_bid: Optional[float] = None
@@ -198,6 +201,18 @@ class JumpStrategy:
     # ======================================================================
     #  Вход
     # ======================================================================
+    def _expected_shift(self, s: JumpSnapshot,
+                        jump_usd: float) -> Optional[float]:
+        """На сколько скачок сдвинет «процент», по модели блуждания.
+
+        None = посчитать не из чего (нет таргета или волатильности); тогда
+        фильтр не применяется и решают обычные пороги.
+        """
+        if self.cfg.jump_min_shift_cents <= 0:
+            return None
+        return expected_shift(s.coin_price, s.target, s.sigma_1s,
+                              max(s.seconds_left, 0.5), jump_usd)
+
     def _horizon(self) -> str:
         """Как подписывать движение в логе — зависит от режима детекции."""
         c = self.cfg
@@ -254,6 +269,18 @@ class JumpStrategy:
         if ask > c.jump_max_leg_price:
             return Action(NONE, f"{side} ask {ask:.2f} > потолка "
                                 f"{c.jump_max_leg_price:.2f} — нечего забирать")
+
+        # Сдвинется ли «процент» вообще? Далеко от таргета исход раунда уже
+        # решён, и любой скачок цены оставляет проценты на месте — там вход
+        # заведомо съедается спредом.
+        shift = self._expected_shift(s, jump)
+        if shift is not None and abs(shift) * 100 < c.jump_min_shift_cents:
+            return Action(NONE, (
+                f"{side}: скачок ${jump:+.2f} сдвинет процент лишь на "
+                f"{abs(shift)*100:.1f}¢ (< {c.jump_min_shift_cents:.1f}¢) — "
+                f"цена в ${abs(s.coin_price - s.target):,.0f} от таргета, "
+                f"исход уже решён" if s.target is not None else
+                f"{side}: ожидаемый сдвиг процента {abs(shift)*100:.1f}¢ мал"))
 
         stake = min(c.jump_stake_usdc, c.jump_max_round_usdc)
         return Action(

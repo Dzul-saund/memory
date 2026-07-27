@@ -130,6 +130,13 @@ class FlowConfig:
     # этого от таргета раунда — иначе сторона безнадёжна и скачок не спасёт.
     jump_max_target_dist_usd: float = 100.0
     jump_stake_usdc: float = 1.0            # первая ставка в лестнице
+    # Минимальный ОЖИДАЕМЫЙ сдвиг «процента» от скачка, в центах.
+    # Считается по модели случайного блуждания: P = Phi((цена-таргет)/(sigma*sqrt(t))).
+    # Чем дальше цена от таргета, тем меньше этот сдвиг — на 3+ сигмах процент
+    # физически не двигается, сколько бы монета ни прыгала, потому что исход
+    # раунда уже решён. Вход туда гарантированно съедается спредом (~1 цент),
+    # поэтому такие сигналы отсекаем. 0 — фильтр выключен.
+    jump_min_shift_cents: float = 2.0
     # Пауза после сделки, чтобы одно и то же движение не открыло вторую
     # позицию. В режиме swing экстремум и так переставляется после филла,
     # поэтому паузе хватает секунды.
@@ -221,6 +228,7 @@ class FlowConfig:
             jump_price_split=_f("JUMP_PRICE_SPLIT", 0.51),
             jump_max_target_dist_usd=_f("JUMP_MAX_TARGET_DIST_USD", 100.0),
             jump_stake_usdc=_f("JUMP_STAKE_USDC", 1.0),
+            jump_min_shift_cents=_f("JUMP_MIN_SHIFT_CENTS", 2.0),
             jump_ladder_enabled=_b("JUMP_LADDER_ENABLED", True),
             jump_ladder_profit_usdc=_f("JUMP_LADDER_PROFIT_USDC", 0.50),
             jump_ladder_grace_s=_f("JUMP_LADDER_GRACE_S", 0.6),

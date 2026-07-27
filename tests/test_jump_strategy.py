@@ -32,12 +32,12 @@ def cfg() -> FlowConfig:
 
 def snap(t=100.0, left=200.0, price=65_000.0, target=65_000.0, jump=0.0,
          up_bid=None, up_ask=None, down_bid=None, down_ask=None,
-         up_flow=0.0, down_flow=0.0) -> JumpSnapshot:
+         up_flow=0.0, down_flow=0.0, sigma=None) -> JumpSnapshot:
     return JumpSnapshot(
         t=t, seconds_left=left, coin_price=price, target=target,
         jump_usd=jump, up_bid=up_bid, up_ask=up_ask,
         down_bid=down_bid, down_ask=down_ask,
-        up_flow=up_flow, down_flow=down_flow,
+        up_flow=up_flow, down_flow=down_flow, sigma_1s=sigma,
     )
 
 
@@ -143,6 +143,57 @@ class TestEntry:
         a = s.on_tick(snap(t=101.0, jump=6.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
         assert "пауза" in a.reason
+
+
+# ---------------------------------------------------------------------------
+#  Фильтр «сдвинется ли процент вообще»
+# ---------------------------------------------------------------------------
+class TestSensitivityFilter:
+    """Далеко от таргета исход раунда уже решён: процент не шелохнётся,
+    сколько бы монета ни прыгала. Такие входы надо отсекать."""
+
+    def test_blocks_entry_far_from_target(self, cfg):
+        s = JumpStrategy(cfg)
+        # 60$ от таргета при sigma 0.9 и 200с — это ~4.7 сигмы, процент мёртв
+        a = s.on_tick(snap(jump=9.0, price=65_060.0, target=65_000.0,
+                           sigma=0.9, up_ask=0.60, down_ask=0.41))
+        assert a.kind == NONE
+        assert "процент" in a.reason
+
+    def test_allows_entry_near_target(self, cfg):
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, price=65_002.0, target=65_000.0,
+                           sigma=0.9, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_high_volatility_keeps_far_entries_alive(self, cfg):
+        """При большой sigma те же $60 — уже меньше сигмы, процент живой."""
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, price=65_060.0, target=65_000.0,
+                           sigma=6.0, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_disabled_by_zero_threshold(self, cfg):
+        cfg.jump_min_shift_cents = 0.0
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, price=65_060.0, target=65_000.0,
+                           sigma=0.9, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_skipped_when_sigma_unknown(self, cfg):
+        """Нет волатильности — фильтр молчит, решают обычные пороги."""
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, price=65_060.0, target=65_000.0,
+                           sigma=None, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_end_of_round_far_out_is_dead(self, cfg):
+        """10 секунд до конца и $20 от таргета — раунд кончен."""
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, left=10.0, price=65_020.0,
+                           target=65_000.0, sigma=0.9,
+                           up_ask=0.60, down_ask=0.41))
+        assert a.kind == NONE
 
 
 # ---------------------------------------------------------------------------
