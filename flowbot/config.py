@@ -126,8 +126,25 @@ class FlowConfig:
     jump_big_usd: float = 15.0              # дешёвая дорожка (B): скачок >= $15
     # Граница «дорого/дёшево» по проценту стороны. Строго: ask >= это -> A.
     jump_price_split: float = 0.51
-    # Дорожка B (дешёвая сторона) разрешена, только если цена монеты не дальше
-    # этого от таргета раунда — иначе сторона безнадёжна и скачок не спасёт.
+
+    # --- подстройка порогов под живость рынка --------------------------------
+    # Порог в фиксированных долларах верен только при той волатильности, при
+    # которой его подбирали. Сдвиг процента от скачка J равен примерно
+    # J*phi(z)/(sigma*sqrt(t)) — то есть ОБРАТНО пропорционален sigma. Когда
+    # рынок просыпается, тот же $5 двигает процент в разы слабее, и порог надо
+    # поднимать ровно во столько же раз: нужный скачок ~ линеен по sigma.
+    #   при sigma 0.9  -> нужно ~$4     (тихое воскресенье)
+    #   при sigma 6.0  -> нужно ~$28    (живой рынок)
+    jump_adaptive: bool = True
+    jump_sigma_ref: float = 0.9             # sigma, при которой калиброваны $5/$15
+    jump_scale_min: float = 1.0             # ниже базовых порогов не опускаемся
+    jump_scale_max: float = 8.0             # и не разгоняемся до бесконечности
+
+    # Дорожка B (дешёвая сторона): как далеко от таргета ещё имеет смысл лезть.
+    # В СИГМАХ, а не в долларах: «далеко» зависит от волатильности и времени.
+    # 3 сигмы при sigma 0.9 и 200с — это $38; при sigma 6.0 — уже $255.
+    jump_max_target_sigmas: float = 3.0
+    # Запасной предел в долларах — работает, только пока sigma неизвестна.
     jump_max_target_dist_usd: float = 100.0
     jump_stake_usdc: float = 1.0            # первая ставка в лестнице
     # Минимальный ОЖИДАЕМЫЙ сдвиг «процента» от скачка, в центах.
@@ -226,6 +243,11 @@ class FlowConfig:
             jump_small_usd=_f("JUMP_SMALL_USD", 5.0),
             jump_big_usd=_f("JUMP_BIG_USD", 15.0),
             jump_price_split=_f("JUMP_PRICE_SPLIT", 0.51),
+            jump_adaptive=_b("JUMP_ADAPTIVE", True),
+            jump_sigma_ref=_f("JUMP_SIGMA_REF", 0.9),
+            jump_scale_min=_f("JUMP_SCALE_MIN", 1.0),
+            jump_scale_max=_f("JUMP_SCALE_MAX", 8.0),
+            jump_max_target_sigmas=_f("JUMP_MAX_TARGET_SIGMAS", 3.0),
             jump_max_target_dist_usd=_f("JUMP_MAX_TARGET_DIST_USD", 100.0),
             jump_stake_usdc=_f("JUMP_STAKE_USDC", 1.0),
             jump_min_shift_cents=_f("JUMP_MIN_SHIFT_CENTS", 2.0),

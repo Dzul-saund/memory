@@ -24,6 +24,8 @@ def _engine(**over):
     cfg.simulate_latency = False        # тесты не ждут пинг
     cfg.trade_log_csv = ""              # не писать CSV в тестах
     cfg.jump_ladder_grace_s = 0.0       # без ожидания подтверждения
+    cfg.jump_adaptive = False           # пороги не плавают: тесты про лестницу
+    cfg.jump_min_shift_cents = 0.0      # и не про фильтр чувствительности
     for k, v in over.items():
         setattr(cfg, k, v)
     eng = JumpEngine(cfg)
@@ -222,15 +224,35 @@ def test_tick_enters_expensive_side_on_small_jump():
 
 
 def test_tick_skips_cheap_side_far_from_target():
+    """Тихий рынок: $150 от таргета — раунд решён, дешёвую сторону не берём.
+
+    Предел считается в сигмах, поэтому «далеко» задаём через волатильность:
+    при sigma 0.9 и 200с три сигмы — это ~$38.
+    """
     async def scenario():
-        eng, cfg = _engine()
+        eng, cfg = _engine(jump_max_target_sigmas=3.0)
         _set_target(65_000.0)
         _book(eng, 0.29, 0.30, 0.70, 0.71)
-        # скачок $16 вверх, но цена уже в $150 от таргета
         _set_jump(eng, price=65_150.0, dprice=16.0, horizon=cfg.jump_window_s)
+        eng.price._sigma = 0.9          # тихий рынок
         eng._tick()
         await _drain(eng)
         assert eng.legs == []
+    asyncio.run(scenario())
+
+
+def test_same_distance_allowed_when_market_is_lively():
+    """Тот же $150 при разогнанном рынке — всего ~2 сигмы, вход законен."""
+    async def scenario():
+        eng, cfg = _engine(jump_max_target_sigmas=3.0)
+        _set_target(65_000.0)
+        _book(eng, 0.29, 0.30, 0.70, 0.71)
+        _set_jump(eng, price=65_150.0, dprice=16.0, horizon=cfg.jump_window_s)
+        eng.price._sigma = 5.0          # живой рынок
+        eng._tick()
+        await _drain(eng)
+        assert len(eng.legs) == 1
+        assert eng.legs[0]["track"] == "B"
     asyncio.run(scenario())
 
 

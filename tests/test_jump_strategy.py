@@ -27,6 +27,9 @@ def cfg() -> FlowConfig:
     c.jump_ladder_grace_s = 0.6
     c.jump_ladder_profit_usdc = 0.50
     c.settle_hold_s = 6.0
+    # Подстройку порогов под волатильность проверяем отдельно
+    # (TestAdaptiveThresholds); остальным тестам она бы плавала пороги.
+    c.jump_adaptive = False
     return c
 
 
@@ -143,6 +146,78 @@ class TestEntry:
         a = s.on_tick(snap(t=101.0, jump=6.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
         assert "пауза" in a.reason
+
+
+# ---------------------------------------------------------------------------
+#  Подстройка порогов под живость рынка
+# ---------------------------------------------------------------------------
+class TestAdaptiveThresholds:
+    """На разогнанном рынке тот же скачок двигает процент во столько же раз
+    слабее — значит и порог входа должен вырасти во столько же раз."""
+
+    @pytest.fixture()
+    def acfg(self, cfg):
+        cfg.jump_adaptive = True
+        cfg.jump_sigma_ref = 0.9
+        cfg.jump_min_shift_cents = 0.0     # изолируем от второго фильтра
+        return cfg
+
+    def test_scale_is_one_at_reference_vol(self, acfg):
+        s = JumpStrategy(acfg)
+        assert s.vol_scale(snap(sigma=0.9)) == pytest.approx(1.0)
+
+    def test_scale_grows_linearly_with_vol(self, acfg):
+        s = JumpStrategy(acfg)
+        assert s.vol_scale(snap(sigma=1.8)) == pytest.approx(2.0)
+        assert s.vol_scale(snap(sigma=4.5)) == pytest.approx(5.0)
+
+    def test_scale_is_clamped(self, acfg):
+        acfg.jump_scale_max = 3.0
+        s = JumpStrategy(acfg)
+        assert s.vol_scale(snap(sigma=90.0)) == pytest.approx(3.0)
+        assert s.vol_scale(snap(sigma=0.01)) == pytest.approx(1.0)
+
+    def test_scale_is_one_without_sigma(self, acfg):
+        s = JumpStrategy(acfg)
+        assert s.vol_scale(snap(sigma=None)) == 1.0
+
+    def test_small_jump_rejected_on_lively_market(self, acfg):
+        """$9 хватало в тихое воскресенье, но не при sigma 4.5."""
+        s = JumpStrategy(acfg)
+        a = s.on_tick(snap(jump=9.0, sigma=4.5, up_ask=0.60, down_ask=0.41))
+        assert a.kind == NONE
+        assert "σ" in a.reason
+
+    def test_same_jump_accepted_on_quiet_market(self, acfg):
+        s = JumpStrategy(acfg)
+        a = s.on_tick(snap(jump=9.0, sigma=0.9, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_big_jump_accepted_on_lively_market(self, acfg):
+        """При sigma 4.5 порог ~$25 — скачок $30 проходит."""
+        s = JumpStrategy(acfg)
+        a = s.on_tick(snap(jump=30.0, sigma=4.5, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+
+    def test_target_distance_limit_scales_with_vol(self, acfg):
+        """$100 от таргета: мертво при тихом рынке, живо при разогнанном."""
+        s = JumpStrategy(acfg)
+        quiet = s.max_target_distance(snap(sigma=0.9, left=200.0))
+        lively = s.max_target_distance(snap(sigma=6.0, left=200.0))
+        assert quiet < 100 < lively, f"тихо {quiet:.0f}, живо {lively:.0f}"
+
+    def test_cheap_side_far_out_allowed_when_lively(self, acfg):
+        s = JumpStrategy(acfg)
+        # sigma 6 -> порог скачка ~$100, предел до таргета ~$255
+        a = s.on_tick(snap(jump=120.0, price=65_100.0, target=65_000.0,
+                           sigma=6.0, up_ask=0.30, down_ask=0.71))
+        assert a.kind == ENTER
+        assert a.track == TRACK_B
+
+    def test_falls_back_to_dollar_limit_without_sigma(self, acfg):
+        s = JumpStrategy(acfg)
+        assert s.max_target_distance(snap(sigma=None)) == \
+            acfg.jump_max_target_dist_usd
 
 
 # ---------------------------------------------------------------------------

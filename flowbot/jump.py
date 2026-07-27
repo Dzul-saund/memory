@@ -38,6 +38,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -201,6 +202,39 @@ class JumpStrategy:
     # ======================================================================
     #  Вход
     # ======================================================================
+    def vol_scale(self, s: JumpSnapshot) -> float:
+        """Во сколько раз поднять долларовые пороги под текущий рынок.
+
+        Сдвиг процента от скачка J ~ J/(sigma*sqrt(t)), значит чтобы получить
+        ТОТ ЖЕ эффект при вдвое более живом рынке, нужен вдвое больший скачок.
+        Отсюда масштаб = sigma_сейчас / sigma_опорная, зажатый в [min, max],
+        чтобы на прогреве или во время всплеска пороги не улетели.
+
+        1.0 = подстройка выключена или волатильность ещё не измерена.
+        """
+        c = self.cfg
+        if not getattr(c, "jump_adaptive", False):
+            return 1.0
+        if not s.sigma_1s or s.sigma_1s <= 0 or c.jump_sigma_ref <= 0:
+            return 1.0
+        return max(c.jump_scale_min,
+                   min(c.jump_scale_max, s.sigma_1s / c.jump_sigma_ref))
+
+    def max_target_distance(self, s: JumpSnapshot) -> float:
+        """Предел «далеко от таргета» для дешёвой дорожки, в долларах.
+
+        Считаем в сигмах остатка раунда (sigma*sqrt(t)) — именно на этом
+        масштабе раунд ещё может перевернуться. Фиксированные доллары тут
+        врут: при живом рынке $100 — это меньше сигмы (всё решаемо), при
+        тихом — восемь сигм (всё решено). Пока sigma неизвестна, работает
+        старый долларовый предел.
+        """
+        c = self.cfg
+        if s.sigma_1s and s.sigma_1s > 0 and c.jump_max_target_sigmas > 0:
+            return c.jump_max_target_sigmas * s.sigma_1s * math.sqrt(
+                max(s.seconds_left, 0.5))
+        return c.jump_max_target_dist_usd
+
     def _expected_shift(self, s: JumpSnapshot,
                         jump_usd: float) -> Optional[float]:
         """На сколько скачок сдвинет «процент», по модели блуждания.
@@ -234,10 +268,17 @@ class JumpStrategy:
                                 f"({s.t - self._last_fill_t:.1f}<"
                                 f"{cooldown:.1f}с) — жду новый скачок")
 
+        # Пороги подстраиваются под живость рынка: на разогнанном рынке тот же
+        # скачок двигает процент во столько же раз слабее.
+        scale = self.vol_scale(s)
+        small = c.jump_small_usd * scale
+        big = c.jump_big_usd * scale
+        sc_txt = f" [x{scale:.1f} по σ]" if scale != 1.0 else ""
+
         jump = s.jump_usd
-        if abs(jump) < c.jump_small_usd:
+        if abs(jump) < small:
             return Action(NONE, f"движение ${jump:+.2f} {self._horizon()} "
-                                f"< ${c.jump_small_usd:.0f} — жду")
+                                f"< ${small:.1f}{sc_txt} — жду")
 
         side = "Up" if jump > 0 else "Down"
         ask = s.ask(side)
@@ -247,24 +288,26 @@ class JumpStrategy:
         # Дорогая сторона (>= сплита) — хватает малого скачка; дешёвая
         # требует большого И близости к таргету.
         if ask >= c.jump_price_split:
-            track, need = TRACK_A, c.jump_small_usd
+            track, need = TRACK_A, small
         else:
-            track, need = TRACK_B, c.jump_big_usd
+            track, need = TRACK_B, big
 
         if abs(jump) < need:
             return Action(NONE, (
                 f"{side} ask {ask:.2f} < {c.jump_price_split:.2f} — дешёвой "
-                f"стороне нужен скачок ${need:.0f}, а он ${jump:+.2f}"))
+                f"стороне нужен скачок ${need:.1f}{sc_txt}, а он ${jump:+.2f}"))
 
         if track == TRACK_B:
             if s.target is None:
                 return Action(NONE, f"{side} дешёвая ({ask:.2f}), но таргет "
                                     f"раунда ещё не известен — не вхожу")
             dist = abs(s.coin_price - s.target)
-            if dist > c.jump_max_target_dist_usd:
+            limit = self.max_target_distance(s)
+            if dist > limit:
                 return Action(NONE, (
                     f"{side} дешёвая ({ask:.2f}): до таргета ${dist:,.0f} > "
-                    f"${c.jump_max_target_dist_usd:,.0f} — скачок не спасёт"))
+                    f"${limit:,.0f} ({c.jump_max_target_sigmas:.0f}σ) — "
+                    f"скачок не спасёт"))
 
         if ask > c.jump_max_leg_price:
             return Action(NONE, f"{side} ask {ask:.2f} > потолка "
@@ -288,7 +331,7 @@ class JumpStrategy:
             track=track,
             reason=(f"СКАЧОК ${jump:+.2f} {self._horizon()} "
                     f"({'вверх' if jump > 0 else 'вниз'}) → {side} @ {ask:.2f} "
-                    f"[дорожка {track}: порог ${need:.0f}], ставка ${stake:.2f}"),
+                    f"[дорожка {track}: порог ${need:.1f}{sc_txt}], ставка ${stake:.2f}"),
         )
 
     # ======================================================================
