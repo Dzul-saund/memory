@@ -18,6 +18,7 @@ import sys
 
 from .config import FlowConfig
 from .jump_engine import JumpEngine
+from .singleton import InstanceLock
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -59,6 +60,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="задать RTT вручную, мс (иначе меряем; ориентир 90)")
     p.add_argument("--hours", type=float, help="сколько работать, часов (деф. 24)")
     p.add_argument("--env-file", help="загрузить пресет .env (перекрывает .env)")
+    p.add_argument("--allow-multiple", action="store_true",
+                   help="разрешить вторую копию на той же монете (по умолчанию "
+                        "запрещено: каждая копия ведёт свою лестницу, и риск "
+                        "складывается)")
     p.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARNING")
     return p.parse_args(argv)
 
@@ -123,7 +128,25 @@ def main(argv=None) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    JumpEngine(cfg).run()
+    # Вторая копия на том же рынке вела бы ВТОРУЮ независимую лестницу: те же
+    # настройки, но удвоенный реальный риск и перемешанный CSV. Не даём.
+    log = logging.getLogger("jumpbot")
+    mode = "live" if not cfg.dry_run else "dry"
+    lock = InstanceLock(f"jumpbot-{cfg.asset}-{mode}")
+    if not lock.acquire() and not args.allow_multiple:
+        log.error(
+            "Скачковая система для %s (%s) уже запущена (PID %s). Вторая "
+            "копия вела бы свою лестницу — риск сложился бы, а потолок "
+            "$%.0f за раунд превратился бы в $%.0f. Закрой ту копию или "
+            "запусти с --allow-multiple, если это осознанно.",
+            cfg.asset.upper(), mode, lock.holder_pid,
+            cfg.jump_max_round_usdc, cfg.jump_max_round_usdc * 2)
+        return 3
+
+    try:
+        JumpEngine(cfg).run()
+    finally:
+        lock.release()
     return 0
 
 

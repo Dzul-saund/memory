@@ -273,7 +273,8 @@ class FlowEngine:
                 await self._buy(action.outcome, action.limit_price,
                                 action.size_usdc, is_flip=False)
             elif action.kind == EXIT:
-                await self._sell_current(action.sell_limit, "выход")
+                await self._sell_current(action.sell_limit, "выход",
+                                         result="SOLD_EXIT")
             elif action.kind == FLIP:
                 # Предосторожность №2: сначала «тут же» берём противоположную
                 # сторону (ловим разворот), ПОТОМ сбрасываем старую позицию.
@@ -281,7 +282,8 @@ class FlowEngine:
                 await self._buy(action.outcome, action.limit_price,
                                 action.size_usdc, is_flip=True)
                 await self._sell_position(old, action.sell_limit,
-                                          "разворот-выход")
+                                          "разворот-выход",
+                                          result="SOLD_FLIP")
         except Exception as exc:  # noqa: BLE001
             self.log.error("исполнение упало: %s", exc)
         finally:
@@ -335,11 +337,12 @@ class FlowEngine:
             _short(resp))
 
     async def _sell_current(self, sell_limit: Optional[float],
-                            tag: str) -> None:
-        await self._sell_position(self.pos, sell_limit, tag)
+                            tag: str, result: str = "SOLD") -> None:
+        await self._sell_position(self.pos, sell_limit, tag, result)
 
     async def _sell_position(self, pos: Optional[dict],
-                             sell_limit: Optional[float], tag: str) -> None:
+                             sell_limit: Optional[float], tag: str,
+                             result: str = "SOLD") -> None:
         """Продать конкретную позицию. Если это ТЕКУЩАЯ позиция движка —
         обнулить её и сообщить стратегии о выходе; если старая (при флипе,
         когда текущая уже стала противоположной) — только зафиксировать P&L."""
@@ -370,7 +373,8 @@ class FlowEngine:
             "(итого %+.2f) | ответ: %s",
             tag, pos["outcome"], shares, fill, proceeds, pnl,
             self.realized_pnl, _short(resp))
-        self._log_trade_row(pos, tag.upper(), fill, proceeds, pnl)
+        # tag — человеку в лог, result — ASCII-код в CSV рядом с WON/LOST.
+        self._log_trade_row(pos, result, fill, proceeds, pnl)
         if self.pos is pos:                 # продали текущую -> выходим во flat
             self.pos = None
             self.strategy.record_exit()

@@ -130,7 +130,7 @@ class JumpEngine(FlowEngine):
                 await self._buy_leg(action)
             elif action.kind == SELL:
                 await self._sell_leg(action.sell_idx, action.limit_price,
-                                     "фиксация")
+                                     "фиксация", result="SOLD_TP")
         except Exception as exc:  # noqa: BLE001 - движок должен жить
             self.log.error("исполнение упало: %s", exc)
         finally:
@@ -201,7 +201,12 @@ class JumpEngine(FlowEngine):
             cost, self.strategy.net_out, _short(resp))
 
     async def _sell_leg(self, idx: Optional[int], sell_limit: Optional[float],
-                        tag: str) -> None:
+                        tag: str, result: str = "SOLD") -> None:
+        """tag — человеку в лог, result — в CSV.
+
+        В колонке result должен лежать машиночитаемый ASCII-код рядом с
+        WON/LOST, а не русское слово: по нему потом фильтруют и считают.
+        """
         leg = next((lg for lg in self.legs if lg["idx"] == idx), None)
         if leg is None:
             return
@@ -228,7 +233,7 @@ class JumpEngine(FlowEngine):
             "(раунд %+.2f, итого %+.2f) | ответ: %s", tag, idx, leg["outcome"],
             shares, fill, proceeds, pnl, self._round_pnl, self.realized_pnl,
             _short(resp))
-        self._log_trade_row(_row(leg), tag.upper(), fill, proceeds, pnl)
+        self._log_trade_row(_row(leg), result, fill, proceeds, pnl)
 
     # ======================================================================
     #  Расчёт в конце окна: платит только выигравшая сторона

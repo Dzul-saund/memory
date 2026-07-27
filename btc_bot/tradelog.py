@@ -32,17 +32,28 @@ FIELDS = [
 
 
 class TradeLogger:
+    """Пишет строго в UTF-8, без BOM.
+
+    Без явной кодировки Python берёт локальную (на русской Windows — cp1251),
+    и любой не-ASCII текст потом читается как «????????». BOM намеренно НЕ
+    ставим: он превратил бы имя первой колонки в «﻿settled_at_utc» для
+    обычного csv.DictReader. Значения во всех колонках держим ASCII (коды
+    WON/LOST/SOLD_TP, а не русские слова), поэтому Excel открывает файл
+    правильно и без BOM.
+    """
+
     def __init__(self, path: Optional[str]):
         self.path = path or ""
         self.enabled = bool(self.path)
         self._lock = threading.Lock()
         if self.enabled and not os.path.exists(self.path):
-            with open(self.path, "w", newline="") as f:
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=FIELDS).writeheader()
 
     def append(self, row: dict) -> None:
         if not self.enabled:
             return
         clean = {k: row.get(k, "") for k in FIELDS}
-        with self._lock, open(self.path, "a", newline="") as f:
+        with self._lock, open(self.path, "a", newline="",
+                              encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=FIELDS).writerow(clean)
