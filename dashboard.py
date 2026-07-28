@@ -549,7 +549,7 @@ TRADER_BOT = False   # --trader-bot: вернуть старую панель ru
 
 
 def build_jump_pane(coin: str, live: bool, stake, max_round,
-                    record=None) -> Pane:
+                    record=None, entry_mode=None) -> Pane:
     """4-я система: скачковая лестница. Единственная, кто реально торгует.
 
     Работает поверх тех же источников, что и первые три панели (фиды
@@ -565,14 +565,17 @@ def build_jump_pane(coin: str, live: bool, stake, max_round,
         argv += ["--max-round", str(max_round)]
     if record:
         argv += ["--record", record]
+    if entry_mode:
+        argv += ["--entry-mode", entry_mode]
+    how = f", вход по «{entry_mode}»" if entry_mode else ""
     title = (f"СДЕЛКИ — скачковая система ({coin.upper()}, "
-             f"{'LIVE' if live else 'dry-run'})")
+             f"{'LIVE' if live else 'dry-run'}{how})")
     return Pane("jump", title, argv, None, PANE_COLORS[3])
 
 
 def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int,
                 include_jump: bool = True, stake=None, max_round=None,
-                record=None):
+                record=None, entry_mode=None):
     price = Pane("price", f"ЦЕНА — fast_monitor ({coin.upper()})",
                  [PY, "-u", "fast_monitor.py", "--coin", coin, "--auto-target"],
                  None, PANE_COLORS[0])
@@ -635,6 +638,11 @@ def main(argv=None) -> int:
     ap.add_argument("--max-round", type=float,
                     help="потолок вложений скачковой системы за раунд, USDC "
                          "(по умолч. 25)")
+    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
+                    help="повод для входа 4-й системы: jump — скачок цены "
+                         "(деф.), edge — запас Phi(z)−ask, lag — отставание "
+                         "якоря Polymarket. Разные режимы = разные замки и "
+                         "разные файлы, их можно держать запущенными разом")
     ap.add_argument("--record", metavar="FILE",
                     help="писать всё, что видит торгующая система, в JSONL "
                          "(потом: python replay.py FILE / features.py FILE)")
@@ -656,7 +664,7 @@ def main(argv=None) -> int:
     panes = build_panes(args.coin, args.live, not args.no_trader,
                         args.book_depth, include_jump=not args.no_jump,
                         stake=args.stake, max_round=args.max_round,
-                        record=args.record)
+                        record=args.record, entry_mode=args.entry_mode)
 
     # --- самопроверка раскладки без запуска процессов ---
     if args.selftest:

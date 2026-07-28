@@ -71,6 +71,12 @@ class JumpSnapshot:
     down_ask: Optional[float] = None
     up_flow: float = 0.0              # имбаланс потока Up в [-1,1]
     down_flow: float = 0.0
+    # Цена, по которой считает САМ Polymarket (якорь Chainlink с их потока).
+    # В fast_monitor это якорь уровня: остальные биржи дебиасятся относительно
+    # него, поэтому разрыв «coin_price − pm_price» — чистое опережение, без
+    # постоянного базиса между площадками.
+    pm_price: Optional[float] = None
+    pm_age_ms: Optional[float] = None
 
     def bid(self, outcome: str) -> Optional[float]:
         return self.up_bid if outcome == "Up" else self.down_bid
@@ -291,6 +297,12 @@ class JumpStrategy:
         return f"за {c.jump_window_s:.0f}с"
 
     def _maybe_enter(self, s: JumpSnapshot) -> Action:
+        """Общие предусловия, затем триггер выбранного режима.
+
+        Режимы различаются РОВНО тем, что считают поводом войти. Всё, что
+        дальше (размер ставки, лестница, фиксация, потолки), у них общее —
+        иначе сравнение трёх запусков мерило бы сразу несколько изменений.
+        """
         c = self.cfg
         if s.coin_price is None:
             return Action(NONE, "нет цены монеты")
@@ -302,8 +314,135 @@ class JumpStrategy:
                 and s.t - self._last_fill_t < cooldown):
             return Action(NONE, f"пауза после сделки "
                                 f"({s.t - self._last_fill_t:.1f}<"
-                                f"{cooldown:.1f}с) — жду новый скачок")
+                                f"{cooldown:.1f}с) — жду сигнал заново")
 
+        mode = getattr(c, "jump_entry_mode", "jump")
+        if mode == "edge":
+            picked = self._trigger_edge(s)
+        elif mode == "lag":
+            picked = self._trigger_lag(s)
+        else:
+            picked = self._trigger_jump(s)
+        if isinstance(picked, Action):
+            return picked                      # отказ с объяснением
+        side, track, why = picked
+
+        stake = min(c.jump_stake_usdc, c.jump_max_round_usdc)
+        ask = s.ask(side)
+        return Action(
+            ENTER, outcome=side, limit_price=round(ask, 2), size_usdc=stake,
+            track=track, reason=f"{why}, ставка ${stake:.2f}",
+        )
+
+    # ---- режим "edge": триггер — запас цены ---------------------------------
+    def _trigger_edge(self, s: JumpSnapshot):
+        """Входим туда, где справедливая цена выше запрошенной.
+
+        Это буквально EV = p − ask, единственная величина, которая отвечает
+        на вопрос «зарабатываем ли мы, если досидим до расчёта». Скачок сюда
+        не входит вовсе — ни как условие, ни как поправка.
+
+        Потолок цены ноги здесь не формальность, а защита от известной дыры
+        модели: у крипты хвосты толще нормальных, поэтому у самых краёв Phi
+        говорит «справедливо 100¢» там, где на деле 99.5¢, и без потолка бот
+        скупал бы всё по 0.98, пока одна потеря не съест полсотни выигрышей.
+        """
+        c = self.cfg
+        fair_up = fair_up_probability(s.coin_price, s.target, s.sigma_1s,
+                                      max(s.seconds_left, 0.5))
+        if fair_up is None:
+            return Action(NONE, "нет таргета или σ — запас не посчитать")
+
+        best = None
+        for side in ("Up", "Down"):
+            ask = s.ask(side)
+            if ask is None:
+                continue
+            fair = fair_up if side == "Up" else 1.0 - fair_up
+            if best is None or fair - ask > best[1]:
+                best = (side, fair - ask, ask, fair)
+        if best is None:
+            return Action(NONE, "нет ask ни на одной стороне")
+
+        side, edge, ask, fair = best
+        if edge * 100 < c.jump_min_edge_cents:
+            return Action(NONE, (
+                f"лучший запас {side} {edge*100:+.1f}¢ < "
+                f"{c.jump_min_edge_cents:.1f}¢ — брать нечего"))
+        if ask > c.jump_max_leg_price:
+            return Action(NONE, (
+                f"{side} ask {ask:.2f} > потолка {c.jump_max_leg_price:.2f} — "
+                f"у краёв модель занижает хвост, запас там ненастоящий"))
+
+        track = TRACK_A if ask >= c.jump_price_split else TRACK_B
+        return side, track, (
+            f"ЗАПАС {side}: справедливо {fair*100:.0f}¢, просят "
+            f"{ask*100:.0f}¢ → +{edge*100:.1f}¢ [дорожка {track}]")
+
+    # ---- режим "lag": триггер — отставание якоря Polymarket -----------------
+    def _trigger_lag(self, s: JumpSnapshot):
+        """Книга считает по устаревшей цене — входим до того, как догонит.
+
+        Отличие от edge: тот говорит «книга дешевле справедливого», но не
+        знает почему. Здесь причина названа и измерена — Polymarket считает
+        раунд по своему якорю, а он отстал от бирж, — поэтому у сигнала есть
+        и величина (на сколько центов книга переоценится), и срок годности
+        (пока якорь не обновится, ~288мс).
+
+        Запас проверяется всё равно: отставание обещает, что цена сдвинется,
+        но не обещает, что мы не переплатили уже сейчас.
+        """
+        c = self.cfg
+        if s.pm_price is None:
+            return Action(NONE, "цена якоря Polymarket неизвестна")
+        if (s.pm_age_ms is not None
+                and s.pm_age_ms > c.jump_lag_max_age_ms):
+            return Action(NONE, (
+                f"якорь Polymarket молчит {s.pm_age_ms:.0f}мс > "
+                f"{c.jump_lag_max_age_ms:.0f}мс — это дырка в потоке, "
+                f"а не опережение"))
+
+        t = max(s.seconds_left, 0.5)
+        ours = fair_up_probability(s.coin_price, s.target, s.sigma_1s, t)
+        theirs = fair_up_probability(s.pm_price, s.target, s.sigma_1s, t)
+        if ours is None or theirs is None:
+            return Action(NONE, "нет таргета или σ — отставание не посчитать")
+
+        lag = ours - theirs          # > 0 => книга недооценивает Up
+        gap = s.coin_price - s.pm_price
+        if abs(lag) * 100 < c.jump_lag_min_cents:
+            return Action(NONE, (
+                f"книга переоценится лишь на {abs(lag)*100:.1f}¢ "
+                f"(< {c.jump_lag_min_cents:.1f}¢), отставание ${gap:+.2f}"))
+
+        side = "Up" if lag > 0 else "Down"
+        ask = s.ask(side)
+        if ask is None:
+            return Action(NONE, f"{side}: нет ask в книге")
+        if ask > c.jump_max_leg_price:
+            return Action(NONE, (
+                f"{side} ask {ask:.2f} > потолка {c.jump_max_leg_price:.2f} — "
+                f"у краёв модель занижает хвост, запас там ненастоящий"))
+
+        fair = ours if side == "Up" else 1.0 - ours
+        edge = fair - ask
+        if edge * 100 < c.jump_min_edge_cents:
+            return Action(NONE, (
+                f"{side}: отставание {abs(lag)*100:.1f}¢ есть, но запас "
+                f"{edge*100:+.1f}¢ < {c.jump_min_edge_cents:.1f}¢ — книга "
+                f"уже переоценилась, мы опоздали"))
+
+        track = TRACK_A if ask >= c.jump_price_split else TRACK_B
+        age = f", {s.pm_age_ms:.0f}мс" if s.pm_age_ms is not None else ""
+        return side, track, (
+            f"ОТСТАВАНИЕ ЯКОРЯ: мы {s.coin_price:,.0f}, Polymarket "
+            f"{s.pm_price:,.0f} (${gap:+.2f}{age}) → книге переоцениться на "
+            f"{abs(lag)*100:.1f}¢ → {side} @ {ask:.2f}, запас "
+            f"+{edge*100:.1f}¢ [дорожка {track}]")
+
+    # ---- режим "jump": исходный триггер по скачку цены ----------------------
+    def _trigger_jump(self, s: JumpSnapshot):
+        c = self.cfg
         # Пороги подстраиваются под живость рынка: на разогнанном рынке тот же
         # скачок двигает процент во столько же раз слабее.
         scale = self.vol_scale(s)
@@ -373,14 +512,10 @@ class JumpStrategy:
                 f"исход уже решён" if s.target is not None else
                 f"{side}: ожидаемый сдвиг процента {abs(shift)*100:.1f}¢ мал"))
 
-        stake = min(c.jump_stake_usdc, c.jump_max_round_usdc)
-        return Action(
-            ENTER, outcome=side, limit_price=round(ask, 2), size_usdc=stake,
-            track=track,
-            reason=(f"СКАЧОК ${jump:+.2f} {self._horizon()} "
-                    f"({'вверх' if jump > 0 else 'вниз'}) → {side} @ {ask:.2f} "
-                    f"[дорожка {track}: порог ${need:.1f}{sc_txt}], ставка ${stake:.2f}"),
-        )
+        return side, track, (
+            f"СКАЧОК ${jump:+.2f} {self._horizon()} "
+            f"({'вверх' if jump > 0 else 'вниз'}) → {side} @ {ask:.2f} "
+            f"[дорожка {track}: порог ${need:.1f}{sc_txt}]")
 
     # ======================================================================
     #  Фиксация прибыли — обе дорожки

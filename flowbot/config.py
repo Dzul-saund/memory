@@ -108,6 +108,27 @@ class FlowConfig:
     # =========================================================================
     #  СКАЧКОВАЯ стратегия (4-я система, flowbot.jump) — пороги в ДОЛЛАРАХ
     # =========================================================================
+    # ЧТО СЛУЖИТ ТРИГГЕРОМ ВХОДА. Три режима, всё остальное (лестница,
+    # фиксация, потолки) у них общее — чтобы сравнение меняло РОВНО одну вещь.
+    #
+    #   "jump" — скачок цены в долларах. Исходная идея. Известный изъян:
+    #            скачок не входит ни в один член EV = p − ask, поэтому он и
+    #            не нужен (сигнал бывает без скачка), и не достаточен
+    #            (скачок на 15σ от таргета не двигает процент вообще).
+    #   "edge" — запас цены: Phi(z) − ask по обеим сторонам, берём лучшую.
+    #            Прямо то, что стоит в EV. Скачок падает до уровня признака,
+    #            который потом померяет features.py.
+    #   "lag"  — отставание якоря: Phi(z по НАШЕЙ цене) − Phi(z по цене
+    #            Polymarket). Отвечает не только «книга дешевле справедливого»,
+    #            но и ПОЧЕМУ (она считает по устаревшей цене) и НАСКОЛЬКО
+    #            это протянет (~288мс). Строже edge: требует ещё и запас.
+    jump_entry_mode: str = "jump"
+    # Порог режима "lag" в центах: на сколько книга обязана переоцениться,
+    # чтобы вход имел смысл.
+    jump_lag_min_cents: float = 3.0
+    # Якорь Polymarket обновляется рывками. Если последняя его цена старше
+    # этого, разрыв «наша − pm» показывает не опережение, а дырку в потоке.
+    jump_lag_max_age_ms: float = 1500.0
     # Здесь «резкое движение» меряется не в σ, а прямо в долларах цены монеты,
     # как просил юзер: «скачок 5 долларов» / «скачок 15 долларов».
     # КАК ловим скачок:
@@ -260,6 +281,9 @@ class FlowConfig:
             flow_confirm=_b("FLOW_FLOW_CONFIRM", True),
             flow_veto=_f("FLOW_FLOW_VETO", -0.6),
             flow_window_s=_f("FLOW_FLOW_WINDOW_S", 3.0),
+            jump_entry_mode=(_s("JUMP_ENTRY_MODE", "jump") or "jump").lower(),
+            jump_lag_min_cents=_f("JUMP_LAG_MIN_CENTS", 3.0),
+            jump_lag_max_age_ms=_f("JUMP_LAG_MAX_AGE_MS", 1500.0),
             jump_trigger_mode=(_s("JUMP_TRIGGER_MODE", "swing") or "swing").lower(),
             jump_swing_lookback_s=_f("JUMP_SWING_LOOKBACK_S", 60.0),
             jump_window_s=_f("JUMP_WINDOW_S", 3.0),
@@ -347,6 +371,19 @@ class FlowConfig:
         errs = []
         if self.jump_stake_usdc <= 0:
             errs.append("JUMP_STAKE_USDC должен быть > 0")
+        if self.jump_entry_mode not in ("jump", "edge", "lag"):
+            errs.append(f"JUMP_ENTRY_MODE должен быть jump, edge или lag, "
+                        f"а не {self.jump_entry_mode!r}")
+        if self.jump_entry_mode == "edge" and self.jump_min_edge_cents <= 0:
+            errs.append("режим edge требует JUMP_MIN_EDGE_CENTS > 0 — "
+                        "запас и есть его единственный триггер")
+        if self.jump_entry_mode == "lag":
+            if self.jump_lag_min_cents <= 0:
+                errs.append("режим lag требует JUMP_LAG_MIN_CENTS > 0")
+            if self.jump_min_edge_cents <= 0:
+                errs.append("режим lag требует JUMP_MIN_EDGE_CENTS > 0: "
+                            "отставание якоря говорит, что книга переоценится, "
+                            "но не о том, что мы не переплачиваем")
         if self.jump_trigger_mode not in ("swing", "window"):
             errs.append(f"JUMP_TRIGGER_MODE должен быть swing или window, "
                         f"а не {self.jump_trigger_mode!r}")

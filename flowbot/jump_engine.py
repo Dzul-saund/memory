@@ -104,6 +104,13 @@ class JumpEngine(FlowEngine):
         else:
             jump_usd, jump_bps = self.price.move_usd(cfg.jump_window_s)
 
+        # Якорь Polymarket: цена, по которой считает раунд САМА площадка.
+        # В fast_monitor остальные биржи дебиасятся относительно него, поэтому
+        # разрыв «наша цена − pm» — чистое опережение, а не базис площадок.
+        pm = fast_monitor.prices.get("polymarket")
+        pm_age = (now_ms() - fast_monitor.last_update.get("polymarket", 0)
+                  if pm is not None else None)
+
         snap = JumpSnapshot(
             t=time.time(),
             seconds_left=max(0.0, self.market["end_ts"] - time.time()),
@@ -113,6 +120,7 @@ class JumpEngine(FlowEngine):
             up_bid=ub, up_ask=ua, down_bid=db, down_ask=da,
             up_flow=self.book.flow(up, cfg.flow_window_s),
             down_flow=self.book.flow(dn, cfg.flow_window_s),
+            pm_price=pm, pm_age_ms=pm_age,
         )
 
         # Запоминаем последний bid каждой ноги — по нему считаем расчёт, если
@@ -329,12 +337,10 @@ class JumpEngine(FlowEngine):
             w = self.cfg.flow_window_s
             u_buy, u_sell, u_n = self.book.trade_counts(up, w)
             d_buy, d_sell, d_n = self.book.trade_counts(dn, w)
-            # Цена, которую видит САМ Polymarket (якорь Chainlink), и её
-            # возраст. Опережение = наш консенсус минус она. Именно эта
-            # разница — преимущество, а не разница с таргетом раунда.
-            pm = fast_monitor.prices.get("polymarket")
-            pm_age = (now_ms() - fast_monitor.last_update.get("polymarket", 0)
-                      if pm is not None else None)
+            # Якорь Polymarket берём ИЗ СНИМКА, а не читаем заново: иначе в
+            # записи оказалась бы цена на миллисекунды свежее той, по которой
+            # стратегия принимала решение, и replay расходился бы с боевым.
+            pm, pm_age = snap.pm_price, snap.pm_age_ms
             self._rec.write(json.dumps({
                 "t": round(snap.t, 3), "slug": (self.market or {}).get("slug"),
                 "left": round(snap.seconds_left, 2),
@@ -443,11 +449,17 @@ class JumpEngine(FlowEngine):
                               max(snap.seconds_left, 0.5),
                               self.cfg.jump_small_usd)
         s_txt = f" чувств {abs(sens)*100:4.1f}¢" if sens is not None else ""
+        # Отставание от якоря — то, ради чего существует режим lag. Держим его
+        # в строке всегда: даже в других режимах видно, есть ли опережение.
+        lag_txt = (f" лаг {snap.coin_price - snap.pm_price:+.1f}$"
+                   if snap.pm_price is not None and snap.coin_price is not None
+                   else "")
         self.log.info(
-            "t-%3ds | %s %s%s | скачок %+.2f$/%s%s | Up %s/%s Down %s/%s | "
-            "поз %s | вложено $%.2f | $%.2f | %s",
-            int(snap.seconds_left), self.cfg.asset.upper(),
-            _m(snap.coin_price), tgt, snap.jump_usd, how, s_txt,
+            "[%s] t-%3ds | %s %s%s | скачок %+.2f$/%s%s%s | Up %s/%s "
+            "Down %s/%s | поз %s | вложено $%.2f | $%.2f | %s",
+            self.cfg.jump_entry_mode, int(snap.seconds_left),
+            self.cfg.asset.upper(), _m(snap.coin_price), tgt, snap.jump_usd,
+            how, s_txt, lag_txt,
             _p(snap.up_bid), _p(snap.up_ask), _p(snap.down_bid),
             _p(snap.down_ask), pos, self.strategy.net_out,
             self._get_balance(), action.reason,
@@ -459,17 +471,33 @@ class JumpEngine(FlowEngine):
         self.log.info("=" * 72)
         self.log.info("СКАЧКОВАЯ система — %s Up/Down 5m — %s",
                       c.asset.upper(), mode)
-        if c.jump_trigger_mode == "swing":
-            how = (f"движение от локального дна/пика (окно поиска экстремума "
-                   f"{c.jump_swing_lookback_s:.0f}с, срабатывает сразу)")
+        if c.jump_entry_mode == "edge":
+            self.log.info(
+                "ВХОД ПО ЗАПАСУ: считаем Phi(z)−ask по обеим сторонам, берём "
+                "лучшую при запасе >=%.1f¢. Скачок цены на вход НЕ влияет.",
+                c.jump_min_edge_cents)
+            self.log.info(
+                "потолок цены ноги %.2f — у краёв модель занижает хвост, "
+                "и «запас» там ненастоящий", c.jump_max_leg_price)
+        elif c.jump_entry_mode == "lag":
+            self.log.info(
+                "ВХОД ПО ОТСТАВАНИЮ ЯКОРЯ: Phi(z по нашей цене) − Phi(z по "
+                "цене Polymarket) >= %.1f¢, якорь не старше %.0fмс, и при "
+                "этом запас >= %.1f¢", c.jump_lag_min_cents,
+                c.jump_lag_max_age_ms, c.jump_min_edge_cents)
         else:
-            how = f"движение за {c.jump_window_s:.0f}с"
-        self.log.info("детекция: %s", how)
-        self.log.info(
-            "вход: скачок >=$%.0f, если %% стороны >= %.2f; иначе нужен "
-            "скачок >=$%.0f и не дальше $%.0f от таргета",
-            c.jump_small_usd, c.jump_price_split,
-            c.jump_big_usd, c.jump_max_target_dist_usd)
+            if c.jump_trigger_mode == "swing":
+                how = (f"движение от локального дна/пика (окно поиска "
+                       f"экстремума {c.jump_swing_lookback_s:.0f}с, "
+                       f"срабатывает сразу)")
+            else:
+                how = f"движение за {c.jump_window_s:.0f}с"
+            self.log.info("детекция: %s", how)
+            self.log.info(
+                "вход: скачок >=$%.0f, если %% стороны >= %.2f; иначе нужен "
+                "скачок >=$%.0f и не дальше $%.0f от таргета",
+                c.jump_small_usd, c.jump_price_split,
+                c.jump_big_usd, c.jump_max_target_dist_usd)
         self.log.info(
             "ставка $%.2f; провал ниже %.2f → добор противоположной стороны на "
             "(вложено+%.2f)/(1-цена); максимум %d доборов и $%.0f за раунд",

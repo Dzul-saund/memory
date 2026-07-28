@@ -57,6 +57,8 @@ def to_snapshot(r: dict) -> JumpSnapshot:
         up_bid=r.get("ub"), up_ask=r.get("ua"),
         down_bid=r.get("db"), down_ask=r.get("da"),
         up_flow=r.get("uf", 0.0), down_flow=r.get("df", 0.0),
+        # Якорь Polymarket — без него режим входа "lag" на записи не проиграть.
+        pm_price=r.get("pm"), pm_age_ms=r.get("pm_age"),
     )
 
 
@@ -151,8 +153,13 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             cost = round(ask * shares, 4)
             if strat.net_out + cost > cfg.jump_max_round_usdc + 1e-9:
                 continue
+            # Бид на входе обязателен: разворот считается от него, а не от
+            # уплаченного ask. Без него проигрывание разворачивало бы позицию
+            # в тот же тик на каждой сделке — спред выглядел бы просадкой.
+            eb = snap.bid(act.outcome)
             leg = strat.record_entry(act.outcome, ask, shares, cost,
-                                     act.track, snap.t)
+                                     act.track, snap.t,
+                                     entry_bid=eb if eb is not None else ask)
             legs.append({"idx": leg.idx, "side": act.outcome,
                          "shares": shares, "cost": cost, "last_bid": ask})
             res.spent += cost
@@ -184,6 +191,12 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
 
 
 SWEEPS = {
+    # Сравнение трёх режимов входа на ОДНОЙ записи — самый честный способ
+    # их сопоставить: рынок буквально один и тот же, отличается только повод
+    # войти. Живые запуски такого не дают, там у каждого свой поток тиков.
+    "entry-mode": ("jump_entry_mode", str),
+    "lag-cents": ("jump_lag_min_cents", float),
+    "edge-cents": ("jump_min_edge_cents", float),
     "max-legs": ("jump_max_ladder_legs", int),
     "min-shift": ("jump_min_shift_cents", float),
     "small": ("jump_small_usd", float),
@@ -202,6 +215,9 @@ def main(argv=None) -> int:
         description="Прогнать запись рынка через скачковую стратегию")
     ap.add_argument("recording", help="файл JSONL от --record")
     ap.add_argument("--env-file", help="пресет с порогами")
+    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
+                    help="повод войти: jump (скачок), edge (запас), "
+                         "lag (отставание якоря Polymarket)")
     ap.add_argument("--max-legs", type=int)
     ap.add_argument("--min-shift", type=float)
     ap.add_argument("--stake", type=float)
@@ -221,6 +237,8 @@ def main(argv=None) -> int:
 
     def build() -> FlowConfig:
         c = FlowConfig.from_env()
+        if args.entry_mode:
+            c.jump_entry_mode = args.entry_mode
         if args.max_legs is not None:
             c.jump_max_ladder_legs = args.max_legs
         if args.min_shift is not None:

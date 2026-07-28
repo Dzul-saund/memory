@@ -14,11 +14,20 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from .config import FlowConfig
 from .jump_engine import JumpEngine
 from .singleton import InstanceLock
+
+
+def tag_path(path: str, tag: str) -> str:
+    """`market.jsonl` + `edge` -> `market_edge.jsonl`; пустая строка как есть."""
+    if not path:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}_{tag}{ext}"
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -41,6 +50,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="скачок для дешёвой стороны, $ (деф. 15)")
     p.add_argument("--split", type=float,
                    help="граница дорого/дёшево по проценту (деф. 0.51)")
+    p.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
+                   help="ЧТО считать поводом войти: jump — скачок цены "
+                        "(деф.); edge — запас Phi(z)−ask; lag — отставание "
+                        "якоря Polymarket. Всё остальное у режимов общее, "
+                        "поэтому их запуски можно сравнивать напрямую")
     p.add_argument("--trigger", choices=["swing", "window"],
                    help="swing (деф.) — ловим движение от локального дна/пика "
                         "сразу; window — сравниваем с ценой N секунд назад")
@@ -94,6 +108,8 @@ def main(argv=None) -> int:
     cfg = FlowConfig.from_env()
     if args.coin:
         cfg.asset = args.coin
+    if args.entry_mode:
+        cfg.jump_entry_mode = args.entry_mode
     if args.stake is not None:
         cfg.jump_stake_usdc = args.stake
     if args.small is not None:
@@ -127,26 +143,42 @@ def main(argv=None) -> int:
     if args.dry_run:
         cfg.dry_run = True
 
+    # Режимы входа — это ПАРАЛЛЕЛЬНЫЕ эксперименты: их запускают одновременно,
+    # в том числе рядом с уже работающей копией. Разводим всё, что копии могли
+    # бы затоптать друг у друга. Режим jump сохраняет прежние имена файлов и
+    # прежний замок — иначе уже запущенный бот потерял бы свою историю, а
+    # вторая его копия смогла бы стартовать рядом с ним.
+    entry = cfg.jump_entry_mode
+    if entry != "jump":
+        cfg.trade_log_csv = tag_path(cfg.trade_log_csv, entry)
+        cfg.record_path = tag_path(cfg.record_path, entry)
+
     try:
         cfg.validate_jump()
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
 
-    # Вторая копия на том же рынке вела бы ВТОРУЮ независимую лестницу: те же
+    # Вторая копия НА ТОМ ЖЕ РЕЖИМЕ вела бы вторую независимую лестницу: те же
     # настройки, но удвоенный реальный риск и перемешанный CSV. Не даём.
+    # Разные режимы входа — разные замки: они и должны работать бок о бок.
     log = logging.getLogger("jumpbot")
     mode = "live" if not cfg.dry_run else "dry"
-    lock = InstanceLock(f"jumpbot-{cfg.asset}-{mode}")
+    suffix = "" if entry == "jump" else f"-{entry}"
+    lock = InstanceLock(f"jumpbot-{cfg.asset}-{mode}{suffix}")
     if not lock.acquire() and not args.allow_multiple:
         log.error(
-            "Скачковая система для %s (%s) уже запущена (PID %s). Вторая "
+            "Система %s (%s, вход по «%s») уже запущена (PID %s). Вторая "
             "копия вела бы свою лестницу — риск сложился бы, а потолок "
-            "$%.0f за раунд превратился бы в $%.0f. Закрой ту копию или "
-            "запусти с --allow-multiple, если это осознанно.",
-            cfg.asset.upper(), mode, lock.holder_pid,
+            "$%.0f за раунд превратился бы в $%.0f. Закрой ту копию, или "
+            "запусти ДРУГОЙ режим входа (--entry-mode), или --allow-multiple, "
+            "если это осознанно.",
+            cfg.asset.upper(), mode, entry, lock.holder_pid,
             cfg.jump_max_round_usdc, cfg.jump_max_round_usdc * 2)
         return 3
+
+    log.info("режим входа: %s | сделки -> %s | запись -> %s", entry,
+             cfg.trade_log_csv or "(выкл)", cfg.record_path or "(выкл)")
 
     try:
         JumpEngine(cfg).run()
