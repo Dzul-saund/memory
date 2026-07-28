@@ -9,7 +9,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flowbot.singleton import InstanceLock, _pid_alive  # noqa: E402
+from flowbot.singleton import (  # noqa: E402
+    InstanceLock, _pid_alive, _win_verdict,
+)
 
 
 def test_first_acquires_second_refused(tmp_path):
@@ -83,3 +85,26 @@ def test_pid_alive_true_for_self_false_for_dead():
     dead.wait()
     assert _pid_alive(dead.pid) is False
     assert _pid_alive(-1) is False
+
+
+# --- Windows-ветка ----------------------------------------------------------
+# Решение вынесено в чистую функцию, поэтому проверяется на любой ОС: поднять
+# на Linux процесс-зомби, который ловил бы этот баг, всё равно нельзя.
+
+def test_win_zombie_with_open_handle_is_dead():
+    """Главный случай. Процесс завершился, но родитель держит хэндл, поэтому
+    OpenProcess его находит. Живым он от этого не становится."""
+    assert _win_verdict(True, 0, 0) is False          # WAIT_OBJECT_0
+
+
+def test_win_running_process_is_alive():
+    assert _win_verdict(True, 0, 0x102) is True       # WAIT_TIMEOUT
+
+
+def test_win_no_such_process_is_dead():
+    assert _win_verdict(False, 87, 0) is False        # ERROR_INVALID_PARAMETER
+
+
+def test_win_access_denied_counts_as_alive():
+    """Чужой процесс существует — замок у него отбирать нельзя."""
+    assert _win_verdict(False, 5, 0) is True          # ERROR_ACCESS_DENIED
