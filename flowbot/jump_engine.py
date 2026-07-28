@@ -134,7 +134,14 @@ class JumpEngine(FlowEngine):
     async def _execute(self, action) -> None:
         try:
             self.log.warning(">>> %s: %s", action.kind.upper(), action.reason)
-            if action.kind in (ENTER, LADDER):
+            if action.kind == LADDER and action.sell_idx is not None:
+                # Разворот: сперва закрываем провалившуюся ногу — она вернёт
+                # капитал, и добор считается уже от РЕАЛИЗОВАННОГО убытка,
+                # а не от полной стоимости ноги.
+                await self._sell_leg(action.sell_idx, None, "разворот",
+                                     result="SOLD_FLIP")
+                await self._buy_leg(action)
+            elif action.kind in (ENTER, LADDER):
                 await self._buy_leg(action)
             elif action.kind == SELL:
                 await self._sell_leg(action.sell_idx, action.limit_price,
@@ -194,8 +201,11 @@ class JumpEngine(FlowEngine):
         # Движение отработано — переставляем экстремум на текущую цену, иначе
         # то же самое дно секунду спустя открыло бы ещё одну такую же сделку.
         self.price.reset_swing()
+        # bid на момент входа: от него считается движение против нас, иначе
+        # спред выглядел бы как мгновенная просадка.
         leg = self.strategy.record_entry(outcome, fill, shares, cost,
-                                         action.track, time.time())
+                                         action.track, time.time(),
+                                         entry_bid=bid if bid is not None else fill)
         self.legs.append({
             "idx": leg.idx, "outcome": outcome, "token": token,
             "entry_price": fill, "shares": shares, "cost": cost,

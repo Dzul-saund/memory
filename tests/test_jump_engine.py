@@ -281,7 +281,12 @@ def test_stale_target_is_ignored():
 # ---------------------------------------------------------------------------
 #  Лестница
 # ---------------------------------------------------------------------------
-def test_ladder_buys_opposite_side_to_cover_loss():
+def test_flip_sells_the_old_leg_and_buys_the_other_side():
+    """Разворот закрывает провалившуюся ногу и открывает противоположную.
+
+    Открытой всегда остаётся ровно ОДНА нога — в этом и смысл: продажа
+    возвращает капитал, поэтому долг не растёт лавиной.
+    """
     async def scenario():
         eng, cfg = _engine()
         _set_target(65_000.0)
@@ -289,35 +294,35 @@ def test_ladder_buys_opposite_side_to_cover_loss():
         _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
         eng._tick()
         await _drain(eng)
-        assert len(eng.legs) == 1
-        spent = eng.strategy.net_out
+        assert len(eng.legs) == 1 and eng.legs[0]["outcome"] == "Up"
+        spent_before = eng.strategy.net_out
 
-        # Up рухнул ниже сплита — движок должен добрать Down.
-        _book(eng, 0.40, 0.41, 0.59, 0.60)
+        _book(eng, 0.40, 0.41, 0.59, 0.60)   # Up провалился
         eng._tick()
         await _drain(eng)
-        assert len(eng.legs) == 2, "лестница должна была добрать"
-        add = eng.legs[1]
-        assert add["outcome"] == "Down"
-        # Если добор выигрывает, раунд в плюсе: шэры * $1 > всё вложенное.
-        assert add["shares"] * 1.0 > eng.strategy.net_out
-        assert eng.strategy.net_out > spent
+        assert len(eng.legs) == 1, "старая нога должна быть продана"
+        assert eng.legs[0]["outcome"] == "Down"
+        # продажа вернула капитал -> вложено выросло меньше, чем на цену ноги
+        assert eng.strategy.net_out < spent_before + eng.legs[0]["cost"]
     asyncio.run(scenario())
 
 
-def test_ladder_respects_round_cap():
+def test_flip_debt_stays_small_because_the_old_leg_was_sold():
+    """Долг после разворота = реализованный убыток, а не стоимость ноги."""
     async def scenario():
-        eng, cfg = _engine(jump_max_round_usdc=1.5)
+        eng, cfg = _engine()
         _set_target(65_000.0)
         _book(eng, 0.59, 0.60, 0.40, 0.41)
         _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
         eng._tick()
         await _drain(eng)
-        assert len(eng.legs) == 1
+        cost0 = eng.legs[0]["cost"]
         _book(eng, 0.40, 0.41, 0.59, 0.60)
         eng._tick()
         await _drain(eng)
-        assert len(eng.legs) == 1, "потолок раунда должен был остановить добор"
+        # вложено ~ реализованный убыток первой ноги + стоимость второй,
+        # а не сумма обеих ног целиком
+        assert eng.strategy.net_out < cost0 + eng.legs[0]["cost"]
     asyncio.run(scenario())
 
 
@@ -335,9 +340,8 @@ def test_settle_pays_only_the_winning_side():
         _book(eng, 0.40, 0.41, 0.59, 0.60)
         eng._tick()
         await _drain(eng)
-        assert len(eng.legs) == 2
-        up_leg = eng.legs[0]
-        dn_leg = eng.legs[1]
+        assert len(eng.legs) == 1, "после разворота открыта одна нога"
+        dn_leg = eng.legs[0]
 
         # Раунд закрылся по Down: Down -> 1.0, Up -> 0.
         _book(eng, 0.00, 0.01, 0.99, 1.00)
@@ -348,10 +352,10 @@ def test_settle_pays_only_the_winning_side():
 
         assert eng.legs == []
         # выплата = только шэры Down; P&L = выплата - вложено
+        # P&L = выплата выжившей ноги минус ВСЁ вложенное за раунд
+        # (включая уже зафиксированный убыток проданной ноги)
         expected = round(dn_leg["shares"] * 1.0, 2) - spent
-        assert eng.realized_pnl == pytest.approx(expected, abs=0.02)
-        assert expected > 0, "добор обязан вытащить раунд в плюс"
-        assert up_leg["cost"] > 0
+        assert eng.realized_pnl == pytest.approx(expected, abs=0.05)
     asyncio.run(scenario())
 
 

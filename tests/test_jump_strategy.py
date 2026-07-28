@@ -347,17 +347,20 @@ class TestSensitivityFilter:
 #  Удержание и лестница
 # ---------------------------------------------------------------------------
 class TestLadder:
-    def _entered(self, cfg, price=0.60, track=TRACK_A, t=100.0):
+    def _entered(self, cfg, price=0.60, track=TRACK_A, t=100.0, bid=None):
+        """Вход по ask=price; бид на входе на цент ниже, если не задан."""
         s = JumpStrategy(cfg)
-        s.record_entry("Up", price, round(1.0 / price, 2), 1.0, track, t=t)
+        eb = bid if bid is not None else price - 0.01
+        s.record_entry("Up", price, round(1.0 / price, 2), 1.0, track, t=t,
+                       entry_bid=eb)
         return s
 
-    def test_holds_while_above_split(self, cfg):
+    def test_holds_while_not_losing(self, cfg):
         s = self._entered(cfg)
         a = s.on_tick(snap(t=105.0, up_bid=0.58, up_ask=0.59,
                            down_bid=0.41, down_ask=0.42))
         assert a.kind == HOLD
-        assert "до расчёта" in a.reason
+        assert "держится" in a.reason
 
     def test_grace_delays_the_ladder(self, cfg):
         """Один проваленный тик — ещё не повод добирать."""
@@ -367,7 +370,8 @@ class TestLadder:
         assert a.kind == HOLD
         assert "подтверждения" in a.reason
 
-    def test_ladder_fires_after_grace(self, cfg):
+    def test_flip_fires_after_grace_and_sells_the_old_leg(self, cfg):
+        """Разворот обязан НЕСТИ приказ продать провалившуюся ногу."""
         s = self._entered(cfg)
         s.on_tick(snap(t=105.0, up_bid=0.40, up_ask=0.41,
                        down_bid=0.59, down_ask=0.60))
@@ -375,19 +379,25 @@ class TestLadder:
                            down_bid=0.59, down_ask=0.60))
         assert a.kind == LADDER
         assert a.outcome == "Down"
-        # вложен $1, хотим +$0.5, добираем по 0.60 => (1+0.5)/0.4 = 3.75 шэра
-        assert a.shares == pytest.approx(3.75, abs=1e-6)
+        assert a.sell_idx == 0, "старая нога должна продаваться"
+        assert a.sell_outcome == "Up"
 
-    def test_ladder_recovers_full_debt(self, cfg):
-        """Экономика добора: если добор выигрывает, раунд в плюсе."""
+    def test_selling_the_old_leg_shrinks_the_next_stake(self, cfg):
+        """Ключевой эффект: продажа возвращает капитал, и добор мельче.
+
+        Держали бы старую ногу — долг был бы $1.00 и добор 3.75 шэра.
+        Продаём: возвращается 1.67*0.40 = $0.67, долг падает до $0.33,
+        и добор нужен вдвое меньше.
+        """
         s = self._entered(cfg)
         s.on_tick(snap(t=105.0, up_bid=0.40, up_ask=0.41,
                        down_bid=0.59, down_ask=0.60))
         a = s.on_tick(snap(t=106.0, up_bid=0.40, up_ask=0.41,
                            down_bid=0.59, down_ask=0.60))
-        spent_before = s.net_out
-        payout = a.shares * 1.0
-        assert payout - (spent_before + a.size_usdc) == pytest.approx(0.5, abs=1e-6)
+        held_debt_shares = (1.0 + 0.5) / (1 - 0.60)      # если бы держали
+        assert a.shares < held_debt_shares * 0.75, (
+            f"добор {a.shares:.2f} не уменьшился (держали бы "
+            f"{held_debt_shares:.2f})")
 
     def test_ladder_stops_at_max_legs(self, cfg):
         cfg.jump_max_ladder_legs = 1
@@ -400,15 +410,17 @@ class TestLadder:
         assert a.kind == HOLD
         assert "пределе" in a.reason
 
-    def test_ladder_stops_at_round_cap(self, cfg):
-        cfg.jump_max_round_usdc = 2.0
+    def test_unlimited_by_default(self, cfg):
+        """Ограничения ступеней по умолчанию нет: долг всё равно сходится."""
+        assert FlowConfig().jump_max_ladder_legs == 0
+        cfg.jump_max_ladder_legs = 0
         s = self._entered(cfg)
+        s.depth = 99
         s.on_tick(snap(t=105.0, up_bid=0.40, up_ask=0.41,
                        down_bid=0.59, down_ask=0.60))
         a = s.on_tick(snap(t=106.0, up_bid=0.40, up_ask=0.41,
                            down_bid=0.59, down_ask=0.60))
-        assert a.kind == HOLD
-        assert "потолок раунда" in a.reason
+        assert a.kind == LADDER, "0 должно означать «без предела»"
 
     def test_ladder_refuses_too_expensive_leg(self, cfg):
         cfg.jump_max_leg_price = 0.90
@@ -482,13 +494,83 @@ class TestTakeProfit:
                            down_bid=0.65, down_ask=0.66, up_flow=0.4))
         assert a.kind == HOLD
 
-    def test_expensive_track_is_not_taken_profit(self, cfg):
-        """Дорожка A прибыль не фиксирует — она едет до расчёта."""
+    def test_expensive_track_also_takes_profit(self, cfg):
+        """Теперь ОБЕ дорожки фиксируют прибыль, а не едут до расчёта.
+
+        Это и закрывает случай «вышли в хороший плюс, досидели до конца
+        и ушли в минус на развороте»."""
         s = JumpStrategy(cfg)
-        s.record_entry("Up", 0.60, 1.66, 1.0, TRACK_A, t=100.0)
+        s.record_entry("Up", 0.60, 1.66, 1.0, TRACK_A, t=100.0, entry_bid=0.59)
         a = s.on_tick(snap(t=290.0, left=4.0, up_bid=0.90, up_ask=0.91,
                            down_bid=0.09, down_ask=0.10))
-        assert a.kind != SELL
+        assert a.kind == SELL
+        assert "ФИКСИРУЮ" in a.reason
+
+
+# ---------------------------------------------------------------------------
+#  Сценарии, ради которых всё это переделывалось
+# ---------------------------------------------------------------------------
+class TestRequestedScenarios:
+    @pytest.fixture()
+    def scfg(self, cfg):
+        cfg.jump_ladder_grace_s = 0.0
+        cfg.jump_tp_min_gain = 0.10
+        cfg.jump_tp_stall_s = 8.0
+        cfg.jump_tp_quiet_usd = 1.5
+        return cfg
+
+    def _bought(self, cfg, ask=0.50, bid=0.45, t=50.0):
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", ask, 2.0, ask * 2, TRACK_A, t=t, entry_bid=bid)
+        return s
+
+    def test_profit_is_taken_when_the_percent_freezes(self, scfg):
+        """«Купил 0.50, выросло до 0.75 и стоит, а до конца ещё минуты»."""
+        s = self._bought(scfg)
+        s.on_tick(snap(t=56.0, jump=5.0, up_bid=0.75, up_ask=0.80,
+                       down_bid=0.20, down_ask=0.25))
+        a = s.on_tick(snap(t=66.0, jump=5.0, up_bid=0.75, up_ask=0.80,
+                           down_bid=0.20, down_ask=0.25))
+        assert a.kind == SELL and "рост встал" in a.reason
+
+    def test_profit_is_taken_when_the_coin_goes_quiet(self, scfg):
+        """«Цена перестала резко двигаться и стоит на месте»."""
+        s = self._bought(scfg)
+        s.on_tick(snap(t=56.0, jump=5.0, up_bid=0.75, up_ask=0.80,
+                       down_bid=0.20, down_ask=0.25))
+        a = s.on_tick(snap(t=61.0, jump=0.2, up_bid=0.75, up_ask=0.80,
+                           down_bid=0.20, down_ask=0.25))
+        assert a.kind == SELL and "замерла" in a.reason
+
+    def test_growing_position_is_left_alone(self, scfg):
+        """Пока пик обновляется — не трогаем, даже если прошло много времени."""
+        s = self._bought(scfg)
+        for i, b in enumerate([0.60, 0.66, 0.72, 0.78, 0.84, 0.90]):
+            a = s.on_tick(snap(t=52.0 + i * 5, jump=5.0,
+                               up_bid=b, up_ask=round(b + 0.05, 2),
+                               down_bid=round(0.95 - b, 2),
+                               down_ask=round(1.0 - b, 2)))
+            assert a.kind != SELL, f"срезали растущую позицию на {b}"
+
+    def test_flip_reverses_the_position_immediately(self, scfg):
+        """«Проценты пошли против — лестница, продавая прошлую позицию»."""
+        s = self._bought(scfg)
+        a = s.on_tick(snap(t=54.0, up_bid=0.40, up_ask=0.45,
+                           down_bid=0.55, down_ask=0.60))
+        assert a.kind == LADDER
+        assert a.sell_idx == 0 and a.sell_outcome == "Up"
+        assert a.outcome == "Down"
+
+    def test_round_is_not_limited_to_one_trade(self, scfg):
+        """После фиксации бот снова ищет вход в этом же раунде."""
+        s = self._bought(scfg)
+        s.on_tick(snap(t=56.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        a = s.on_tick(snap(t=66.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        assert a.kind == SELL
+        s.record_sell(a.sell_idx, 1.50, t=66.0)
+        assert s.legs == []
+        a = s.on_tick(snap(t=70.0, jump=6.0, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER, a.reason
 
 
 # ---------------------------------------------------------------------------

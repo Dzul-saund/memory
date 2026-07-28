@@ -128,11 +128,12 @@ def test_replay_respects_max_legs(tmp_path):
     rows.append({"type": "settle", "slug": "s1", "winner": "Down",
                  "resolved": True, "t": 1100.0})
     _write(p, rows)
-    no_ladder = R.replay(str(p), _cfg(jump_max_ladder_legs=0))
-    with_ladder = R.replay(str(p), _cfg(jump_max_ladder_legs=2))
-    assert no_ladder.ladders == 0
-    assert with_ladder.ladders >= 1
-    assert with_ladder.pnl > no_ladder.pnl, "добор должен был спасти раунд"
+    # 0 = БЕЗ ПРЕДЕЛА, отключается флагом jump_ladder_enabled
+    off = R.replay(str(p), _cfg(jump_ladder_enabled=False))
+    on = R.replay(str(p), _cfg(jump_max_ladder_legs=2))
+    assert off.ladders == 0
+    assert on.ladders >= 1
+    assert on.pnl > off.pnl, "разворот должен был спасти раунд"
 
 
 def test_replay_unresolved_round_marks_to_market(tmp_path):

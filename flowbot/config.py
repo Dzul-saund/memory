@@ -179,7 +179,10 @@ class FlowConfig:
     jump_ladder_loss: float = 0.02
     # ПРЕДОХРАНИТЕЛИ лестницы. Без них мартингейл растёт по экспоненте и один
     # неудачный раунд съедает депозит: (потрачено+прибыль)/(1-цена).
-    jump_max_ladder_legs: int = 4           # сколько доборов максимум за раунд
+    # 0 = БЕЗ ОГРАНИЧЕНИЙ. Это безопасно только потому, что при развороте
+    # старая нога продаётся: долг сходится (1.00 -> 0.45 -> 0.29 -> 0.24),
+    # а не удваивается. Поставишь число — будет жёсткий предел ступеней.
+    jump_max_ladder_legs: int = 0
     jump_max_round_usdc: float = 25.0       # потолок вложений в один раунд
     jump_max_leg_price: float = 0.95        # дороже — добор бессмыслен (шэры -> ∞)
 
@@ -199,12 +202,23 @@ class FlowConfig:
     jump_tp_deadline_s: float = 5.0         # «до окончания 5 секунд» — фиксируем
     jump_tp_stall_retrace: float = 0.03     # откат % от пика = рост кончился
     jump_tp_flow_against: float = -0.20     # «люди смотрят в другую сторону»
+    # «Проценты перестали подниматься»: пик не обновлялся столько секунд.
+    jump_tp_stall_s: float = 8.0
+    # «Цена перестала резко двигаться и стоит на месте»: движение монеты не
+    # больше этого. Вместе с застоем пика закрывает случай «вышли в плюс и
+    # досидели до разворота».
+    jump_tp_quiet_usd: float = 1.5
 
     # --- рантайм -------------------------------------------------------------
     dry_run: bool = True
     run_duration_seconds: float = 86400.0
-    status_log_interval_seconds: float = 1.0
-    tick_max_wait_seconds: float = 0.2      # запасной такт, если книга молчит
+    # Как часто ПЕЧАТАТЬ строку состояния. На решения не влияет: они
+    # принимаются на каждом обновлении книги (см. tick_max_wait_seconds).
+    # Секунда была слишком медленной для глаза — панель отставала от соседних.
+    status_log_interval_seconds: float = 0.1
+    # Запасной такт, если книга молчит. Обычно цикл будит UPDATE_EVENT,
+    # то есть решение принимается в тот же миг, когда пришла цена или заявка.
+    tick_max_wait_seconds: float = 0.05
     max_consecutive_errors: int = 12
     trade_log_csv: str = "flowbot_trades.csv"   # "" отключает
     # Запись всего, что видел бот, в JSONL — сырьё для проигрывания и подбора
@@ -266,7 +280,7 @@ class FlowConfig:
             jump_ladder_profit_usdc=_f("JUMP_LADDER_PROFIT_USDC", 0.50),
             jump_ladder_grace_s=_f("JUMP_LADDER_GRACE_S", 0.6),
             jump_ladder_loss=_f("JUMP_LADDER_LOSS", 0.02),
-            jump_max_ladder_legs=_i("JUMP_MAX_LADDER_LEGS", 4),
+            jump_max_ladder_legs=_i("JUMP_MAX_LADDER_LEGS", 0),
             jump_max_round_usdc=_f("JUMP_MAX_ROUND_USDC", 25.0),
             jump_max_leg_price=_f("JUMP_MAX_LEG_PRICE", 0.95),
             jump_settle_converge=_f("JUMP_SETTLE_CONVERGE", 0.90),
@@ -276,14 +290,16 @@ class FlowConfig:
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),
             jump_tp_stall_retrace=_f("JUMP_TP_STALL_RETRACE", 0.03),
             jump_tp_flow_against=_f("JUMP_TP_FLOW_AGAINST", -0.20),
+            jump_tp_stall_s=_f("JUMP_TP_STALL_S", 8.0),
+            jump_tp_quiet_usd=_f("JUMP_TP_QUIET_USD", 1.5),
             ping_ms=(float(ping) if ping not in (None, "") else None),
             assumed_rtt_ms=_f("FLOW_ASSUMED_RTT_MS", 90.0),
             order_process_ms=_f("FLOW_ORDER_PROCESS_MS", 45.0),
             simulate_latency=_b("FLOW_SIMULATE_LATENCY", True),
             dry_run=_b("DRY_RUN", True),
             run_duration_seconds=_f("RUN_DURATION_SECONDS", 86400.0),
-            status_log_interval_seconds=_f("STATUS_LOG_INTERVAL_SECONDS", 1.0),
-            tick_max_wait_seconds=_f("FLOW_TICK_MAX_WAIT_S", 0.2),
+            status_log_interval_seconds=_f("STATUS_LOG_INTERVAL_SECONDS", 0.1),
+            tick_max_wait_seconds=_f("FLOW_TICK_MAX_WAIT_S", 0.05),
             max_consecutive_errors=_i("MAX_CONSECUTIVE_ERRORS", 12),
             trade_log_csv=(
                 "flowbot_trades.csv" if os.getenv("FLOW_TRADE_LOG_CSV") is None

@@ -86,13 +86,18 @@ class JumpSnapshot:
 class Leg:
     """Одна купленная нога лестницы."""
     outcome: str                      # "Up" | "Down"
-    entry_price: float
+    entry_price: float                # уплаченный ask
     shares: float
     cost: float
     track: str                        # TRACK_A | TRACK_B
     entry_t: float
     peak_bid: float
     idx: int                          # порядковый номер в лестнице (0 — вход)
+    # Бид в момент входа. Спред между ним и уплаченным ask — стоимость входа,
+    # а не движение рынка против нас, поэтому развороты считаются от него.
+    entry_bid: float = 0.0
+    peak_t: float = 0.0               # когда пик обновлялся в последний раз
+    against_since: Optional[float] = None
 
 
 @dataclass
@@ -158,9 +163,15 @@ class JumpStrategy:
 
     # -- колбэки исполнения (зовёт движок по факту филла) ---------------------
     def record_entry(self, outcome: str, price: float, shares: float,
-                     cost: float, track: str, t: float) -> Leg:
+                     cost: float, track: str, t: float,
+                     entry_bid: Optional[float] = None) -> Leg:
+        # Пик ведём по БИДУ (за него реально можно продать), стартуя от бида
+        # на входе. От уплаченного ask пик показывал бы весь спред как
+        # мгновенный откат.
+        eb = entry_bid if entry_bid is not None else price
         leg = Leg(outcome=outcome, entry_price=price, shares=shares, cost=cost,
-                  track=track, entry_t=t, peak_bid=price, idx=len(self.legs))
+                  track=track, entry_t=t, peak_bid=eb, idx=len(self.legs),
+                  entry_bid=eb, peak_t=t)
         self.legs.append(leg)
         self.net_out += cost
         if len(self.legs) > 1:
@@ -198,6 +209,7 @@ class JumpStrategy:
             b = s.bid(leg.outcome)
             if b is not None and b > leg.peak_bid:
                 leg.peak_bid = b
+                leg.peak_t = s.t      # рост продолжается — засекаем заново
 
     # ======================================================================
     #  Вход
@@ -371,36 +383,56 @@ class JumpStrategy:
         )
 
     # ======================================================================
-    #  Фиксация прибыли — только дешёвая дорожка B
+    #  Фиксация прибыли — обе дорожки
     # ======================================================================
     def _take_profit(self, s: JumpSnapshot) -> Optional[Action]:
+        """В плюсе, а рост встал — забираем и идём искать следующий вход.
+
+        Именно этот выход закрывает случай «вышли в хороший плюс, досидели
+        до расчёта и ушли в минус»: как только процент перестал расти ИЛИ
+        цена монеты замерла, прибыль фиксируется, а не проверяется на
+        прочность оставшимися минутами раунда.
+        """
         c = self.cfg
         if not c.jump_tp_enabled:
             return None
         for leg in self.legs:
-            if leg.track != TRACK_B:
-                continue
             bid = s.bid(leg.outcome)
             if bid is None:
                 continue
-            gain = bid - leg.entry_price
+            gain = bid - leg.entry_price      # честный плюс: bid против ask
             if gain < c.jump_tp_min_gain:
                 continue                      # ещё не в плюсе — не о чем говорить
 
             deadline = s.seconds_left <= c.jump_tp_deadline_s
-            # «цена перестала расти»: скачок больше не идёт в нашу сторону.
             mom_fav = s.jump_usd * favour(leg.outcome)
             retraced = bid <= leg.peak_bid - c.jump_tp_stall_retrace
             flow_bad = s.flow(leg.outcome) <= c.jump_tp_flow_against
-            stalled = mom_fav <= 0 and (retraced or flow_bad)
+            faded = mom_fav <= 0 and (retraced or flow_bad)
+            # «проценты перестали подниматься»: пик стоит на месте столько
+            # секунд. Прямая проверка застоя — не ждём отката.
+            frozen = (c.jump_tp_stall_s > 0
+                      and s.t - leg.peak_t >= c.jump_tp_stall_s)
+            # «цена перестала резко двигаться и стоит на месте»
+            quiet = (c.jump_tp_quiet_usd > 0
+                     and abs(s.jump_usd) <= c.jump_tp_quiet_usd
+                     and s.t - leg.peak_t >= c.jump_tp_stall_s / 2)
 
-            if not (deadline or stalled):
+            if not (deadline or faded or frozen or quiet):
                 continue
-            why = (f"до конца {s.seconds_left:.0f}с" if deadline else
-                   f"рост кончился (движение {mom_fav:+.1f}$"
-                   + (f", % откатился с {leg.peak_bid:.2f}" if retraced else "")
-                   + (f", поток против {s.flow(leg.outcome):+.2f}"
-                      if flow_bad else "") + ")")
+            if deadline:
+                why = f"до конца {s.seconds_left:.0f}с"
+            elif frozen:
+                why = (f"% стоит на {leg.peak_bid:.2f} уже "
+                       f"{s.t - leg.peak_t:.0f}с — рост встал")
+            elif quiet:
+                why = (f"цена замерла (движение {s.jump_usd:+.1f}$ <= "
+                       f"{c.jump_tp_quiet_usd:.1f}$)")
+            else:
+                why = (f"рост кончился (движение {mom_fav:+.1f}$"
+                       + (f", % откатился с {leg.peak_bid:.2f}" if retraced else "")
+                       + (f", поток против {s.flow(leg.outcome):+.2f}"
+                          if flow_bad else "") + ")")
             return Action(
                 SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
                 limit_price=round(bid, 2),
@@ -410,30 +442,41 @@ class JumpStrategy:
         return None
 
     # ======================================================================
-    #  Лестница: добор противоположной стороны
+    #  Лестница-переворот: продаём провалившуюся ногу и берём другую сторону
     # ======================================================================
     def _maybe_ladder(self, s: JumpSnapshot) -> Action:
+        """Проценты пошли против нас — разворачиваемся.
+
+        Отличие от прежней лестницы: старая нога ПРОДАЁТСЯ, а не остаётся
+        висеть. Это не косметика, а то, что делает лестницу конечной. Продажа
+        возвращает капитал, и в долге остаётся только реализованный убыток
+        ноги (спред плюс просадка), а не вся её стоимость:
+
+            держим старую:  долг 1.00 -> 2.50 -> 5.50 -> 11.50 -> 23.50 …
+            продаём старую: долг 1.00 -> 0.45 -> 0.29 ->  0.24 ->  0.22 …
+
+        Поэтому лимит на число ступеней здесь не нужен: долг сходится сам.
+        """
         c = self.cfg
         leg = self.legs[-1]                   # живая ставка — самая свежая нога
         bid = s.bid(leg.outcome)
         if bid is None:
             return Action(HOLD, f"{leg.outcome}: нет bid — держу")
 
-        # Провалилась ли ставка? Нужны ОБА условия: ниже сплита и в убытке
-        # относительно входа (иначе дешёвая нога, купленная по 0.05, считалась
-        # бы «провалившейся» с первой же секунды — см. шапку модуля).
-        under_split = bid < c.jump_price_split
-        losing = bid <= leg.entry_price - c.jump_ladder_loss
-        if not (under_split and losing):
+        # Пошло против? Считаем от БИДА НА ВХОДЕ: спред между ним и уплаченным
+        # ask — стоимость входа, а не движение рынка. Иначе разворот
+        # срабатывал бы в тот же тик на каждой сделке.
+        losing = bid <= leg.entry_bid - c.jump_ladder_loss
+        if not losing:
+            leg.against_since = None
             self._below_since = None
             return Action(HOLD, (
                 f"{leg.outcome} держится {bid:.2f} "
-                f"(вход {leg.entry_price:.2f}, сплит {c.jump_price_split:.2f}) "
-                f"— веду до расчёта"))
+                f"(вход {leg.entry_price:.2f}, бид на входе {leg.entry_bid:.2f})"))
 
-        if self._below_since is None:
-            self._below_since = s.t
-        waited = s.t - self._below_since
+        if leg.against_since is None:
+            leg.against_since = s.t
+        waited = s.t - leg.against_since
         if waited < c.jump_ladder_grace_s:
             return Action(HOLD, f"{leg.outcome} просел до {bid:.2f}, жду "
                                 f"подтверждения {waited:.1f}/"
@@ -442,7 +485,8 @@ class JumpStrategy:
         if not c.jump_ladder_enabled:
             return Action(HOLD, f"{leg.outcome} просел до {bid:.2f}, лестница "
                                 f"выключена — держу до расчёта")
-        if self.depth >= c.jump_max_ladder_legs:
+        # Предел ступеней: 0 = без ограничений (долг всё равно сходится).
+        if 0 < c.jump_max_ladder_legs <= self.depth:
             return Action(HOLD, (
                 f"{leg.outcome} просел до {bid:.2f}, но лестница на пределе "
                 f"({self.depth}/{c.jump_max_ladder_legs}) — держу до расчёта"))
@@ -450,28 +494,28 @@ class JumpStrategy:
         opp = opposite(leg.outcome)
         opp_ask = s.ask(opp)
         if opp_ask is None:
-            return Action(HOLD, f"{opp}: нет ask для добора")
+            return Action(HOLD, f"{opp}: нет ask для разворота")
         if opp_ask > c.jump_max_leg_price:
             return Action(HOLD, (
-                f"добор {opp} по {opp_ask:.2f} дороже потолка "
+                f"разворот в {opp} по {opp_ask:.2f} дороже потолка "
                 f"{c.jump_max_leg_price:.2f} — шэров нужно слишком много"))
 
-        shares = ladder_shares(self.debt, c.jump_ladder_profit_usdc, opp_ask)
+        # Долг ПОСЛЕ продажи старой ноги: вернём bid*shares, останется только
+        # реализованный убыток. Движок пересчитает по факту филла.
+        proceeds = bid * leg.shares
+        debt_after = max(0.0, self.net_out - proceeds)
+        shares = ladder_shares(debt_after, c.jump_ladder_profit_usdc, opp_ask)
         cost = shares * opp_ask
         if shares <= 0:
-            return Action(HOLD, f"добор {opp}: расчёт дал 0 шэров")
-        if self.net_out + cost > c.jump_max_round_usdc:
-            return Action(HOLD, (
-                f"добор {opp} стоил бы ${cost:.2f}, вложено ${self.net_out:.2f} "
-                f"— вышли бы за потолок раунда ${c.jump_max_round_usdc:.2f}, "
-                f"держу до расчёта"))
+            return Action(HOLD, f"разворот {opp}: расчёт дал 0 шэров")
 
         return Action(
             LADDER, outcome=opp, limit_price=round(opp_ask, 2),
             shares=shares, size_usdc=cost, track=leg.track,
-            reason=(f"ЛЕСТНИЦА #{self.depth + 1}: {leg.outcome} упал до "
-                    f"{bid:.2f} (вход {leg.entry_price:.2f}) → беру {opp} "
-                    f"{shares:.2f} шэр @ {opp_ask:.2f} = ${cost:.2f}, чтобы "
-                    f"перекрыть ${self.debt:.2f} и выйти "
-                    f"+${c.jump_ladder_profit_usdc:.2f}"),
+            sell_idx=leg.idx, sell_outcome=leg.outcome,
+            reason=(f"РАЗВОРОТ #{self.depth + 1}: {leg.outcome} упал до "
+                    f"{bid:.2f} (бид на входе {leg.entry_bid:.2f}) → продаю его "
+                    f"и беру {opp} {shares:.2f} шэр @ {opp_ask:.2f} = "
+                    f"${cost:.2f}, чтобы перекрыть ${debt_after:.2f} "
+                    f"и выйти +${c.jump_ladder_profit_usdc:.2f}"),
         )
