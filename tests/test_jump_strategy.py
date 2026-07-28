@@ -27,9 +27,11 @@ def cfg() -> FlowConfig:
     c.jump_ladder_grace_s = 0.6
     c.jump_ladder_profit_usdc = 0.50
     c.settle_hold_s = 6.0
-    # Подстройку порогов под волатильность проверяем отдельно
-    # (TestAdaptiveThresholds); остальным тестам она бы плавала пороги.
+    # Подстройку порогов под волатильность и запас цены проверяем
+    # отдельно (TestAdaptiveThresholds / TestEdgeFilter); остальным
+    # тестам они бы плавали пороги.
     c.jump_adaptive = False
+    c.jump_min_edge_cents = 0.0
     return c
 
 
@@ -146,6 +148,76 @@ class TestEntry:
         a = s.on_tick(snap(t=101.0, jump=6.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
         assert "пауза" in a.reason
+
+
+# ---------------------------------------------------------------------------
+#  Запас цены: справедливая вероятность против того, что просят
+# ---------------------------------------------------------------------------
+class TestEdgeFilter:
+    """Скачок говорит КУДА пошла цена, но не говорит, не заложен ли он уже
+    в процент. Это единственная проверка «не переплачиваем ли мы»."""
+
+    @pytest.fixture()
+    def ecfg(self, cfg):
+        cfg.jump_min_edge_cents = 3.0
+        cfg.jump_min_shift_cents = 0.0     # изолируем от соседнего фильтра
+        return cfg
+
+    def test_refuses_when_move_is_already_priced_in(self, ecfg):
+        """Ситуация со скриншота: справедливо ~60¢, в книге просят 94¢."""
+        s = JumpStrategy(ecfg)
+        a = s.on_tick(snap(jump=9.0, price=63_434.31, target=63_429.71,
+                           sigma=1.0, left=299.1,
+                           up_ask=0.94, down_ask=0.11))
+        assert a.kind == NONE
+        assert "переплачиваем" in a.reason
+        assert "60" in a.reason      # справедливая цена в тексте отказа
+
+    def test_enters_when_side_is_underpriced(self, ecfg):
+        """Та же цена монеты, но книга ещё не переоценила: Up просят 55¢.
+
+        Берём ask ВЫШЕ сплита: иначе сработает правило дешёвой дорожки
+        (нужен скачок $15), и тест проверял бы не то."""
+        s = JumpStrategy(ecfg)
+        a = s.on_tick(snap(jump=9.0, price=63_434.31, target=63_429.71,
+                           sigma=1.0, left=299.1,
+                           up_ask=0.55, down_ask=0.50))
+        assert a.kind == ENTER
+        assert a.outcome == "Up"
+
+    def test_thin_edge_is_refused(self, ecfg):
+        """Запас есть, но меньше порога — не лезем: спред съест."""
+        s = JumpStrategy(ecfg)
+        a = s.on_tick(snap(jump=9.0, price=63_434.31, target=63_429.71,
+                           sigma=1.0, left=299.1,
+                           up_ask=0.59, down_ask=0.46))
+        assert a.kind == NONE
+        assert "запас" in a.reason
+
+    def test_works_for_down_side(self, ecfg):
+        """Для Down справедливая цена = 1 − P(Up)."""
+        s = JumpStrategy(ecfg)
+        # цена НИЖЕ таргета -> Down справедливо дорогой, но просят дешевле
+        a = s.on_tick(snap(jump=-9.0, price=63_425.0, target=63_429.71,
+                           sigma=1.0, left=299.1,
+                           up_ask=0.50, down_ask=0.55))
+        assert a.kind == ENTER
+        assert a.outcome == "Down"
+
+    def test_disabled_by_zero(self, cfg):
+        cfg.jump_min_edge_cents = 0.0
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, price=63_434.31, target=63_429.71,
+                           sigma=1.0, left=299.1,
+                           up_ask=0.94, down_ask=0.11))
+        assert a.kind == ENTER      # без фильтра купил бы переоценённое
+
+    def test_silent_without_sigma_or_target(self, ecfg):
+        """Нет данных для модели — правило не применяется, а не блокирует."""
+        s = JumpStrategy(ecfg)
+        assert s.on_tick(snap(jump=9.0, sigma=None,
+                              up_ask=0.60, down_ask=0.41)).kind == ENTER
+        assert s._edge(snap(target=None, sigma=1.0), "Up", 0.60) is None
 
 
 # ---------------------------------------------------------------------------

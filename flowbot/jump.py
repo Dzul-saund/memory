@@ -42,7 +42,7 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from btc_bot.prob import expected_shift
+from btc_bot.prob import expected_shift, fair_up_probability
 
 # Виды действий
 ENTER = "enter"     # первый вход в раунде
@@ -235,6 +235,30 @@ class JumpStrategy:
                 max(s.seconds_left, 0.5))
         return c.jump_max_target_dist_usd
 
+    def _edge(self, s: JumpSnapshot, side: str,
+              ask: float) -> Optional[float]:
+        """Запас цены: справедливая вероятность стороны минус её ask.
+
+        Справедливая цена берётся из той же модели, что и P(UP) в мониторе:
+        P = Phi((цена − таргет)/(sigma*sqrt(t))). Для Down это 1 − P.
+
+        Положительный запас = сторона недооценена, покупка имеет смысл.
+        Отрицательный = скачок УЖЕ в цене, и мы бы платили сверх честного.
+        None = нет таргета или волатильности; тогда правило не применяется.
+
+        Оговорка: модель считает движение цены нормальным блужданием без
+        сноса. У крипты хвосты толще, поэтому у самых краёв (сторона дешевле
+        ~5¢) она недооценивает шанс — там на её запас полагаться нельзя.
+        """
+        if self.cfg.jump_min_edge_cents <= 0:
+            return None
+        p_up = fair_up_probability(s.coin_price, s.target, s.sigma_1s,
+                                   max(s.seconds_left, 0.5))
+        if p_up is None:
+            return None
+        fair = p_up if side == "Up" else 1.0 - p_up
+        return fair - ask
+
     def _expected_shift(self, s: JumpSnapshot,
                         jump_usd: float) -> Optional[float]:
         """На сколько скачок сдвинет «процент», по модели блуждания.
@@ -312,6 +336,18 @@ class JumpStrategy:
         if ask > c.jump_max_leg_price:
             return Action(NONE, f"{side} ask {ask:.2f} > потолка "
                                 f"{c.jump_max_leg_price:.2f} — нечего забирать")
+
+        # ЗАПАС ЦЕНЫ. Скачок говорит, КУДА пошла цена, но молчит о том, не
+        # заложен ли он уже в процент. Считаем справедливую вероятность нашей
+        # стороны и сравниваем с тем, что просят: если ask выше справедливой
+        # цены, мы покупаем переоценённое, каким бы сильным ни был скачок.
+        edge = self._edge(s, side, ask)
+        if edge is not None and edge * 100 < c.jump_min_edge_cents:
+            fair = ask + edge
+            return Action(NONE, (
+                f"{side}: справедливо {fair*100:.0f}¢, просят {ask*100:.0f}¢ "
+                f"-> запас {edge*100:+.1f}¢ < {c.jump_min_edge_cents:.1f}¢ "
+                f"— движение уже в цене, переплачиваем"))
 
         # Сдвинется ли «процент» вообще? Далеко от таргета исход раунда уже
         # решён, и любой скачок цены оставляет проценты на месте — там вход
