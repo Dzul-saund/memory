@@ -87,7 +87,6 @@ def _cfg(**over):
     c.jump_adaptive = False
     c.jump_min_shift_cents = 0.0
     c.jump_min_edge_cents = 0.0
-    c.jump_manage_enabled = False
     c.jump_ladder_grace_s = 0.0
     for k, v in over.items():
         setattr(c, k, v)

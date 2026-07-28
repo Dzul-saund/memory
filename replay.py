@@ -151,10 +151,8 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             cost = round(ask * shares, 4)
             if strat.net_out + cost > cfg.jump_max_round_usdc + 1e-9:
                 continue
-            eb = snap.bid(act.outcome)
             leg = strat.record_entry(act.outcome, ask, shares, cost,
-                                     act.track, snap.t,
-                                     entry_bid=eb if eb is not None else ask)
+                                     act.track, snap.t)
             legs.append({"idx": leg.idx, "side": act.outcome,
                          "shares": shares, "cost": cost, "last_bid": ask})
             res.spent += cost

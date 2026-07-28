@@ -27,7 +27,6 @@ def _engine(**over):
     cfg.jump_adaptive = False           # пороги не плавают: тесты про лестницу
     cfg.jump_min_shift_cents = 0.0      # и не про фильтр чувствительности
     cfg.jump_min_edge_cents = 0.0       # и не про запас цены
-    cfg.jump_manage_enabled = False     # и не про стоп/фиксацию
     for k, v in over.items():
         setattr(cfg, k, v)
     eng = JumpEngine(cfg)
