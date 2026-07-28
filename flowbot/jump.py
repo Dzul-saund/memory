@@ -86,13 +86,18 @@ class JumpSnapshot:
 class Leg:
     """Одна купленная нога лестницы."""
     outcome: str                      # "Up" | "Down"
-    entry_price: float
+    entry_price: float                # уплаченный ask
     shares: float
     cost: float
     track: str                        # TRACK_A | TRACK_B
     entry_t: float
     peak_bid: float
     idx: int                          # порядковый номер в лестнице (0 — вход)
+    # Бид в момент входа. От него считается стоп: ask мы уже заплатили, и
+    # спред между ними — не движение рынка против нас, а стоимость входа.
+    entry_bid: float = 0.0
+    peak_t: float = 0.0               # когда пик обновлялся в последний раз
+    stop_since: Optional[float] = None
 
 
 @dataclass
@@ -158,9 +163,15 @@ class JumpStrategy:
 
     # -- колбэки исполнения (зовёт движок по факту филла) ---------------------
     def record_entry(self, outcome: str, price: float, shares: float,
-                     cost: float, track: str, t: float) -> Leg:
+                     cost: float, track: str, t: float,
+                     entry_bid: Optional[float] = None) -> Leg:
+        # Пик ведём по БИДУ (за него реально можно продать). Стартуем от бида
+        # на входе, а не от уплаченного ask — иначе «откат от пика» показывал
+        # бы весь спред сразу и выход срабатывал бы мгновенно.
+        eb = entry_bid if entry_bid is not None else price
         leg = Leg(outcome=outcome, entry_price=price, shares=shares, cost=cost,
-                  track=track, entry_t=t, peak_bid=price, idx=len(self.legs))
+                  track=track, entry_t=t, peak_bid=eb, idx=len(self.legs),
+                  entry_bid=eb, peak_t=t)
         self.legs.append(leg)
         self.net_out += cost
         if len(self.legs) > 1:
@@ -188,6 +199,11 @@ class JumpStrategy:
         self._track_peaks(s)
         if not self.legs:
             return self._maybe_enter(s)
+        # Порядок важен: сначала режем убыток, потом забираем прибыль, и лишь
+        # если ведение выключено — доходим до лестницы.
+        act = self._stop_loss(s)
+        if act is not None:
+            return act
         act = self._take_profit(s)
         if act is not None:
             return act
@@ -198,6 +214,7 @@ class JumpStrategy:
             b = s.bid(leg.outcome)
             if b is not None and b > leg.peak_bid:
                 leg.peak_bid = b
+                leg.peak_t = s.t      # рост продолжается — засекаем заново
 
     # ======================================================================
     #  Вход
@@ -371,19 +388,58 @@ class JumpStrategy:
         )
 
     # ======================================================================
-    #  Фиксация прибыли — только дешёвая дорожка B
+    #  Стоп: режем убыток, не дожидаясь расчёта
+    # ======================================================================
+    def _stop_loss(self, s: JumpSnapshot) -> Optional[Action]:
+        """Пошло против — выходим и освобождаемся для следующей сделки.
+
+        Отсчёт от БИДА НА ВХОДЕ. Если считать от уплаченного ask, стоп
+        сработает в тот же тик на каждой сделке: спред 5¢ означает, что bid
+        сразу на 5¢ ниже ask, и это не движение рынка, а цена входа.
+        """
+        c = self.cfg
+        if not c.jump_manage_enabled or c.jump_stop_cents <= 0:
+            return None
+        for leg in self.legs:
+            bid = s.bid(leg.outcome)
+            if bid is None:
+                continue
+            floor = leg.entry_bid - c.jump_stop_cents / 100.0
+            if bid > floor + 1e-9:
+                leg.stop_since = None
+                continue
+            if leg.stop_since is None:
+                leg.stop_since = s.t
+            if s.t - leg.stop_since < c.jump_stop_grace_s:
+                continue                      # один шумный тик — не повод
+            loss = bid - leg.entry_price      # реальный итог: против ask
+            return Action(
+                SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
+                limit_price=round(bid, 2),
+                reason=(f"СТОП {leg.outcome}: bid {bid:.2f} ниже входного "
+                        f"{leg.entry_bid:.2f} на {c.jump_stop_cents:.0f}¢ "
+                        f"→ выхожу, итог {loss*100:+.0f}¢ (вошли по "
+                        f"{leg.entry_price:.2f}); дальше ищу новый вход"),
+            )
+        return None
+
+    # ======================================================================
+    #  Фиксация прибыли — обе дорожки
     # ======================================================================
     def _take_profit(self, s: JumpSnapshot) -> Optional[Action]:
         c = self.cfg
         if not c.jump_tp_enabled:
             return None
+        manage = c.jump_manage_enabled
         for leg in self.legs:
-            if leg.track != TRACK_B:
+            # Без активного ведения прибыль фиксирует только дешёвая дорожка,
+            # как было изначально; с ведением — обе.
+            if not manage and leg.track != TRACK_B:
                 continue
             bid = s.bid(leg.outcome)
             if bid is None:
                 continue
-            gain = bid - leg.entry_price
+            gain = bid - leg.entry_price      # честный плюс: bid против ask
             if gain < c.jump_tp_min_gain:
                 continue                      # ещё не в плюсе — не о чем говорить
 
@@ -393,14 +449,23 @@ class JumpStrategy:
             retraced = bid <= leg.peak_bid - c.jump_tp_stall_retrace
             flow_bad = s.flow(leg.outcome) <= c.jump_tp_flow_against
             stalled = mom_fav <= 0 and (retraced or flow_bad)
+            # «проценты перестали подниматься»: пик стоит на месте столько
+            # секунд. Прямая проверка застоя — не ждём отката.
+            frozen = (manage and c.jump_tp_stall_s > 0
+                      and s.t - leg.peak_t >= c.jump_tp_stall_s)
 
-            if not (deadline or stalled):
+            if not (deadline or stalled or frozen):
                 continue
-            why = (f"до конца {s.seconds_left:.0f}с" if deadline else
-                   f"рост кончился (движение {mom_fav:+.1f}$"
-                   + (f", % откатился с {leg.peak_bid:.2f}" if retraced else "")
-                   + (f", поток против {s.flow(leg.outcome):+.2f}"
-                      if flow_bad else "") + ")")
+            if deadline:
+                why = f"до конца {s.seconds_left:.0f}с"
+            elif frozen:
+                why = (f"% стоит на {leg.peak_bid:.2f} уже "
+                       f"{s.t - leg.peak_t:.0f}с — рост встал")
+            else:
+                why = (f"рост кончился (движение {mom_fav:+.1f}$"
+                       + (f", % откатился с {leg.peak_bid:.2f}" if retraced else "")
+                       + (f", поток против {s.flow(leg.outcome):+.2f}"
+                          if flow_bad else "") + ")")
             return Action(
                 SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
                 limit_price=round(bid, 2),

@@ -32,6 +32,10 @@ def cfg() -> FlowConfig:
     # тестам они бы плавали пороги.
     c.jump_adaptive = False
     c.jump_min_edge_cents = 0.0
+    # Активное ведение (стоп + фиксация на обеих дорожках) проверяется
+    # отдельно в TestActiveManagement. Здесь оно выключено, иначе стоп
+    # срабатывал бы раньше лестницы и тесты лестницы проверяли бы не то.
+    c.jump_manage_enabled = False
     return c
 
 
@@ -489,6 +493,130 @@ class TestTakeProfit:
         a = s.on_tick(snap(t=290.0, left=4.0, up_bid=0.90, up_ask=0.91,
                            down_bid=0.09, down_ask=0.10))
         assert a.kind != SELL
+
+
+# ---------------------------------------------------------------------------
+#  Активное ведение: стоп, фиксация на обеих дорожках, возврат к торговле
+# ---------------------------------------------------------------------------
+class TestActiveManagement:
+    """Нога не должна ехать до расчёта: выросла — забрать, пошла против —
+    выйти, и в обоих случаях освободиться для следующей сделки."""
+
+    @pytest.fixture()
+    def mcfg(self, cfg):
+        cfg.jump_manage_enabled = True
+        cfg.jump_stop_cents = 1.0
+        cfg.jump_stop_grace_s = 0.0
+        cfg.jump_tp_min_gain = 0.10
+        cfg.jump_tp_stall_s = 8.0
+        return cfg
+
+    def _bought(self, cfg, ask=0.50, bid=0.45, t=100.0, track=TRACK_A):
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", ask, 2.0, ask * 2, track, t=t, entry_bid=bid)
+        return s
+
+    # -- стоп ---------------------------------------------------------------
+    def test_stop_does_not_fire_on_the_spread(self, mcfg):
+        """КЛЮЧЕВОЕ: сразу после покупки bid ниже ask на весь спред.
+
+        Если бы стоп считался от уплаченного ask, он срабатывал бы в тот же
+        тик на каждой сделке. Отсчёт идёт от бида на входе, поэтому пока
+        рынок не двинулся — выхода нет.
+        """
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=101.0, up_bid=0.45, up_ask=0.50,
+                           down_bid=0.50, down_ask=0.55))
+        assert a.kind != SELL, f"стоп сработал на спреде: {a.reason}"
+
+    def test_stop_fires_when_bid_falls_a_cent(self, mcfg):
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=101.0, up_bid=0.44, up_ask=0.49,
+                           down_bid=0.51, down_ask=0.56))
+        assert a.kind == SELL
+        assert "СТОП" in a.reason
+        assert a.limit_price == 0.44
+
+    def test_stop_reports_the_real_loss_including_spread(self, mcfg):
+        """Стоп «в 1 цент» при спреде 5¢ стоит примерно 6 центов."""
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=101.0, up_bid=0.44, up_ask=0.49,
+                           down_bid=0.51, down_ask=0.56))
+        assert "-6¢" in a.reason, a.reason
+
+    def test_stop_waits_for_grace(self, mcfg):
+        mcfg.jump_stop_grace_s = 1.0
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=100.2, up_bid=0.44, up_ask=0.49))
+        assert a.kind != SELL, "один тик не должен выбивать"
+        a = s.on_tick(snap(t=101.5, up_bid=0.44, up_ask=0.49))
+        assert a.kind == SELL
+
+    def test_recovery_clears_the_pending_stop(self, mcfg):
+        mcfg.jump_stop_grace_s = 1.0
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        s.on_tick(snap(t=100.2, up_bid=0.44, up_ask=0.49))
+        s.on_tick(snap(t=100.4, up_bid=0.46, up_ask=0.51))   # отскочило
+        a = s.on_tick(snap(t=100.6, up_bid=0.44, up_ask=0.49))
+        assert a.kind != SELL, "отсчёт стопа должен был начаться заново"
+
+    def test_stop_disabled_by_zero(self, mcfg):
+        mcfg.jump_stop_cents = 0.0
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=101.0, up_bid=0.30, up_ask=0.35))
+        assert a.kind != SELL
+
+    # -- фиксация -----------------------------------------------------------
+    def test_expensive_track_now_takes_profit(self, mcfg):
+        """Раньше дорожка A ехала до расчёта. Теперь тоже фиксирует."""
+        s = self._bought(mcfg, ask=0.50, bid=0.45, track=TRACK_A)
+        # выросли до 0.75, движение встало, поток развернулся
+        s.on_tick(snap(t=101.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        a = s.on_tick(snap(t=102.0, jump=-1.0, up_bid=0.72, up_ask=0.77,
+                           up_flow=-0.5))
+        assert a.kind == SELL
+        assert "ФИКСИРУЮ" in a.reason
+
+    def test_sells_when_percent_stops_rising(self, mcfg):
+        """«Выросло до 0.75 и стоит» — прямой случай из задачи.
+
+        Ни отката, ни разворота потока: процент просто замер. Через
+        jump_tp_stall_s секунд без нового пика — забираем.
+        """
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        s.on_tick(snap(t=101.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        # ещё 5с — рано
+        a = s.on_tick(snap(t=106.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        assert a.kind != SELL
+        # 9с без нового пика — рост встал
+        a = s.on_tick(snap(t=110.0, jump=5.0, up_bid=0.75, up_ask=0.80))
+        assert a.kind == SELL
+        assert "рост встал" in a.reason
+
+    def test_growth_that_continues_is_not_cut(self, mcfg):
+        """Пока пик обновляется, позицию не трогаем."""
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        for i, b in enumerate([0.60, 0.66, 0.72, 0.78, 0.84]):
+            a = s.on_tick(snap(t=101.0 + i * 3, jump=5.0,
+                               up_bid=b, up_ask=b + 0.05))
+            assert a.kind != SELL, f"срезали растущую позицию на {b}"
+
+    def test_no_take_profit_while_in_loss(self, mcfg):
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=120.0, jump=0.0, up_bid=0.46, up_ask=0.51))
+        assert a.kind != SELL, "0.46 против входа 0.50 — это не прибыль"
+
+    # -- возврат к торговле --------------------------------------------------
+    def test_free_to_trade_again_after_selling(self, mcfg):
+        """После выхода бот не должен простаивать до конца раунда."""
+        s = self._bought(mcfg, ask=0.50, bid=0.45)
+        a = s.on_tick(snap(t=101.0, up_bid=0.44, up_ask=0.49))
+        assert a.kind == SELL
+        s.record_sell(a.sell_idx, 0.88, t=101.0)
+        assert s.legs == []
+        # пауза после сделки прошла — снова ищем вход
+        a = s.on_tick(snap(t=103.0, jump=6.0, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER, a.reason
 
 
 # ---------------------------------------------------------------------------

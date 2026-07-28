@@ -194,8 +194,11 @@ class JumpEngine(FlowEngine):
         # Движение отработано — переставляем экстремум на текущую цену, иначе
         # то же самое дно секунду спустя открыло бы ещё одну такую же сделку.
         self.price.reset_swing()
+        # bid на момент входа нужен стопу: от него, а не от уплаченного ask,
+        # считается движение против нас.
         leg = self.strategy.record_entry(outcome, fill, shares, cost,
-                                         action.track, time.time())
+                                         action.track, time.time(),
+                                         entry_bid=bid if bid is not None else fill)
         self.legs.append({
             "idx": leg.idx, "outcome": outcome, "token": token,
             "entry_price": fill, "shares": shares, "cost": cost,
