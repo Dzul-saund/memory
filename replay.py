@@ -196,6 +196,7 @@ SWEEPS = {
     # войти. Живые запуски такого не дают, там у каждого свой поток тиков.
     "entry-mode": ("jump_entry_mode", str),
     "lag-cents": ("jump_lag_min_cents", float),
+    "trail": ("jump_tp_trail", float),
     "edge-cents": ("jump_min_edge_cents", float),
     "max-legs": ("jump_max_ladder_legs", int),
     "min-shift": ("jump_min_shift_cents", float),

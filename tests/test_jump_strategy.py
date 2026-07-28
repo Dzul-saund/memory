@@ -479,7 +479,14 @@ class TestTakeProfit:
         assert a.kind != SELL
 
     def test_sells_when_growth_stalls_and_flow_turns(self, cfg):
-        """Рост кончился (движение не в нашу сторону) + поток против."""
+        """Рост кончился (движение не в нашу сторону) + поток против.
+
+        Трейлинг здесь выключен намеренно: откат с 0.34 до 0.30 больше его
+        порога, и он забрал бы этот выход себе. Проверяем именно старый
+        триггер — он остаётся как более ранний выход, когда поток заявок
+        развернулся раньше, чем цена успела откатиться.
+        """
+        cfg.jump_tp_trail = 0.0
         s = self._cheap(cfg)
         s.on_tick(snap(t=200.0, jump=8.0, up_bid=0.34, up_ask=0.35,
                        down_bid=0.65, down_ask=0.66))     # пик 0.34
@@ -604,3 +611,88 @@ class TestBookkeeping:
         assert s.depth == 0
         a = s.on_tick(snap(jump=6.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == ENTER      # пауза после сделки тоже сброшена
+
+
+# ---------------------------------------------------------------------------
+#  Трейлинг-стоп: не отдавать назад уже заработанное
+# ---------------------------------------------------------------------------
+class TestTrailingStop:
+    """Регрессия на реальный случай из боя.
+
+    Вход 0.53, рост до 0.70, дальше откат — и старая версия проезжала весь
+    путь до −0.07, потому что ни один из четырёх прежних триггеров на откате
+    не срабатывал, а проверка «мы в плюсе» стояла перед ними и просто
+    переставала смотреть на позицию, когда прибыль истончалась.
+    """
+
+    def _leg(self, cfg, entry=0.53, entry_bid=0.51):
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", entry, 1.88, 1.0, TRACK_A, t=0.0,
+                       entry_bid=entry_bid)
+        return s
+
+    def _tick(self, s, t, bid, jump=2.5):
+        return s.on_tick(snap(t=t, left=200.0, jump=jump,
+                              up_bid=bid, up_ask=round(bid + 0.02, 2),
+                              down_bid=round(1 - bid - 0.02, 2),
+                              down_ask=round(1 - bid, 2)))
+
+    def test_sells_on_pullback_from_peak(self, cfg):
+        cfg.jump_tp_trail = 0.03
+        s = self._leg(cfg)
+        for t, bid in ((1.0, 0.60), (2.0, 0.65), (3.0, 0.70)):
+            assert self._tick(s, t, bid).kind == HOLD
+        # −4¢ от пика: порог пройден
+        act = self._tick(s, 4.0, 0.66)
+        assert act.kind == SELL
+        assert act.sell_idx == 0
+        assert "откат" in act.reason
+
+    def test_survives_the_exact_field_case(self, cfg):
+        """Полный проход: раньше досиживали до минуса, теперь выходим в плюс."""
+        cfg.jump_tp_trail = 0.03
+        s = self._leg(cfg)
+        path = [(1.0, 0.60), (2.0, 0.65), (3.0, 0.70), (4.0, 0.69),
+                (5.0, 0.68), (6.0, 0.66), (7.0, 0.64), (8.0, 0.62)]
+        sold_at = None
+        for t, bid in path:
+            act = self._tick(s, t, bid)
+            if act.kind == SELL:
+                sold_at = bid
+                break
+        assert sold_at is not None, "позиция снова проехала весь откат"
+        assert sold_at - 0.53 > 0, "вышли в минус — стоп не спас"
+
+    def test_does_not_arm_before_real_profit(self, cfg):
+        """Дрожание бида сразу после покупки не должно закрывать сделку."""
+        cfg.jump_tp_trail = 0.03
+        s = self._leg(cfg)
+        # бид гуляет вокруг входа, до +10¢ ни разу не доходили
+        for t, bid in ((1.0, 0.52), (2.0, 0.48), (3.0, 0.47)):
+            assert self._tick(s, t, bid).kind != SELL
+
+    def test_arms_only_after_min_gain(self, cfg):
+        cfg.jump_tp_trail = 0.03
+        cfg.jump_tp_min_gain = 0.10
+        s = self._leg(cfg)
+        # пик 0.62 = вход +9¢, до взвода не хватает цента
+        assert self._tick(s, 1.0, 0.62).kind == HOLD
+        assert self._tick(s, 2.0, 0.55).kind == HOLD
+        # а теперь пик 0.63 = ровно +10¢, стоп взведён
+        assert self._tick(s, 3.0, 0.63).kind == HOLD
+        assert self._tick(s, 4.0, 0.60).kind == SELL
+
+    def test_zero_disables_the_trail(self, cfg):
+        cfg.jump_tp_trail = 0.0
+        s = self._leg(cfg)
+        for t, bid in ((1.0, 0.70), (2.0, 0.66)):
+            act = self._tick(s, t, bid)
+        assert act.kind == HOLD
+
+    def test_trail_beats_the_ladder_to_the_exit(self, cfg):
+        """Продать по 0.66 лучше, чем разворачиваться из 0.49."""
+        cfg.jump_tp_trail = 0.03
+        s = self._leg(cfg)
+        self._tick(s, 1.0, 0.70)
+        act = self._tick(s, 2.0, 0.60)
+        assert act.kind == SELL, "лестница не должна опережать фиксацию"

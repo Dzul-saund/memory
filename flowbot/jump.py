@@ -535,6 +535,34 @@ class JumpStrategy:
             bid = s.bid(leg.outcome)
             if bid is None:
                 continue
+
+            # ── ТРЕЙЛИНГ-СТОП: не отдавать назад то, что уже заработано ──
+            # Прибыль, которая была на экране, — достигнутый результат, а не
+            # намерение. Проверка стоит ПЕРЕД порогом «мы в плюсе» намеренно:
+            # на откате плюс тает первым, и старый порядок переставал смотреть
+            # на позицию ровно в тот момент, когда защищать её нужнее всего.
+            #
+            # Взвод — только после того, как нога хоть раз стоила на
+            # jump_tp_min_gain дороже входа. Иначе дрожание бида сразу после
+            # покупки закрывало бы каждую сделку в минус.
+            # Допуск 1e-9 — цены здесь всегда в целых центах, а 0.63 − 0.53
+            # в двоичной дроби даёт 0.09999999999999998, и ровно на пороге
+            # стоп не взводился бы.
+            eps = 1e-9
+            armed = leg.peak_bid - leg.entry_price >= c.jump_tp_min_gain - eps
+            if (c.jump_tp_trail > 0 and armed
+                    and bid <= leg.peak_bid - c.jump_tp_trail + eps):
+                return Action(
+                    SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
+                    limit_price=round(bid, 2),
+                    reason=(
+                        f"ФИКСИРУЮ {leg.outcome}: пик был {leg.peak_bid:.2f}, "
+                        f"сейчас {bid:.2f} — откат "
+                        f"{(leg.peak_bid - bid) * 100:.0f}¢ от пика "
+                        f"(вошли {leg.entry_price:.2f}, итог "
+                        f"{bid - leg.entry_price:+.2f})"),
+                )
+
             gain = bid - leg.entry_price      # честный плюс: bid против ask
             if gain < c.jump_tp_min_gain:
                 continue                      # ещё не в плюсе — не о чем говорить
