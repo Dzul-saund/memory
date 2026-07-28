@@ -312,6 +312,19 @@ class JumpEngine(FlowEngine):
         if not self._rec:
             return
         try:
+            up = (self.market or {}).get("up")
+            dn = (self.market or {}).get("down")
+            ubs, uas, ubl, ual = self.book.depth(up)
+            dbs, das, _, _ = self.book.depth(dn)
+            w = self.cfg.flow_window_s
+            u_buy, u_sell, u_n = self.book.trade_counts(up, w)
+            d_buy, d_sell, d_n = self.book.trade_counts(dn, w)
+            # Цена, которую видит САМ Polymarket (якорь Chainlink), и её
+            # возраст. Опережение = наш консенсус минус она. Именно эта
+            # разница — преимущество, а не разница с таргетом раунда.
+            pm = fast_monitor.prices.get("polymarket")
+            pm_age = (now_ms() - fast_monitor.last_update.get("polymarket", 0)
+                      if pm is not None else None)
             self._rec.write(json.dumps({
                 "t": round(snap.t, 3), "slug": (self.market or {}).get("slug"),
                 "left": round(snap.seconds_left, 2),
@@ -320,6 +333,12 @@ class JumpEngine(FlowEngine):
                 "ub": snap.up_bid, "ua": snap.up_ask,
                 "db": snap.down_bid, "da": snap.down_ask,
                 "uf": round(snap.up_flow, 3), "df": round(snap.down_flow, 3),
+                # --- сырьё для признаков (по цене задним числом не считается)
+                "pm": pm, "pm_age": round(pm_age) if pm_age is not None else None,
+                "ubs": ubs, "uas": uas, "dbs": dbs, "das": das,
+                "lvl": [ubl, ual],
+                "tb": round(u_buy, 2), "tsl": round(u_sell, 2), "tn": u_n,
+                "dtb": round(d_buy, 2), "dts": round(d_sell, 2), "dtn": d_n,
             }, separators=(",", ":")) + "\n")
         except Exception:  # noqa: BLE001 - запись не должна ронять торговлю
             pass

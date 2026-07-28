@@ -312,6 +312,39 @@ class BookEngine:
                 break
         return ref
 
+    def depth(self, token: Optional[str]):
+        """(объём на лучшем биде, на лучшем аске, уровней bid, уровней ask).
+
+        Размер на топе — это то, обо что мы ударимся при входе, а число
+        уровней грубо показывает, насколько книга «толстая». Восстановить
+        это по цене задним числом нельзя, поэтому пишем в запись как есть.
+        """
+        book = self.books.get(str(token)) if token else None
+        if book is None:
+            return None, None, 0, 0
+        bb, ba = book.best_bid(), book.best_ask()
+        return (book.bids.get(bb) if bb is not None else None,
+                book.asks.get(ba) if ba is not None else None,
+                len(book.bids), len(book.asks))
+
+    def trade_counts(self, token: Optional[str], window: float,
+                     now: Optional[float] = None):
+        """(объём BUY, объём SELL, число сделок) за окно — агрессия потока."""
+        tr = self.trades.get(str(token)) if token else None
+        if not tr:
+            return 0.0, 0.0, 0
+        now = now if now is not None else time.time()
+        buy = sell = 0.0
+        n = 0
+        for t, side, size in tr:
+            if now - t <= window:
+                n += 1
+                if side == "BUY":
+                    buy += size
+                else:
+                    sell += size
+        return buy, sell, n
+
     def flow(self, token: Optional[str], window: float,
              now: Optional[float] = None) -> float:
         """Имбаланс в [-1,1]: >0 = давят на покупку токена (бычий сигнал стороны).
