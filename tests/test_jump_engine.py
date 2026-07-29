@@ -629,3 +629,74 @@ def test_partial_sell_keeps_the_remainder():
     assert ok is False, "нога закрыта не полностью"
     assert eng.legs[0]["shares"] == round(total - 1.00, 2)
     assert eng.strategy.legs[0].shares == round(total - 1.00, 2)
+
+
+# ---------------------------------------------------------------------------
+#  Повисший ордер: бот не должен молча переставать торговать
+# ---------------------------------------------------------------------------
+class HangingTrader(FakeTrader):
+    """Биржа не отвечает. У клиента нет таймаута — значит он нужен у нас."""
+
+    def buy(self, token, price, size, resting=False):
+        time.sleep(1)
+        return {"status": "matched"}
+
+
+def test_hung_order_times_out_and_does_not_create_a_position():
+    """Ордер завис. Ногу записывать нельзя: мы не знаем, дошёл он или нет.
+
+    Записать — значит потом «продавать» позицию, которой может не быть, и
+    вести лестницу от выдуманного долга.
+    """
+    from flowbot.jump import Action, ENTER
+
+    # Пауза заведомо длинная: asyncio.run дожидается спящий поток, и с
+    # короткой паузой проверка «пауза ещё идёт» гонялась бы со временем.
+    eng, cfg = _live(jump_error_cooldown_s=30.0)
+    eng.trader = HangingTrader()
+    cfg.order_timeout_s = 0.2
+    _book(eng, 0.51, 0.53, 0.47, 0.49)
+    asyncio.run(eng._buy_leg(Action(ENTER, outcome="Up", limit_price=0.53,
+                                    size_usdc=1.0, track="A", reason="тест")))
+    assert eng.legs == []
+    assert eng.strategy.legs == []
+    assert eng._retry_after > time.time(), "после зависания нужна пауза"
+
+
+def test_watchdog_clears_a_stuck_busy_flag():
+    """Без сторожа один повисший ордер убивал торговлю до перезапуска.
+
+    Снаружи это выглядит хуже всего: строки состояния идут, решение
+    «покупать» печатается, а сделок нет и причина не названа.
+    """
+    async def scenario():
+        eng, cfg = _live()
+        cfg.order_timeout_s = 0.1
+        eng.busy = True
+        eng._busy_since = time.time() - 999.0
+        _set_target(65_000.0)
+        _book(eng, 0.59, 0.60, 0.40, 0.41)
+        _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
+        eng._tick()
+        # Старый флаг снят, и тут же взведён заново — под НОВЫЙ ордер.
+        assert eng._busy_since > time.time() - 5.0
+        await _drain(eng)
+        assert len(eng.trader.buys) == 1, "после сброса сторожа сделка прошла"
+
+    asyncio.run(scenario())
+
+
+def test_skip_is_reported_not_silent():
+    """Сигнал есть, действовать нельзя — это должно быть видно в логе."""
+    eng, cfg = _live()
+    eng.busy = True
+    eng._busy_since = time.time()
+    eng._last_skip_log = 0.0
+    _set_target(65_000.0)
+    _book(eng, 0.59, 0.60, 0.40, 0.41)
+    _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
+
+    said = []
+    eng.log.warning = lambda msg, *a: said.append(msg % a if a else msg)
+    eng._tick()
+    assert any("сигнал есть, но сделки нет" in s for s in said), said

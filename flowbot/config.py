@@ -102,6 +102,10 @@ class FlowConfig:
     assumed_rtt_ms: float = 90.0
     # Внутренняя обработка ордера (подпись + матчинг-движок) сверх сети.
     order_process_ms: float = 45.0
+    # Сколько ждать ответа биржи на ордер. У клиента своего таймаута нет:
+    # повисший запрос держал бы флаг «ордер в полёте» взведённым, и бот
+    # молча переставал бы торговать до перезапуска.
+    order_timeout_s: float = 10.0
     # В dry-run симулируем задержку исполнения этой долей RTT + обработка.
     simulate_latency: bool = True
 
@@ -372,6 +376,7 @@ class FlowConfig:
             ping_ms=(float(ping) if ping not in (None, "") else None),
             assumed_rtt_ms=_f("FLOW_ASSUMED_RTT_MS", 90.0),
             order_process_ms=_f("FLOW_ORDER_PROCESS_MS", 45.0),
+            order_timeout_s=_f("FLOW_ORDER_TIMEOUT_S", 10.0),
             simulate_latency=_b("FLOW_SIMULATE_LATENCY", True),
             dry_run=_b("DRY_RUN", True),
             run_duration_seconds=_f("RUN_DURATION_SECONDS", 86400.0),

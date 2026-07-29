@@ -50,6 +50,11 @@ class JumpEngine(FlowEngine):
         # отклонённый ордер повторяется на каждом такте (десять раз в
         # секунду), и площадка справедливо начинает ограничивать нас.
         self._retry_after = 0.0
+        # Когда взвели self.busy. Нужен сторож: у запроса к бирже нет
+        # таймаута по умолчанию, и один повисший ордер оставлял бы busy
+        # взведённым НАВСЕГДА — бот молча переставал бы торговать.
+        self._busy_since = 0.0
+        self._last_skip_log = 0.0
         if cfg.record_path:
             self._rec = open(cfg.record_path, "a", encoding="utf-8")
             self.log.info("запись рынка: %s", cfg.record_path)
@@ -137,11 +142,47 @@ class JumpEngine(FlowEngine):
         action = self.strategy.on_tick(snap)
         self._log_status(snap, action)
 
-        if action.kind in (ENTER, LADDER, SELL) and not self.busy:
-            if time.time() < self._retry_after:
-                return                     # пауза после ошибки биржи
-            self.busy = True
-            asyncio.create_task(self._execute(action))
+        if action.kind not in (ENTER, LADDER, SELL):
+            return
+        now = time.time()
+
+        if self.busy:
+            # СТОРОЖ. Ордер не может исполняться дольше своего таймаута с
+            # запасом. Если висит дольше — запрос повис, и без сброса бот
+            # больше не торгует до перезапуска, ничего об этом не сообщая.
+            limit = self.cfg.order_timeout_s * 2 + 5.0
+            if now - self._busy_since > limit:
+                self.log.error(
+                    "СТОРОЖ: ордер висит %.0fс (> %.0fс) — снимаю блокировку. "
+                    "Сделка могла уйти на биржу: проверь позиции на сайте.",
+                    now - self._busy_since, limit)
+                self.busy = False
+            else:
+                self._note_skip("предыдущий ордер ещё в полёте")
+                return
+
+        if now < self._retry_after:
+            self._note_skip(f"пауза после ошибки биржи, ещё "
+                            f"{self._retry_after - now:.0f}с")
+            return
+
+        self.busy = True
+        self._busy_since = now
+        asyncio.create_task(self._execute(action))
+
+    def _note_skip(self, why: str) -> None:
+        """Сигнал был, но действовать нельзя. Раньше это молчало.
+
+        Молчание тут опаснее всего: снаружи бот выглядит работающим — строки
+        состояния идут, решение «покупать» печатается, — а сделок нет и
+        причина неизвестна. Пишем, но не чаще раза в 5 секунд, иначе на
+        десяти тактах в секунду лог утонет.
+        """
+        now = time.time()
+        if now - self._last_skip_log < 5.0:
+            return
+        self._last_skip_log = now
+        self.log.warning("сигнал есть, но сделки нет: %s", why)
 
     # ======================================================================
     #  Исполнение
@@ -175,7 +216,7 @@ class JumpEngine(FlowEngine):
         finally:
             self.busy = False
 
-    def _back_off(self, side: str, exc: Exception) -> None:
+    def _back_off(self, side: str, exc) -> None:
         """Ордер отвергнут — замолчать на паузу, а не долбить биржу.
 
         Сигнал никуда не девается: он держится, пока держится рынок, и на
@@ -241,7 +282,18 @@ class JumpEngine(FlowEngine):
                 self.cfg.jump_max_round_usdc)
             return
         try:
-            resp = await asyncio.to_thread(self.trader.buy, token, fill, shares)
+            # Таймаут обязателен: у клиента биржи его нет, а зависший запрос
+            # держал бы busy взведённым и бот бы молча замер.
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(self.trader.buy, token, fill, shares),
+                timeout=self.cfg.order_timeout_s)
+        except asyncio.TimeoutError:
+            self._back_off("BUY", f"нет ответа за {self.cfg.order_timeout_s:.0f}с")
+            self.log.error(
+                "ВНИМАНИЕ: ордер мог уйти на биржу. Ногу НЕ записываю (иначе "
+                "бот считал бы своей позицию, которой может не быть) — "
+                "проверь позиции на сайте вручную.")
+            return
         except Exception as exc:  # noqa: BLE001
             self._back_off("BUY", exc)
             return
@@ -334,8 +386,14 @@ class JumpEngine(FlowEngine):
         shares = leg["shares"]
         proceeds = round(fill * shares, 2)
         try:
-            resp = await asyncio.to_thread(self.trader.sell, leg["token"],
-                                           fill, shares)
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(self.trader.sell, leg["token"], fill, shares),
+                timeout=self.cfg.order_timeout_s)
+        except asyncio.TimeoutError:
+            self._back_off("SELL", f"нет ответа за {self.cfg.order_timeout_s:.0f}с")
+            self.log.error("нога оставлена; продажа могла уйти на биржу — "
+                           "проверь позиции на сайте")
+            return False
         except Exception as exc:  # noqa: BLE001
             self._back_off("SELL", exc)
             self.log.error("нога оставлена")
