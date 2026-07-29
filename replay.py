@@ -31,7 +31,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, Iterator, List, Optional
 
-from btc_bot.util import ceil2, floor2
+from btc_bot.util import whole_shares
 from flowbot.config import FlowConfig
 from flowbot.jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                           ladder_shares)
@@ -143,18 +143,20 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             if ask is None or (act.limit_price is not None
                                and ask > act.limit_price + 1e-9):
                 continue
+            # Размер считается ТОЧНО так же, как в бою: целыми шэрами.
+            # Площадка отвергает суммы с более чем двумя знаками, а при цене
+            # в целых центах это гарантирует только целое число шэров.
+            # Разойдись здесь с движком — и подбор порогов по записи будет
+            # мерить не ту стратегию, что торгует.
             if act.shares is not None:
-                shares = floor2(ladder_shares(strat.debt,
-                                              cfg.jump_ladder_profit_usdc, ask))
+                want = ladder_shares(strat.debt,
+                                     cfg.jump_ladder_profit_usdc, ask)
             else:
-                shares = floor2((act.size_usdc or 0.0) / ask)
+                want = (act.size_usdc or 0.0) / ask
+            shares = whole_shares(want * ask, ask,
+                                  getattr(cfg, "jump_min_order_usdc", 0.0))
             if shares <= 0:
                 continue
-            # Тот же минимум, что и в бою: округление шэров вниз опускало
-            # каждую покупку под доллар. Сравнение по НЕОКРУГЛЁННОЙ сумме.
-            floor_usdc = getattr(cfg, "jump_min_order_usdc", 0.0)
-            if floor_usdc > 0 and ask * shares < floor_usdc - 1e-9:
-                shares = ceil2(floor_usdc / ask)
             cost = round(ask * shares, 4)
             if strat.net_out + cost > cfg.jump_max_round_usdc + 1e-9:
                 continue

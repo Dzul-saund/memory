@@ -58,6 +58,31 @@ def floor2(x: float) -> float:
     return math.floor(x * 100) / 100.0
 
 
+def whole_shares(usdc: float, price: float, min_usdc: float = 0.0) -> float:
+    """Сколько ЦЕЛЫХ шэров взять на `usdc` по цене `price`.
+
+    Polymarket отвергает покупку, если сумма в USDC (price * size) имеет
+    больше двух знаков после запятой:
+
+        {"error": "invalid amounts, the market buy orders maker amount
+                   supports a max accuracy of 2 decimals"}
+
+    Цена всегда в целых центах, поэтому два знака гарантированы только для
+    ЦЕЛОГО числа шэров: 0.57 * 1.76 = $1.0032 отвергается, 0.57 * 2 = $1.14
+    проходит. Дробные размеры (floor2/ceil2) для покупки не годятся —
+    именно на них живой ордер и падал с 400.
+
+    Если целая часть не дотягивает до минимального размера ордера,
+    округляем ВВЕРХ до первого целого, который его перекрывает.
+    """
+    if price <= 0:
+        return 0.0
+    n = math.floor(usdc / price)
+    if n * price < min_usdc - 1e-9:
+        n = math.ceil(min_usdc / price)
+    return float(max(n, 0))
+
+
 def ceil2(x: float) -> float:
     """Round UP to 2 decimals (Polymarket share precision).
 

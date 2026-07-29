@@ -263,6 +263,10 @@ class FlowConfig:
     # обвал книги продавал бы ногу по любой цене, какую она покажет.
     # 0 = пола нет, продаём по текущему биду (прежнее поведение).
     jump_max_sell_slip: float = 0.03
+    # Пауза после ОТКАЗА биржи. Сигнал держится, пока держится рынок,
+    # поэтому без паузы отклонённый ордер повторяется на каждом такте —
+    # десять раз в секунду. Первый живой запуск дал ровно это.
+    jump_error_cooldown_s: float = 5.0
     jump_tp_deadline_s: float = 5.0         # «до окончания 5 секунд» — фиксируем
     jump_tp_stall_retrace: float = 0.03     # откат % от пика = рост кончился
     jump_tp_flow_against: float = -0.20     # «люди смотрят в другую сторону»
@@ -358,6 +362,7 @@ class FlowConfig:
             jump_tp_trail_arm=_f("JUMP_TP_TRAIL_ARM", 0.02),
             jump_stop_loss=_f("JUMP_STOP_LOSS", 0.01),
             jump_max_sell_slip=_f("JUMP_MAX_SELL_SLIP", 0.03),
+            jump_error_cooldown_s=_f("JUMP_ERROR_COOLDOWN_S", 5.0),
             jump_min_order_usdc=_f("JUMP_MIN_ORDER_USDC", 1.0),
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),
             jump_tp_stall_retrace=_f("JUMP_TP_STALL_RETRACE", 0.03),

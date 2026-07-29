@@ -451,6 +451,29 @@ def test_order_never_goes_below_the_minimum(ask):
     assert leg["shares"] * ask >= cfg.jump_min_order_usdc - 1e-9
 
 
+def test_size_is_always_a_whole_number_of_shares():
+    """Площадка отвергает суммы длиннее двух знаков после запятой.
+
+    При цене в целых центах два знака гарантирует только целое число шэров:
+    0.57 * 1.76 = $1.0032 -> 400 "invalid amounts". Первый живой ордер упал
+    именно на этом, а dry-run пропускал, потому что там сумм никто не считает.
+    """
+    from flowbot.jump import Action, ENTER
+
+    for ask in (0.53, 0.57, 0.31, 0.95):
+        eng, cfg = _engine()
+        _book(eng, round(ask - 0.02, 2), ask, round(1 - ask, 2),
+              round(1 - ask + 0.02, 2))
+        asyncio.run(eng._buy_leg(
+            Action(ENTER, outcome="Up", limit_price=ask, size_usdc=1.0,
+                   track="A", reason="тест")))
+        shares = eng.legs[-1]["shares"]
+        assert shares == int(shares), f"дробный размер {shares} при цене {ask}"
+        amount = round(ask * shares, 10)
+        assert amount == round(amount, 2), f"сумма ${amount} длиннее 2 знаков"
+        assert amount >= cfg.jump_min_order_usdc - 1e-9
+
+
 def test_minimum_can_be_switched_off():
     eng, cfg = _engine(jump_min_order_usdc=0.0)
     _book(eng, 0.51, 0.53, 0.47, 0.49)
@@ -459,7 +482,8 @@ def test_minimum_can_be_switched_off():
     asyncio.run(eng._buy_leg(
         Action(ENTER, outcome="Up", limit_price=0.53, size_usdc=1.0,
                track="A", reason="тест")))
-    assert eng.legs[-1]["shares"] == 1.88      # прежнее округление вниз
+    # Без минимума берём столько целых шэров, сколько влезает в ставку.
+    assert eng.legs[-1]["shares"] == 1.0
 
 
 # ---------------------------------------------------------------------------

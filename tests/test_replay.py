@@ -102,8 +102,10 @@ def test_replay_enters_and_settles_a_win(tmp_path):
     res = R.replay(str(p), _cfg())
     assert res.entries == 1
     assert res.rounds == 1
-    # вход $1 по 0.60 => 1.66 шэра, выплата $1.66
-    assert res.pnl == pytest.approx(0.66, abs=0.02)
+    # Размер — ЦЕЛЫМИ шэрами (площадка отвергает суммы длиннее 2 знаков).
+    # Ставка $1 по 0.60: один шэр стоит $0.60 и не дотягивает до минимума
+    # $1, поэтому берём два за $1.20. Выплата 2 * $1 = $2.00.
+    assert res.pnl == pytest.approx(0.80, abs=0.02)
 
 
 def test_replay_settles_a_loss(tmp_path):
@@ -113,7 +115,8 @@ def test_replay_settles_a_loss(tmp_path):
                  "resolved": True, "t": 1100.0})
     _write(p, rows)
     res = R.replay(str(p), _cfg())
-    assert res.pnl == pytest.approx(-1.0, abs=0.02)
+    # два шэра по 0.60 = $1.20, проигравшая сторона платит ноль
+    assert res.pnl == pytest.approx(-1.20, abs=0.02)
 
 
 def test_replay_respects_max_legs(tmp_path):

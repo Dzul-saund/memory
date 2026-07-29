@@ -23,7 +23,7 @@ from typing import List, Optional
 import fast_monitor
 
 from btc_bot.prob import expected_shift
-from btc_bot.util import ceil2, floor2
+from btc_bot.util import floor2, whole_shares
 
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
@@ -46,6 +46,10 @@ class JumpEngine(FlowEngine):
         self._round_pnl = 0.0
         self.rounds = 0
         self._rec = None
+        # Пока не истечёт — новых ордеров не отправляем. Без этого один
+        # отклонённый ордер повторяется на каждом такте (десять раз в
+        # секунду), и площадка справедливо начинает ограничивать нас.
+        self._retry_after = 0.0
         if cfg.record_path:
             self._rec = open(cfg.record_path, "a", encoding="utf-8")
             self.log.info("запись рынка: %s", cfg.record_path)
@@ -134,6 +138,8 @@ class JumpEngine(FlowEngine):
         self._log_status(snap, action)
 
         if action.kind in (ENTER, LADDER, SELL) and not self.busy:
+            if time.time() < self._retry_after:
+                return                     # пауза после ошибки биржи
             self.busy = True
             asyncio.create_task(self._execute(action))
 
@@ -169,6 +175,18 @@ class JumpEngine(FlowEngine):
         finally:
             self.busy = False
 
+    def _back_off(self, side: str, exc: Exception) -> None:
+        """Ордер отвергнут — замолчать на паузу, а не долбить биржу.
+
+        Сигнал никуда не девается: он держится, пока держится рынок, и на
+        следующем такте бот попробует снова. Без паузы это «снова» наступает
+        через 60мс, и один отказ превращается в сотни запросов в минуту.
+        """
+        pause = getattr(self.cfg, "jump_error_cooldown_s", 5.0)
+        self._retry_after = time.time() + pause
+        self.log.error("ордер %s упал: %s", side, exc)
+        self.log.warning("пауза %.0fс перед следующей попыткой", pause)
+
     async def _buy_leg(self, action) -> None:
         if self.market is None:
             return
@@ -190,29 +208,30 @@ class JumpEngine(FlowEngine):
         # Добор считается в ШЭРАХ (их число решает уравнение перекрытия
         # минуса), обычный вход — в долларах ставки. И то и другое надо
         # пересчитать по РЕАЛЬНОЙ цене филла, а не по той, что была в решении.
+        # РАЗМЕР — ТОЛЬКО ЦЕЛЫМИ ШЭРАМИ.
+        #
+        # Polymarket отвергает покупку, если сумма в USDC (цена * размер)
+        # имеет больше двух знаков после запятой. Цена всегда в целых центах,
+        # поэтому два знака гарантированы лишь при целом числе шэров:
+        # 0.57 * 1.76 = $1.0032 -> 400 "invalid amounts", 0.57 * 2 = $1.14 ок.
+        # Дробные размеры проходили dry-run, потому что там никто не считает
+        # суммы, и падали на первом же живом ордере.
+        floor_usdc = getattr(self.cfg, "jump_min_order_usdc", 0.0)
         if action.shares is not None:
-            shares = floor2(ladder_shares(self.strategy.debt,
-                                          self.cfg.jump_ladder_profit_usdc,
-                                          fill))
+            want = ladder_shares(self.strategy.debt,
+                                 self.cfg.jump_ladder_profit_usdc, fill)
         else:
-            shares = floor2((action.size_usdc or 0.0) / fill)
+            want = (action.size_usdc or 0.0) / fill
+        shares = whole_shares(want * fill, fill, floor_usdc)
         if shares <= 0:
-            self.log.warning("ПОКУПКА %s: расчёт дал %.2f шэров — пропуск",
+            self.log.warning("ПОКУПКА %s: расчёт дал %.0f шэров — пропуск",
                              outcome, shares)
             return
-        # МИНИМАЛЬНЫЙ РАЗМЕР ОРДЕРА. Шэры округляются вниз до сотых, поэтому
-        # ставка $1.00 по 0.53 давала 1.88 шэра = $0.9964 — под минимумом
-        # площадки. Добиваем размер ВВЕРХ, а не отбрасываем сделку.
-        #
-        # Сравнивать нужно НЕОКРУГЛЁННОЕ произведение: round(0.9964, 2) даёт
-        # ровно 1.00, и проверка минимума по округлённой сумме молча
-        # пропускала бы ордер, который на площадку уходит на $0.9964.
-        floor_usdc = getattr(self.cfg, "jump_min_order_usdc", 0.0)
-        if floor_usdc > 0 and fill * shares < floor_usdc - 1e-9:
-            shares = ceil2(floor_usdc / fill)
-            self.log.info("размер добит до минимума $%.2f: %.2f шэр @ %.2f "
-                          "= $%.4f", floor_usdc, shares, fill, fill * shares)
         cost = round(fill * shares, 2)
+        if abs(cost - want * fill) > 0.01:
+            self.log.info("размер округлён до целых шэров: %.0f @ %.2f = "
+                          "$%.2f (хотели $%.2f)", shares, fill, cost,
+                          want * fill)
         # Потолок раунда проверяем ещё раз ЗДЕСЬ, а не только в стратегии:
         # за время пинга цена филла могла вырасти, а вместе с ней и стоимость.
         if self.strategy.net_out + cost > self.cfg.jump_max_round_usdc + 1e-9:
@@ -224,7 +243,7 @@ class JumpEngine(FlowEngine):
         try:
             resp = await asyncio.to_thread(self.trader.buy, token, fill, shares)
         except Exception as exc:  # noqa: BLE001
-            self.log.error("ордер BUY упал: %s", exc)
+            self._back_off("BUY", exc)
             return
 
         # Ордер уходит как FAK: несведённый остаток отменяется. Значит филла
@@ -318,7 +337,8 @@ class JumpEngine(FlowEngine):
             resp = await asyncio.to_thread(self.trader.sell, leg["token"],
                                            fill, shares)
         except Exception as exc:  # noqa: BLE001
-            self.log.error("ордер SELL упал: %s (нога оставлена)", exc)
+            self._back_off("SELL", exc)
+            self.log.error("нога оставлена")
             return False
 
         got = interpret(resp, shares)
