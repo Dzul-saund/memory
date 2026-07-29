@@ -28,6 +28,7 @@ from btc_bot.util import floor2, whole_shares
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
 from .fills import UNKNOWN, interpret
+from .positions import reconcile, shares_from_balance
 from .jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                    ladder_shares)
 
@@ -55,6 +56,7 @@ class JumpEngine(FlowEngine):
         # взведённым НАВСЕГДА — бот молча переставал бы торговать.
         self._busy_since = 0.0
         self._last_skip_log = 0.0
+        self._last_reconcile = 0.0
         if cfg.record_path:
             self._rec = open(cfg.record_path, "a", encoding="utf-8")
             self.log.info("запись рынка: %s", cfg.record_path)
@@ -139,6 +141,14 @@ class JumpEngine(FlowEngine):
             leg["last_bid"] = ub if leg["outcome"] == "Up" else db
 
         self._record(snap)
+
+        # Периодическая сверка с биржей. Дешёвая (два запроса) и редкая, но
+        # это единственное, что ловит расхождение учёта с реальностью.
+        every = getattr(cfg, "jump_reconcile_s", 0.0)
+        if every > 0 and snap.t - self._last_reconcile > every and not self.busy:
+            self._last_reconcile = snap.t
+            asyncio.create_task(self._reconcile())
+
         action = self.strategy.on_tick(snap)
         self._log_status(snap, action)
 
@@ -174,6 +184,80 @@ class JumpEngine(FlowEngine):
         self.busy = True
         self._busy_since = now
         asyncio.create_task(self._execute(action))
+
+    async def _reconcile(self) -> None:
+        """Спросить биржу, чем мы владеем на самом деле, и поверить ЕЙ.
+
+        Свой учёт бота — это память о его же действиях, и она расходится с
+        реальностью при таймаутах, частичных филлах и неверно разобранных
+        ответах. Расхождение само не чинится: позиция висит на Polymarket и
+        теряет в цене, а бот показывает «поз —» и ничего не делает, потому
+        что управлять он может только тем, о чём знает.
+
+        Биржа — источник истины. Мы не пытаемся угадать, откуда взялась
+        разница: если шэры есть — заводим ногу и дальше ведём её обычными
+        правилами (стоп, трейлинг); если их нет — выбрасываем фантом.
+        """
+        if self.market is None or self.cfg.dry_run:
+            return
+        for outcome, token in (("Up", self.market["up"]),
+                               ("Down", self.market["down"])):
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(self.trader.position, token),
+                    timeout=self.cfg.order_timeout_s)
+            except Exception as exc:  # noqa: BLE001 - сверка не должна ронять бота
+                self.log.debug("сверка позиции %s: %s", outcome, exc)
+                continue
+
+            theirs = shares_from_balance(resp)
+            ours = sum(lg["shares"] for lg in self.legs
+                       if lg["outcome"] == outcome)
+            diff = reconcile(ours, theirs)
+            if not diff:
+                continue
+
+            if diff > 0:
+                self._adopt(outcome, token, diff)
+            else:
+                self._drop_phantom(outcome, -diff)
+
+    def _adopt(self, outcome: str, token: str, shares: float) -> None:
+        """На бирже есть шэры, о которых бот не знал — берём их под управление."""
+        bid, ask = self.book.best(token)
+        px = ask if ask is not None else (bid or 0.5)
+        self.log.error(
+            "СВЕРКА: на бирже %.2f шэр %s, о которых бот не знал — беру под "
+            "управление по текущей цене %.2f. Скорее всего ордер прошёл, а "
+            "ответ на него потерялся.", shares, outcome, px)
+        leg = self.strategy.record_entry(outcome, px, shares,
+                                         round(px * shares, 2), "A",
+                                         time.time(),
+                                         entry_bid=bid if bid is not None else px)
+        self.legs.append({
+            "idx": leg.idx, "outcome": outcome, "token": token,
+            "entry_price": px, "shares": shares, "cost": round(px * shares, 2),
+            "track": "A", "last_bid": bid,
+            "coin_at_entry": self.price.price(),
+            "secs_at_entry": int(self.market["end_ts"] - time.time()),
+        })
+
+    def _drop_phantom(self, outcome: str, shares: float) -> None:
+        """Бот считал ноги своими, а на бирже их нет — выбрасываем."""
+        self.log.error(
+            "СВЕРКА: бот считал своими %.2f шэр %s, но на бирже их нет — "
+            "выбрасываю фантом. Скорее всего ордер не исполнился, а ответ "
+            "разобрался как успех.", shares, outcome)
+        left = shares
+        for lg in list(self.legs):
+            if lg["outcome"] != outcome or left <= 0:
+                continue
+            take = min(lg["shares"], left)
+            lg["shares"] = round(lg["shares"] - take, 2)
+            left = round(left - take, 2)
+            self.strategy.record_partial_sell(lg["idx"], take, 0.0, time.time())
+            if lg["shares"] <= 0:
+                self.legs = [x for x in self.legs if x["idx"] != lg["idx"]]
 
     def _note_skip(self, why: str) -> None:
         """Сигнал был, но действовать нельзя. Раньше это молчало.

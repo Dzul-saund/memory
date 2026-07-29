@@ -136,6 +136,32 @@ class LiveTrader:
         self.log.info("CLOB keep-alive ON: orders go out on a warm "
                       "connection (no TLS handshake before an order).")
 
+    def position(self, token_id: str):
+        """Сколько шэров этого токена РЕАЛЬНО лежит на кошельке.
+
+        Возвращает сырой ответ биржи; разбирает его flowbot.positions. Нужен
+        для сверки: собственный учёт бота расходится с биржей при таймаутах,
+        частичных филлах и неверно разобранных ответах, а без сверки такое
+        расхождение живёт вечно.
+        """
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+        def _do():
+            return self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL,
+                                       token_id=str(token_id),
+                                       signature_type=self.cfg.signature_type)
+            )
+
+        return with_retry(
+            _do,
+            retries=self.cfg.max_retries,
+            base=self.cfg.backoff_base_seconds,
+            max_backoff=self.cfg.max_backoff_seconds,
+            what="position",
+            logger=self.log,
+        )
+
     def get_balance(self) -> float:
         """USDC collateral balance, in dollars."""
         from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
@@ -243,6 +269,10 @@ class DryRunTrader:
         self._start = cfg.dry_run_balance
         self._spent = 0.0       # USDC paid out on (simulated) buys
         self._credited = 0.0    # USDC received from (simulated) winning settlements
+
+    def position(self, token_id: str):
+        """В симуляции сверять не с чем: биржа о наших ордерах не знает."""
+        return None
 
     def get_balance(self) -> float:
         base = self._provider() if self._provider else self._start

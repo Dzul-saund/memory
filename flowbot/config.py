@@ -275,6 +275,12 @@ class FlowConfig:
     # поэтому без паузы отклонённый ордер повторяется на каждом такте —
     # десять раз в секунду. Первый живой запуск дал ровно это.
     jump_error_cooldown_s: float = 5.0
+    # Как часто сверять свой учёт позиций с БИРЖЕЙ, секунд. 0 = не сверять.
+    # Учёт бота — память о его же действиях, и она расходится с реальностью
+    # при таймаутах, частичных филлах и неверно разобранных ответах. Без
+    # сверки расхождение живёт вечно: позиция висит на Polymarket и теряет
+    # в цене, а бот показывает «поз —» и ничего не делает.
+    jump_reconcile_s: float = 20.0
     jump_tp_deadline_s: float = 5.0         # «до окончания 5 секунд» — фиксируем
     jump_tp_stall_retrace: float = 0.03     # откат % от пика = рост кончился
     jump_tp_flow_against: float = -0.20     # «люди смотрят в другую сторону»
@@ -371,6 +377,7 @@ class FlowConfig:
             jump_stop_loss=_f("JUMP_STOP_LOSS", 0.01),
             jump_max_sell_slip=_f("JUMP_MAX_SELL_SLIP", 0.0),
             jump_error_cooldown_s=_f("JUMP_ERROR_COOLDOWN_S", 5.0),
+            jump_reconcile_s=_f("JUMP_RECONCILE_S", 20.0),
             jump_min_order_usdc=_f("JUMP_MIN_ORDER_USDC", 1.0),
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),
             jump_tp_stall_retrace=_f("JUMP_TP_STALL_RETRACE", 0.03),
