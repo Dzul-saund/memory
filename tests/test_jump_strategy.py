@@ -348,7 +348,14 @@ class TestSensitivityFilter:
 # ---------------------------------------------------------------------------
 class TestLadder:
     def _entered(self, cfg, price=0.60, track=TRACK_A, t=100.0, bid=None):
-        """Вход по ask=price; бид на входе на цент ниже, если не задан."""
+        """Вход по ask=price; бид на входе на цент ниже, если не задан.
+
+        Жёсткий стоп здесь выключен намеренно: он срабатывает на 1¢ ниже
+        бида на входе, то есть РАНЬШЕ лестницы (2¢ плюс выдержка 0.6с), и
+        забрал бы себе каждый из этих сценариев. Взаимодействие двух правил
+        проверяется отдельно, в TestStopLoss.
+        """
+        cfg.jump_stop_loss = 0.0
         s = JumpStrategy(cfg)
         eb = bid if bid is not None else price - 0.01
         s.record_entry("Up", price, round(1.0 / price, 2), 1.0, track, t=t,
@@ -526,7 +533,13 @@ class TestRequestedScenarios:
         cfg.jump_tp_quiet_usd = 1.5
         return cfg
 
-    def _bought(self, cfg, ask=0.50, bid=0.45, t=50.0):
+    def _bought(self, cfg, ask=0.50, bid=0.45, t=50.0, stop=0.0):
+        """stop=0 по умолчанию: эти сценарии про лестницу и фиксацию.
+
+        Жёсткий стоп срабатывает раньше обоих (1¢ ниже бида на входе), и без
+        его отключения каждый сценарий свёлся бы к нему одному.
+        """
+        cfg.jump_stop_loss = stop
         s = JumpStrategy(cfg)
         s.record_entry("Up", ask, 2.0, ask * 2, TRACK_A, t=t, entry_bid=bid)
         return s
@@ -664,23 +677,42 @@ class TestTrailingStop:
         assert sold_at - 0.53 > 0, "вышли в минус — стоп не спас"
 
     def test_does_not_arm_before_real_profit(self, cfg):
-        """Дрожание бида сразу после покупки не должно закрывать сделку."""
-        cfg.jump_tp_trail = 0.03
+        """Дрожание бида сразу после покупки не должно взводить стоп.
+
+        Жёсткий стоп отключён: проверяем именно взвод трейлинга, иначе
+        уход бида ниже входа закрыл бы позицию раньше по другому правилу.
+        """
+        cfg.jump_tp_trail = 0.02
+        cfg.jump_stop_loss = 0.0
         s = self._leg(cfg)
-        # бид гуляет вокруг входа, до +10¢ ни разу не доходили
-        for t, bid in ((1.0, 0.52), (2.0, 0.48), (3.0, 0.47)):
+        # бид ходит вокруг входа 0.53 и ни разу не доходит до 0.55
+        for t, bid in ((1.0, 0.52), (2.0, 0.54), (3.0, 0.51)):
             assert self._tick(s, t, bid).kind != SELL
 
-    def test_arms_only_after_min_gain(self, cfg):
-        cfg.jump_tp_trail = 0.03
-        cfg.jump_tp_min_gain = 0.10
+    def test_arms_exactly_at_the_threshold(self, cfg):
+        """Взвод по jump_tp_trail_arm (2¢ от уплаченного ask), не по 10¢."""
+        cfg.jump_tp_trail = 0.02
+        cfg.jump_tp_trail_arm = 0.02
+        cfg.jump_stop_loss = 0.0
         s = self._leg(cfg)
-        # пик 0.62 = вход +9¢, до взвода не хватает цента
-        assert self._tick(s, 1.0, 0.62).kind == HOLD
-        assert self._tick(s, 2.0, 0.55).kind == HOLD
-        # а теперь пик 0.63 = ровно +10¢, стоп взведён
-        assert self._tick(s, 3.0, 0.63).kind == HOLD
-        assert self._tick(s, 4.0, 0.60).kind == SELL
+        # пик 0.54 = вход +1¢: до взвода не хватает цента
+        assert self._tick(s, 1.0, 0.54).kind == HOLD
+        assert self._tick(s, 2.0, 0.52).kind == HOLD
+        # пик 0.55 = ровно +2¢, стоп взведён; откат на 2¢ закрывает
+        assert self._tick(s, 3.0, 0.55).kind == HOLD
+        assert self._tick(s, 4.0, 0.53).kind == SELL
+
+    def test_old_arming_threshold_was_the_blocker(self, cfg):
+        """Регрессия: при взводе по 10¢ падение от пика игнорировалось.
+
+        Пик +9¢ к уплаченному ask, откат на 6¢ — старый порог не взводился
+        и позиция ехала вниз без единой реакции. Новый взвод её закрывает.
+        """
+        cfg.jump_tp_trail = 0.02
+        cfg.jump_stop_loss = 0.0
+        s = self._leg(cfg)
+        assert self._tick(s, 1.0, 0.62).kind == HOLD      # пик +9¢
+        assert self._tick(s, 2.0, 0.56).kind == SELL      # откат 6¢
 
     def test_zero_disables_the_trail(self, cfg):
         cfg.jump_tp_trail = 0.0
@@ -696,3 +728,70 @@ class TestTrailingStop:
         self._tick(s, 1.0, 0.70)
         act = self._tick(s, 2.0, 0.60)
         assert act.kind == SELL, "лестница не должна опережать фиксацию"
+
+
+# ---------------------------------------------------------------------------
+#  Жёсткий стоп: процент ушёл ниже входа
+# ---------------------------------------------------------------------------
+class TestStopLoss:
+    """«Если процент упал ниже нашего входа хоть на цент — продаёт.»
+
+    Ключевая тонкость — ОТ ЧЕГО считать. Спред означает, что сразу после
+    покупки бид уже ниже уплаченного ask, поэтому стоп от ask закрывал бы
+    каждую сделку в тот же тик с гарантированным убытком. Отсчёт идёт от
+    бида на входе — цены, по которой рынок реально готов был выкупить нашу
+    ногу в момент покупки.
+    """
+
+    def _leg(self, cfg, ask=0.53, entry_bid=0.51):
+        cfg.jump_stop_loss = 0.01
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", ask, 1.89, 1.00, TRACK_A, t=0.0,
+                       entry_bid=entry_bid)
+        return s
+
+    def _tick(self, s, t, bid):
+        return s.on_tick(snap(t=t, left=200.0, jump=2.0,
+                              up_bid=bid, up_ask=round(bid + 0.02, 2),
+                              down_bid=round(1 - bid - 0.02, 2),
+                              down_ask=round(1 - bid, 2)))
+
+    def test_sells_one_cent_below_entry_bid(self, cfg):
+        s = self._leg(cfg)
+        assert self._tick(s, 1.0, 0.51).kind == HOLD      # ровно бид входа
+        act = self._tick(s, 2.0, 0.50)                    # на цент ниже
+        assert act.kind == SELL
+        assert "СТОП" in act.reason
+
+    def test_does_not_fire_on_the_spread_at_entry(self, cfg):
+        """Главная ловушка: спред 5¢ не должен выглядеть просадкой.
+
+        Купили по 0.53 при биде 0.48. Бид стоит на месте — это стоимость
+        входа, а не движение против нас. Стоп молчать обязан.
+        """
+        s = self._leg(cfg, ask=0.53, entry_bid=0.48)
+        assert self._tick(s, 1.0, 0.48).kind == HOLD
+
+    def test_beats_the_ladder_to_the_exit(self, cfg):
+        """Стоп (1¢) срабатывает раньше лестницы (2¢ плюс выдержка)."""
+        cfg.jump_ladder_enabled = True
+        cfg.jump_ladder_loss = 0.02
+        cfg.jump_ladder_grace_s = 0.6
+        s = self._leg(cfg)
+        act = self._tick(s, 1.0, 0.50)
+        assert act.kind == SELL, "лестница не должна опережать стоп"
+
+    def test_profit_taking_still_wins_over_the_stop(self, cfg):
+        """Если мы в плюсе, забрать прибыль важнее — порядок проверок."""
+        cfg.jump_tp_trail = 0.02
+        s = self._leg(cfg)
+        self._tick(s, 1.0, 0.60)                          # пик, стоп взведён
+        act = self._tick(s, 2.0, 0.58)                    # откат 2¢
+        assert act.kind == SELL
+        assert "ФИКСИРУЮ" in act.reason
+
+    def test_zero_disables_the_stop(self, cfg):
+        cfg.jump_ladder_enabled = False
+        s = self._leg(cfg)
+        s.cfg.jump_stop_loss = 0.0
+        assert self._tick(s, 1.0, 0.30).kind == HOLD

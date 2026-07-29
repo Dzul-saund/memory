@@ -129,8 +129,10 @@ def test_replay_respects_max_legs(tmp_path):
                  "resolved": True, "t": 1100.0})
     _write(p, rows)
     # 0 = БЕЗ ПРЕДЕЛА, отключается флагом jump_ladder_enabled
-    off = R.replay(str(p), _cfg(jump_ladder_enabled=False))
-    on = R.replay(str(p), _cfg(jump_max_ladder_legs=2))
+    # Стоп выключен: он закрывает ногу раньше лестницы, и обе ветки дали бы
+    # ноль доборов — тест проверял бы не то.
+    off = R.replay(str(p), _cfg(jump_ladder_enabled=False, jump_stop_loss=0.0))
+    on = R.replay(str(p), _cfg(jump_max_ladder_legs=2, jump_stop_loss=0.0))
     assert off.ladders == 0
     assert on.ladders >= 1
     assert on.pnl > off.pnl, "разворот должен был спасти раунд"

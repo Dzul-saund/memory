@@ -27,6 +27,10 @@ def _engine(**over):
     cfg.jump_adaptive = False           # пороги не плавают: тесты про лестницу
     cfg.jump_min_shift_cents = 0.0      # и не про фильтр чувствительности
     cfg.jump_min_edge_cents = 0.0       # и не про запас цены
+    # Жёсткий стоп срабатывает на 1¢ ниже бида на входе, то есть раньше
+    # лестницы. Тесты ниже про саму лестницу — там он выключается, а его
+    # приоритет над ней проверяется отдельно (TestStopLoss в стратегии).
+    cfg.jump_stop_loss = 0.0
     for k, v in over.items():
         setattr(cfg, k, v)
     eng = JumpEngine(cfg)
@@ -422,3 +426,37 @@ def test_new_window_resets_the_ladder():
         assert eng.strategy.net_out == 0.0
         assert eng.strategy.legs == []
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+#  Минимальный размер ордера
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("ask", [0.53, 0.66, 0.31, 0.95])
+def test_order_never_goes_below_the_minimum(ask):
+    """Ставка $1 не должна превращаться в ордер на $0.99.
+
+    Округление шэров вниз до сотых опускало под доллар КАЖДУЮ покупку.
+    Проверяем неокруглённое произведение: round(0.9964, 2) даёт ровно 1.00,
+    и по округлённой сумме недобор был бы не виден.
+    """
+    from flowbot.jump import Action, ENTER
+
+    eng, cfg = _engine()
+    _book(eng, round(ask - 0.02, 2), ask, round(1 - ask, 2),
+          round(1 - ask + 0.02, 2))
+    asyncio.run(eng._buy_leg(
+        Action(ENTER, outcome="Up", limit_price=ask, size_usdc=1.0,
+               track="A", reason="тест")))
+    leg = eng.legs[-1]
+    assert leg["shares"] * ask >= cfg.jump_min_order_usdc - 1e-9
+
+
+def test_minimum_can_be_switched_off():
+    eng, cfg = _engine(jump_min_order_usdc=0.0)
+    _book(eng, 0.51, 0.53, 0.47, 0.49)
+    from flowbot.jump import Action, ENTER
+
+    asyncio.run(eng._buy_leg(
+        Action(ENTER, outcome="Up", limit_price=0.53, size_usdc=1.0,
+               track="A", reason="тест")))
+    assert eng.legs[-1]["shares"] == 1.88      # прежнее округление вниз

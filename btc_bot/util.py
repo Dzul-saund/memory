@@ -58,6 +58,18 @@ def floor2(x: float) -> float:
     return math.floor(x * 100) / 100.0
 
 
+def ceil2(x: float) -> float:
+    """Round UP to 2 decimals (Polymarket share precision).
+
+    Нужен там, где округление вниз опускает ордер под минимальный размер:
+    $1.00 / 0.53 = 1.8867 шэра, floor2 даёт 1.88 -> $0.9964, то есть КАЖДАЯ
+    покупка на ставку $1 оказывалась чуть дешевле доллара.
+    """
+    # Округляем до 9 знаков перед ceil: 1.89*100 в двоичной дроби даёт
+    # 188.99999999999997, и без этого ceil вернул бы лишнюю сотую.
+    return math.ceil(round(x * 100, 9)) / 100.0
+
+
 def fmt(x: Optional[float], nd: int = 2) -> str:
     return "-" if x is None else f"{x:.{nd}f}"
 

@@ -31,7 +31,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, Iterator, List, Optional
 
-from btc_bot.util import floor2
+from btc_bot.util import ceil2, floor2
 from flowbot.config import FlowConfig
 from flowbot.jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                           ladder_shares)
@@ -150,6 +150,11 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
                 shares = floor2((act.size_usdc or 0.0) / ask)
             if shares <= 0:
                 continue
+            # Тот же минимум, что и в бою: округление шэров вниз опускало
+            # каждую покупку под доллар. Сравнение по НЕОКРУГЛЁННОЙ сумме.
+            floor_usdc = getattr(cfg, "jump_min_order_usdc", 0.0)
+            if floor_usdc > 0 and ask * shares < floor_usdc - 1e-9:
+                shares = ceil2(floor_usdc / ask)
             cost = round(ask * shares, 4)
             if strat.net_out + cost > cfg.jump_max_round_usdc + 1e-9:
                 continue
@@ -197,6 +202,8 @@ SWEEPS = {
     "entry-mode": ("jump_entry_mode", str),
     "lag-cents": ("jump_lag_min_cents", float),
     "trail": ("jump_tp_trail", float),
+    "trail-arm": ("jump_tp_trail_arm", float),
+    "stop-loss": ("jump_stop_loss", float),
     "edge-cents": ("jump_min_edge_cents", float),
     "max-legs": ("jump_max_ladder_legs", int),
     "min-shift": ("jump_min_shift_cents", float),

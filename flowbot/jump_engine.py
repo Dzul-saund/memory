@@ -23,7 +23,7 @@ from typing import List, Optional
 import fast_monitor
 
 from btc_bot.prob import expected_shift
-from btc_bot.util import floor2
+from btc_bot.util import ceil2, floor2
 
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
@@ -190,6 +190,18 @@ class JumpEngine(FlowEngine):
             self.log.warning("ПОКУПКА %s: расчёт дал %.2f шэров — пропуск",
                              outcome, shares)
             return
+        # МИНИМАЛЬНЫЙ РАЗМЕР ОРДЕРА. Шэры округляются вниз до сотых, поэтому
+        # ставка $1.00 по 0.53 давала 1.88 шэра = $0.9964 — под минимумом
+        # площадки. Добиваем размер ВВЕРХ, а не отбрасываем сделку.
+        #
+        # Сравнивать нужно НЕОКРУГЛЁННОЕ произведение: round(0.9964, 2) даёт
+        # ровно 1.00, и проверка минимума по округлённой сумме молча
+        # пропускала бы ордер, который на площадку уходит на $0.9964.
+        floor_usdc = getattr(self.cfg, "jump_min_order_usdc", 0.0)
+        if floor_usdc > 0 and fill * shares < floor_usdc - 1e-9:
+            shares = ceil2(floor_usdc / fill)
+            self.log.info("размер добит до минимума $%.2f: %.2f шэр @ %.2f "
+                          "= $%.4f", floor_usdc, shares, fill, fill * shares)
         cost = round(fill * shares, 2)
         # Потолок раунда проверяем ещё раз ЗДЕСЬ, а не только в стратегии:
         # за время пинга цена филла могла вырасти, а вместе с ней и стоимость.
