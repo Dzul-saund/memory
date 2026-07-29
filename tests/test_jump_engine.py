@@ -700,3 +700,20 @@ def test_skip_is_reported_not_silent():
     eng.log.warning = lambda msg, *a: said.append(msg % a if a else msg)
     eng._tick()
     assert any("сигнал есть, но сделки нет" in s for s in said), said
+
+
+def test_collapsing_book_is_sold_not_held():
+    """Обвал книги обязан ПРОДАВАТЬСЯ, а не удерживаться.
+
+    Пол цены продажи выключен по умолчанию именно поэтому: он запрещал
+    продавать тем строже, чем сильнее падало, то есть работал против стопа.
+    В бою это дало съезд ноги с 0.47 до 0.10 при стопе на 0.45.
+    """
+    eng, cfg = _live()
+    assert cfg.jump_max_sell_slip == 0.0, "пол продажи должен быть выключен"
+    _enter(eng, ask=0.47, bid=0.46)
+    _book(eng, 0.10, 0.12, 0.88, 0.90)          # книга рухнула на 36¢
+    ok = asyncio.run(eng._sell_leg(0, 0.46, "стоп"))
+    assert ok is True, "продажа обязана пройти"
+    assert eng.legs == []
+    assert eng.trader.sells[0][1] == 0.10       # по текущему биду
