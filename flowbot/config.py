@@ -256,6 +256,13 @@ class FlowConfig:
     # закрывал бы КАЖДУЮ сделку в тот же тик с гарантированным убытком.
     # 0 = выключить.
     jump_stop_loss: float = 0.01
+    # Сколько разрешено отдать при ПРОДАЖЕ против цены решения.
+    #
+    # Между решением и отправкой проходит пинг, и книга успевает просесть.
+    # SELL уходит как FAK с полом: ниже него не исполнится. Без этого пола
+    # обвал книги продавал бы ногу по любой цене, какую она покажет.
+    # 0 = пола нет, продаём по текущему биду (прежнее поведение).
+    jump_max_sell_slip: float = 0.03
     jump_tp_deadline_s: float = 5.0         # «до окончания 5 секунд» — фиксируем
     jump_tp_stall_retrace: float = 0.03     # откат % от пика = рост кончился
     jump_tp_flow_against: float = -0.20     # «люди смотрят в другую сторону»
@@ -350,6 +357,7 @@ class FlowConfig:
             jump_tp_trail=_f("JUMP_TP_TRAIL", 0.02),
             jump_tp_trail_arm=_f("JUMP_TP_TRAIL_ARM", 0.02),
             jump_stop_loss=_f("JUMP_STOP_LOSS", 0.01),
+            jump_max_sell_slip=_f("JUMP_MAX_SELL_SLIP", 0.03),
             jump_min_order_usdc=_f("JUMP_MIN_ORDER_USDC", 1.0),
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),
             jump_tp_stall_retrace=_f("JUMP_TP_STALL_RETRACE", 0.03),

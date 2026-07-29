@@ -460,3 +460,148 @@ def test_minimum_can_be_switched_off():
         Action(ENTER, outcome="Up", limit_price=0.53, size_usdc=1.0,
                track="A", reason="тест")))
     assert eng.legs[-1]["shares"] == 1.88      # прежнее округление вниз
+
+
+# ---------------------------------------------------------------------------
+#  Живая торговля: то, чего dry-run не проверяет
+# ---------------------------------------------------------------------------
+class FakeTrader:
+    """Трейдер, отвечающий как настоящая биржа, — включая отказы.
+
+    В dry-run ответ всегда «simulated_fill», поэтому весь путь обработки
+    отказов и частичных филлов не выполнялся ни разу.
+    """
+
+    def __init__(self, buy_resp=None, sell_resp=None):
+        self.buy_resp = buy_resp or {"status": "matched"}
+        self.sell_resp = sell_resp or {"status": "matched"}
+        self.buys, self.sells = [], []
+
+    def buy(self, token, price, size, resting=False):
+        self.buys.append((token, price, size))
+        return self.buy_resp
+
+    def sell(self, token, price, size, resting=False):
+        self.sells.append((token, price, size))
+        return self.sell_resp
+
+    def settle(self, payout):
+        pass
+
+    def get_balance(self):
+        return 100.0
+
+    def presign_window(self, *a, **k):
+        return None
+
+
+def _live(buy_resp=None, sell_resp=None, **over):
+    eng, cfg = _engine(**over)
+    eng.trader = FakeTrader(buy_resp, sell_resp)
+    return eng, cfg
+
+
+def _enter(eng, ask=0.53, bid=0.51):
+    from flowbot.jump import Action, ENTER
+
+    _book(eng, bid, ask, round(1 - ask, 2), round(1 - bid, 2))
+    asyncio.run(eng._buy_leg(Action(ENTER, outcome="Up", limit_price=ask,
+                                    size_usdc=1.0, track="A", reason="тест")))
+
+
+def test_rejected_buy_does_not_create_a_position():
+    """Биржа отказала — ноги быть не должно.
+
+    Иначе бот дальше «продаёт» несуществующие шэры и ведёт лестницу от
+    выдуманного долга.
+    """
+    eng, _ = _live(buy_resp={"errorMsg": "not enough balance"})
+    _enter(eng)
+    assert eng.legs == []
+    assert eng.strategy.legs == []
+    assert eng.strategy.net_out == 0.0
+
+
+def test_unmatched_fak_does_not_create_a_position():
+    eng, _ = _live(buy_resp={"status": "unmatched"})
+    _enter(eng)
+    assert eng.legs == []
+
+
+def test_partial_buy_records_only_what_filled():
+    eng, _ = _live(buy_resp={"status": "matched", "sizeMatched": "1.00"})
+    _enter(eng)
+    assert len(eng.legs) == 1
+    assert eng.legs[0]["shares"] == 1.00
+    assert eng.legs[0]["cost"] == 0.53
+
+
+def test_unknown_response_still_opens_the_leg():
+    """Незнакомый ответ не должен останавливать торговлю — но должен кричать."""
+    eng, _ = _live(buy_resp={"какое-то": "поле"})
+    _enter(eng)
+    assert len(eng.legs) == 1
+
+
+def test_flip_does_not_buy_when_the_sell_was_rejected():
+    """Главный денежный риск разворота.
+
+    Если провалившуюся ногу продать не удалось, а вторую сторону мы всё
+    равно взяли — открыты ОБЕ, чего конструкция лестницы не допускает, и
+    долг посчитан от ноги, которая на самом деле осталась у нас.
+    """
+    from flowbot.jump import Action, LADDER
+
+    eng, _ = _live(sell_resp={"errorMsg": "order failed"})
+    _enter(eng)
+    before = len(eng.trader.buys)
+    asyncio.run(eng._execute(Action(
+        LADDER, outcome="Down", limit_price=0.49, shares=3.0,
+        size_usdc=1.5, track="A", sell_idx=0, sell_outcome="Up",
+        reason="разворот")))
+    assert len(eng.trader.buys) == before, "добор ушёл, хотя продажа провалилась"
+    assert len(eng.legs) == 1, "старая нога должна остаться единственной"
+
+
+def test_sell_is_refused_when_the_book_has_no_bid():
+    """Раньше здесь стоял запасной ноль — ордер уходил по цене 0.00."""
+    eng, _ = _live()
+    _enter(eng)
+    eng.book.books.clear()
+    eng.legs[0]["last_bid"] = None
+    ok = asyncio.run(eng._sell_leg(0, None, "тест"))
+    assert ok is False
+    assert eng.trader.sells == [], "продажа по нулевой цене отдала бы шэры даром"
+    assert len(eng.legs) == 1
+
+
+def test_sell_holds_when_the_book_fell_below_the_floor():
+    """Книга просела глубже допуска — ждём, а не отдаём по любой цене."""
+    eng, cfg = _live(jump_max_sell_slip=0.03)
+    _enter(eng)
+    _book(eng, 0.40, 0.42, 0.58, 0.60)          # бид рухнул с 0.51 до 0.40
+    ok = asyncio.run(eng._sell_leg(0, 0.51, "фиксация"))
+    assert ok is False
+    assert eng.trader.sells == []
+    assert len(eng.legs) == 1
+
+
+def test_sell_goes_through_within_the_allowed_slip():
+    eng, cfg = _live(jump_max_sell_slip=0.03)
+    _enter(eng)
+    _book(eng, 0.49, 0.51, 0.49, 0.51)          # просел на 2¢ — в допуске
+    ok = asyncio.run(eng._sell_leg(0, 0.51, "фиксация"))
+    assert ok is True
+    assert len(eng.trader.sells) == 1
+    assert eng.legs == []
+
+
+def test_partial_sell_keeps_the_remainder():
+    """Продалась часть — оставшиеся шэры не должны потеряться."""
+    eng, _ = _live(sell_resp={"status": "matched", "sizeMatched": "1.00"})
+    _enter(eng)
+    total = eng.legs[0]["shares"]
+    ok = asyncio.run(eng._sell_leg(0, None, "тест"))
+    assert ok is False, "нога закрыта не полностью"
+    assert eng.legs[0]["shares"] == round(total - 1.00, 2)
+    assert eng.strategy.legs[0].shares == round(total - 1.00, 2)

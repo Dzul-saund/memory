@@ -27,6 +27,7 @@ from btc_bot.util import ceil2, floor2
 
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
+from .fills import UNKNOWN, interpret
 from .jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                    ladder_shares)
 
@@ -146,8 +147,17 @@ class JumpEngine(FlowEngine):
                 # Разворот: сперва закрываем провалившуюся ногу — она вернёт
                 # капитал, и добор считается уже от РЕАЛИЗОВАННОГО убытка,
                 # а не от полной стоимости ноги.
-                await self._sell_leg(action.sell_idx, None, "разворот",
-                                     result="SOLD_FLIP")
+                #
+                # Если продать НЕ удалось, добор отменяется. Иначе мы держали
+                # бы обе стороны сразу, а весь расчёт лестницы исходит из
+                # того, что открыта ровно одна нога: долг считался бы от
+                # проданной ноги, которая на самом деле осталась у нас.
+                if not await self._sell_leg(action.sell_idx, None, "разворот",
+                                            result="SOLD_FLIP"):
+                    self.log.error(
+                        "РАЗВОРОТ отменён: провалившуюся ногу продать не "
+                        "удалось, вторую сторону не беру")
+                    return
                 await self._buy_leg(action)
             elif action.kind in (ENTER, LADDER):
                 await self._buy_leg(action)
@@ -216,6 +226,31 @@ class JumpEngine(FlowEngine):
         except Exception as exc:  # noqa: BLE001
             self.log.error("ордер BUY упал: %s", exc)
             return
+
+        # Ордер уходит как FAK: несведённый остаток отменяется. Значит филла
+        # могло не быть вовсе. Записать ногу, которой нет, — худшее, что
+        # может случиться: дальше бот «продаёт» её и ведёт лестницу от
+        # выдуманного долга.
+        got = interpret(resp, shares)
+        if not got.ok:
+            self.log.error("ПОКУПКА %s ОТКЛОНЕНА биржей: %s | ответ: %s",
+                           outcome, got.note, resp)
+            return
+        if got.kind == UNKNOWN:
+            self.log.warning(
+                "ПОКУПКА %s: ответ биржи не разобран (%s). Считаю "
+                "исполненным — СВЕРЬ позицию на сайте. Ответ: %s",
+                outcome, got.note, resp)
+        elif got.shares is not None and got.shares < shares - 1e-9:
+            # Частичный филл: владеем меньшим, чем просили. Учитываем
+            # фактическое, иначе продажа уйдёт на несуществующие шэры.
+            self.log.warning("ПОКУПКА %s исполнена ЧАСТИЧНО: %s",
+                             outcome, got.note)
+            shares = floor2(got.shares)
+            cost = round(fill * shares, 2)
+            if shares <= 0:
+                return
+
         self._invalidate_balance()
         self.n_trades += 1
         # Движение отработано — переставляем экстремум на текущую цену, иначе
@@ -239,19 +274,44 @@ class JumpEngine(FlowEngine):
             cost, self.strategy.net_out, _short(resp))
 
     async def _sell_leg(self, idx: Optional[int], sell_limit: Optional[float],
-                        tag: str, result: str = "SOLD") -> None:
-        """tag — человеку в лог, result — в CSV.
+                        tag: str, result: str = "SOLD") -> bool:
+        """Продать ногу. Возвращает True, только если продажа состоялась.
 
-        В колонке result должен лежать машиночитаемый ASCII-код рядом с
-        WON/LOST, а не русское слово: по нему потом фильтруют и считают.
+        tag — человеку в лог, result — в CSV. В колонке result должен лежать
+        машиночитаемый ASCII-код рядом с WON/LOST, а не русское слово: по
+        нему потом фильтруют и считают.
         """
         leg = next((lg for lg in self.legs if lg["idx"] == idx), None)
         if leg is None:
-            return
+            return False
         await self._sim_latency()
         bid, _ask = self.book.best(leg["token"])
-        px = bid if bid is not None else (leg.get("last_bid") or 0.0)
-        fill = round(px, 2)
+        px = bid if bid is not None else leg.get("last_bid")
+
+        # Без цены продавать нельзя. Раньше здесь стоял запасной ноль, и
+        # ордер на продажу мог уйти по цене 0.00 — то есть отдать шэры
+        # даром. В dry-run это не всплывало: там филл симулированный.
+        if px is None or px <= 0:
+            self.log.error("ПРОДАЖА %s отменена: нет бида в книге "
+                           "(нога оставлена)", leg["outcome"])
+            return False
+
+        # Пол цены. Между решением и отправкой проходит пинг, и книга могла
+        # просесть. SELL уходит как FAK с полом: ниже него не исполнится.
+        # Позволяем отдать не больше jump_max_sell_slip от цены решения,
+        # иначе на обвале мы бы продавали по любой цене, какую покажет книга.
+        floor_px = px
+        slip = getattr(self.cfg, "jump_max_sell_slip", 0.0)
+        if sell_limit is not None and slip > 0:
+            floor_px = max(px, sell_limit - slip)
+            if floor_px > px + 1e-9:
+                self.log.warning(
+                    "ПРОДАЖА %s: бид %.2f ниже пола %.2f (решение %.2f, "
+                    "допуск %.2f) — жду, нога оставлена",
+                    leg["outcome"], px, floor_px, sell_limit, slip)
+                return False
+
+        fill = round(floor_px, 2)
         shares = leg["shares"]
         proceeds = round(fill * shares, 2)
         try:
@@ -259,7 +319,37 @@ class JumpEngine(FlowEngine):
                                            fill, shares)
         except Exception as exc:  # noqa: BLE001
             self.log.error("ордер SELL упал: %s (нога оставлена)", exc)
-            return
+            return False
+
+        got = interpret(resp, shares)
+        if not got.ok:
+            self.log.error("ПРОДАЖА %s ОТКЛОНЕНА биржей: %s | ответ: %s "
+                           "(нога оставлена)", leg["outcome"], got.note, resp)
+            return False
+        if got.kind == UNKNOWN:
+            self.log.warning(
+                "ПРОДАЖА %s: ответ биржи не разобран (%s). Считаю "
+                "исполненной — СВЕРЬ позицию на сайте. Ответ: %s",
+                leg["outcome"], got.note, resp)
+        elif got.shares is not None and got.shares < shares - 1e-9:
+            # Продалась часть — остаток шэров остаётся у нас, и нога живёт
+            # дальше уменьшенной. Закрывать её здесь нельзя: мы бы «забыли»
+            # про то, чем всё ещё владеем.
+            sold = floor2(got.shares)
+            proceeds = round(fill * sold, 2)
+            self.trader.settle(proceeds)
+            self._invalidate_balance()
+            leg["shares"] = round(leg["shares"] - sold, 2)
+            leg["cost"] = round(leg["entry_price"] * leg["shares"], 2)
+            self.strategy.record_partial_sell(idx, sold, proceeds, time.time())
+            self.log.warning(
+                "ПРОДАЖА %s ЧАСТИЧНАЯ: %s — продано %.2f @ $%.2f (=$%.2f), "
+                "осталось %.2f шэр", leg["outcome"], got.note, sold, fill,
+                proceeds, leg["shares"])
+            if leg["shares"] <= 0:
+                self.legs = [lg for lg in self.legs if lg["idx"] != idx]
+            return False
+
         self.trader.settle(proceeds)       # dry-run: вернуть кэш; live: no-op
         self._invalidate_balance()
         pnl = round(proceeds - leg["cost"], 2)
@@ -272,6 +362,7 @@ class JumpEngine(FlowEngine):
             shares, fill, proceeds, pnl, self._round_pnl, self.realized_pnl,
             _short(resp))
         self._log_trade_row(_row(leg), result, fill, proceeds, pnl)
+        return True
 
     # ======================================================================
     #  Расчёт в конце окна: платит только выигравшая сторона

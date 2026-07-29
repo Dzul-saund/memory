@@ -186,6 +186,30 @@ class JumpStrategy:
         self._last_fill_t = t
         return leg
 
+    def record_partial_sell(self, idx: int, shares_sold: float,
+                            proceeds: float, t: float) -> None:
+        """Продалась ЧАСТЬ ноги — уменьшаем её, а не закрываем.
+
+        Так бывает только в бою: ордер уходит как FAK, и если в книге на
+        нашей цене лежало меньше, чем мы продаём, остаток отменяется. Нога
+        при этом никуда не девается — у нас на руках остались шэры, и
+        забыть про них нельзя.
+
+        Цену входа не трогаем: она осталась той же, изменилось количество.
+        Стоимость пересчитываем от неё, чтобы P&L остатка считался честно.
+        """
+        for lg in self.legs:
+            if lg.idx != idx:
+                continue
+            lg.shares = max(0.0, round(lg.shares - shares_sold, 2))
+            lg.cost = round(lg.entry_price * lg.shares, 2)
+            if lg.shares <= 0:
+                self.legs = [x for x in self.legs if x.idx != idx]
+            break
+        self.net_out -= proceeds
+        self._below_since = None
+        self._last_fill_t = t
+
     def record_sell(self, idx: int, proceeds: float, t: float) -> None:
         self.legs = [lg for lg in self.legs if lg.idx != idx]
         self.net_out -= proceeds
