@@ -567,12 +567,11 @@ def test_unknown_response_still_opens_the_leg():
     assert len(eng.legs) == 1
 
 
-def test_flip_does_not_buy_when_the_sell_was_rejected():
-    """Главный денежный риск разворота.
+def test_flip_still_buys_when_the_sell_was_rejected():
+    """Осознанный выбор: добор идёт даже если продать старую ногу не вышло.
 
-    Если провалившуюся ногу продать не удалось, а вторую сторону мы всё
-    равно взяли — открыты ОБЕ, чего конструкция лестницы не допускает, и
-    долг посчитан от ноги, которая на самом деле осталась у нас.
+    Плата за это — открыты ОБЕ ноги, а долг лестницы посчитан так, будто
+    первую продали. Бот предупреждает в лог, но сделку не отменяет.
     """
     from flowbot.jump import Action, LADDER
 
@@ -583,8 +582,8 @@ def test_flip_does_not_buy_when_the_sell_was_rejected():
         LADDER, outcome="Down", limit_price=0.49, shares=3.0,
         size_usdc=1.5, track="A", sell_idx=0, sell_outcome="Up",
         reason="разворот")))
-    assert len(eng.trader.buys) == before, "добор ушёл, хотя продажа провалилась"
-    assert len(eng.legs) == 1, "старая нога должна остаться единственной"
+    assert len(eng.trader.buys) == before + 1, "добор обязан пройти"
+    assert len(eng.legs) == 2, "обе ноги открыты — цена этого решения"
 
 
 def test_sell_is_refused_when_the_book_has_no_bid():
@@ -717,3 +716,50 @@ def test_collapsing_book_is_sold_not_held():
     assert ok is True, "продажа обязана пройти"
     assert eng.legs == []
     assert eng.trader.sells[0][1] == 0.10       # по текущему биду
+
+
+async def _enter_async(eng, ask=0.53, bid=0.51):
+    from flowbot.jump import Action, ENTER
+
+    _book(eng, bid, ask, round(1 - ask, 2), round(1 - bid, 2))
+    await eng._buy_leg(Action(ENTER, outcome="Up", limit_price=ask,
+                              size_usdc=1.0, track="A", reason="тест"))
+
+
+def test_cooldown_never_blocks_an_exit():
+    """Пауза после отказа биржи придерживает вход, но НЕ выход.
+
+    Раньше она блокировала любое действие, включая продажу: один
+    отклонённый ордер — и бот пять секунд даже не пытался выйти, пока
+    цена падала. Это и выглядело как «держит вместо того чтобы продать».
+    """
+    from flowbot.jump import Action, ENTER, SELL
+
+    async def scenario():
+        # Общая заготовка глушит стоп (там тесты про лестницу) — здесь он
+        # как раз и проверяется, поэтому включаем явно.
+        eng, cfg = _live(jump_stop_loss=0.01)
+        await _enter_async(eng, ask=0.50, bid=0.49)
+        eng._retry_after = time.time() + 60.0     # «идёт пауза после ошибки»
+        _book(eng, 0.40, 0.42, 0.58, 0.60)        # цена ушла против нас
+
+        eng._tick()
+        await _drain(eng)
+        assert eng.legs == [], "выход обязан пройти даже во время паузы"
+        assert len(eng.trader.sells) == 1
+
+    asyncio.run(scenario())
+
+
+def test_cooldown_still_holds_back_entries():
+    async def scenario():
+        eng, cfg = _live()
+        eng._retry_after = time.time() + 60.0
+        _set_target(65_000.0)
+        _book(eng, 0.59, 0.60, 0.40, 0.41)
+        _set_jump(eng, price=65_010.0, dprice=8.0, horizon=cfg.jump_window_s)
+        eng._tick()
+        await _drain(eng)
+        assert eng.trader.buys == [], "вход во время паузы уходить не должен"
+
+    asyncio.run(scenario())
