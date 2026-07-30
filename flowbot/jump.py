@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from btc_bot.prob import expected_shift, fair_up_probability
+from btc_bot.util import floor2
 
 # Виды действий
 ENTER = "enter"     # первый вход в раунде
@@ -201,7 +202,8 @@ class JumpStrategy:
         for lg in self.legs:
             if lg.idx != idx:
                 continue
-            lg.shares = max(0.0, round(lg.shares - shares_sold, 2))
+            # Вниз, не round: остаток — это «сколько ещё можно продать».
+            lg.shares = max(0.0, floor2(lg.shares - shares_sold))
             lg.cost = round(lg.entry_price * lg.shares, 2)
             if lg.shares <= 0:
                 self.legs = [x for x in self.legs if x.idx != idx]

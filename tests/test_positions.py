@@ -304,3 +304,121 @@ class TestDryRun:
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         asyncio.run(eng._reconcile())
         assert called == []
+
+
+class TestShortBalanceOnSell:
+    """Боевой случай: 400 "not enough balance: balance: 67795, order amount: 70000".
+
+    На кошельке лежало 67795 сырых единиц (0.067795 шэра), а ордер ушёл на
+    70000 (0.07). Разница целиком из округлений ВВЕРХ по пути размера:
+    round(0.067795, 4) -> 0.0678, затем round(0.0678, 2) -> 0.07. Продать
+    больше, чем лежит, нельзя никогда — размер обязан усекаться вниз.
+    """
+
+    RAW = 67795          # ровно то, что назвала биржа
+
+    def test_balance_parser_never_reports_more_than_there_is(self):
+        got = shares_from_balance({"balance": str(self.RAW)})
+        assert got <= self.RAW / 1e6, "разобранный остаток больше фактического"
+        assert got == 0.0677
+
+    def test_sell_size_is_truncated_not_rounded(self):
+        """Та самая строка, из-за которой уходило 70000 вместо 67795."""
+        from btc_bot.util import floor2
+        assert floor2(0.0678) == 0.06        # не 0.07
+        assert int(floor2(0.0678) * 1e6) <= self.RAW
+
+    def test_partial_sell_remainder_cannot_grow(self):
+        """round(0.0678 - 0.0, 2) давал 0.07 — нога РОСЛА после неудачи."""
+        eng, _ = _live_engine()
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        eng.strategy.record_entry("Up", 0.57, 0.0678, 0.04, "A", time.time(),
+                                  entry_bid=0.56)
+        eng.strategy.record_partial_sell(0, 0.0, 0.0, time.time())
+        assert eng.strategy.legs[0].shares <= 0.0678
+
+    def test_short_balance_resyncs_the_leg_instead_of_retrying(self):
+        eng, _ = _live_engine()
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        eng.trader.position = lambda token: {"balance": "2500000"}   # 2.5 шэра
+        leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
+               "entry_price": 0.57, "shares": 3.0, "cost": 1.71, "track": "A",
+               "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
+        eng.legs.append(leg)
+        eng.strategy.record_entry("Up", 0.57, 3.0, 1.71, "A", time.time(),
+                                  entry_bid=0.56)
+
+        handled = asyncio.run(eng._fix_short_balance(
+            leg, "not enough balance / allowance: balance: 2500000"))
+
+        assert handled is True
+        # Продаём ЦЕЛЫЕ шэры: 0.5 продать нечем (0.57 x 2.5 = $1.425).
+        assert leg["shares"] == 2.0
+        assert eng.strategy.legs[0].shares == 2.0
+
+    def test_unsellable_dust_is_parked_not_retried_forever(self):
+        """Ровно твой случай: 0.067795 шэра продать нечем — снимаем с торговли."""
+        eng, _ = _live_engine()
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        eng.trader.position = lambda token: {"balance": str(self.RAW)}
+        leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
+               "entry_price": 0.57, "shares": 0.07, "cost": 0.04, "track": "A",
+               "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
+        eng.legs.append(leg)
+        eng.strategy.record_entry("Up", 0.57, 0.07, 0.04, "A", time.time(),
+                                  entry_bid=0.56)
+
+        handled = asyncio.run(eng._fix_short_balance(
+            leg, "not enough balance / allowance: the balance is not enough "
+                 "-> balance: 67795, order amount: 70000"))
+
+        assert handled is True
+        assert eng.legs == []                  # цикл прекращён
+        assert eng.strategy.legs == []
+        assert "UPTOK" in eng._leftovers       # но остаток не потерян
+
+    def test_other_errors_still_go_to_the_normal_pause(self):
+        """Временный отказ не должен трактоваться как нехватка баланса."""
+        eng, _ = _live_engine()
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
+               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, "track": "A",
+               "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
+        eng.legs.append(leg)
+        assert asyncio.run(eng._fix_short_balance(leg, "503 service unavailable")) is False
+        assert len(eng.legs) == 1
+
+
+class TestSellNeverLoopsForever:
+    """Любой устойчивый отказ обязан кончиться снятием ноги, а не циклом."""
+
+    def _leg(self, eng):
+        leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
+               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, "track": "A",
+               "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
+        eng.legs.append(leg)
+        eng.strategy.record_entry("Up", 0.57, 2.0, 1.14, "A", time.time(),
+                                  entry_bid=0.56)
+        return leg
+
+    def test_leg_is_parked_after_n_consecutive_failures(self):
+        eng, cfg = _live_engine(jump_max_sell_fails=3)
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        leg = self._leg(eng)
+        for i in range(2):
+            eng._note_sell_failure(leg, "503 service unavailable")
+            assert eng.legs, f"снята слишком рано на попытке {i+1}"
+        eng._note_sell_failure(leg, "503 service unavailable")
+        assert eng.legs == []
+        assert eng.strategy.legs == []
+        assert "UPTOK" in eng._leftovers      # шэры не потеряны из вида
+
+    def test_counter_resets_after_a_good_sell(self):
+        eng, _ = _live_engine(jump_max_sell_fails=3)
+        _book(eng, 0.51, 0.52, 0.48, 0.49)
+        leg = self._leg(eng)
+        eng._note_sell_failure(leg, "timeout")
+        eng._note_sell_failure(leg, "timeout")
+        leg["sell_fails"] = 0                 # так делает удачная продажа
+        eng._note_sell_failure(leg, "timeout")
+        assert eng.legs, "счётчик не сбросился после удачной продажи"

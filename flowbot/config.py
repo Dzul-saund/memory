@@ -285,6 +285,11 @@ class FlowConfig:
     # Сверка проверяет такие токены на каждом такте сверки, но кричать об
     # одном и том же каждые 20с — значит утопить в этом остальной лог.
     jump_leftover_warn_s: float = 120.0
+    # Сколько отказов продажи подряд терпеть, прежде чем снять ногу с
+    # торговли. Выход не придерживается паузой после ошибки (стоп обязан
+    # срабатывать сразу), поэтому устойчивый отказ иначе повторяется на
+    # каждом такте — десять раз в секунду. 0 = терпеть бесконечно.
+    jump_max_sell_fails: int = 5
     jump_tp_deadline_s: float = 5.0         # «до окончания 5 секунд» — фиксируем
     jump_tp_stall_retrace: float = 0.03     # откат % от пика = рост кончился
     jump_tp_flow_against: float = -0.20     # «люди смотрят в другую сторону»
@@ -383,6 +388,7 @@ class FlowConfig:
             jump_error_cooldown_s=_f("JUMP_ERROR_COOLDOWN_S", 5.0),
             jump_reconcile_s=_f("JUMP_RECONCILE_S", 20.0),
             jump_leftover_warn_s=_f("JUMP_LEFTOVER_WARN_S", 120.0),
+            jump_max_sell_fails=_i("JUMP_MAX_SELL_FAILS", 5),
             jump_min_order_usdc=_f("JUMP_MIN_ORDER_USDC", 1.0),
             jump_tp_deadline_s=_f("JUMP_TP_DEADLINE_S", 5.0),
             jump_tp_stall_retrace=_f("JUMP_TP_STALL_RETRACE", 0.03),

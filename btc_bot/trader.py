@@ -17,7 +17,7 @@ import time
 from typing import Callable, Optional
 
 from .config import Config
-from .util import with_retry
+from .util import floor2, with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +226,24 @@ class LiveTrader:
         """
         from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
 
+        # РАЗМЕР ПРОДАЖИ УСЕКАЕТСЯ ВНИЗ, НИКОГДА НЕ ОКРУГЛЯЕТСЯ.
+        #
+        # Здесь стояло round(size, 2), и это неверно при любых входных
+        # данных: продать больше, чем лежит на кошельке, физически нельзя.
+        # Позиция в 0.067795 шэра превращалась в 0.07 -> ордер на 70000
+        # сырых единиц против баланса 67795 -> 400 "not enough balance",
+        # и так на каждом такте, потому что выход паузой не придерживается.
+        # Вверх округлять можно цену (это в нашу пользу), размер — нет.
+        size = floor2(size)
+        if size <= 0:
+            raise ValueError(
+                f"размер продажи после усечения = 0 (было {size!r}); "
+                "продавать нечего — остаток меньше сотой шэра")
+
         order = OrderArgsV2(
             token_id=token_id,
             price=round(price, 2),
-            size=round(size, 2),
+            size=size,
             side="SELL",
         )
         signed = self.client.create_order(order)

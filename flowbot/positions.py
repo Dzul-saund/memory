@@ -20,6 +20,7 @@ None («не знаю»), а не как ноль («позиций нет»). �
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 # Шэры и USDC приходят в «сырых» единицах с шестью знаками, как в ERC-20.
@@ -48,7 +49,11 @@ def shares_from_balance(resp: Any) -> Optional[float]:
         # Значение приходит в сырых единицах (1 шэр = 1_000_000). Дробное
         # значение меньше единицы — уже нормализованное, оставляем как есть.
         shares = raw / DECIMALS if raw >= 1.0 else raw
-        return round(shares, 4)
+        # УСЕКАЕМ ВНИЗ, а не округляем. Это ответ на вопрос «сколько мы
+        # можем продать», и завышать его нельзя ни на единицу: round() для
+        # 67795 сырых давал 0.0678 шэра при фактических 0.067795, и ордер
+        # на такую ногу отвергался с "not enough balance".
+        return math.floor(shares * 10_000) / 10_000.0
     return None
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Dict, List, Optional
 
@@ -327,7 +328,7 @@ class JumpEngine(FlowEngine):
             if lg.get("token") != token or left <= 0:
                 continue
             take = min(lg["shares"], left)
-            lg["shares"] = round(lg["shares"] - take, 2)
+            lg["shares"] = floor2(lg["shares"] - take)
             left = round(left - take, 2)
             self.strategy.record_partial_sell(lg["idx"], take, 0.0, time.time())
             if lg["shares"] <= 0:
@@ -508,6 +509,109 @@ class JumpEngine(FlowEngine):
             "$%.2f | ответ: %s", action.track, leg.idx, outcome, shares, fill,
             cost, self.strategy.net_out, _short(resp))
 
+    @staticmethod
+    def _is_short_balance(err) -> bool:
+        """Биржа отказала именно из-за нехватки шэров, а не по другой причине.
+
+        Это ДЕТЕРМИНИРОВАННЫЙ отказ: повторять тот же ордер бессмысленно,
+        ответ будет тот же. Отличать его от временных отказов обязательно —
+        выход не придерживается паузой (стоп должен срабатывать сразу), и
+        без этой развилки один такой отказ превращается в десять запросов
+        в секунду до конца раунда.
+        """
+        text = str(err).lower()
+        return ("not enough balance" in text
+                or "balance is not enough" in text
+                or "insufficient balance" in text)
+
+    async def _fix_short_balance(self, leg: dict, err) -> bool:
+        """Отказ «не хватает баланса» — пересинхронизировать ногу с биржей.
+
+        Возвращает True, если отказ распознан и обработан (звонящий не должен
+        уходить в обычную паузу и повторять тот же ордер).
+
+        Биржа — источник истины: спрашиваем фактический остаток и приводим
+        ногу к нему, усекая вниз. Если продавать уже нечего — нога снимается
+        и уходит в остатки, иначе бот будет пытаться продать пыль вечно.
+        """
+        if not self._is_short_balance(err):
+            return False
+
+        self.log.error(
+            "ПРОДАЖА %s отвергнута: на бирже меньше шэров, чем считает бот "
+            "(%.4f). Спрашиваю фактический остаток. Ответ: %s",
+            leg["outcome"], leg["shares"], _short(err))
+
+        theirs = await self._ask_position(leg["token"], leg["outcome"])
+        if theirs is None:
+            self.log.error(
+                "остаток выяснить не удалось — нога оставлена, "
+                "следующая попытка после паузы")
+            self._back_off("SELL", "баланс не выяснен")
+            return True
+
+        # ПРОДАЁМ ТОЛЬКО ЦЕЛЫЕ ШЭРЫ — по той же причине, по которой их
+        # покупаем целыми (btc_bot.util.whole_shares). Цена всегда в целых
+        # центах, поэтому «цена × размер» укладывается в два знака USDC
+        # только при целом размере: 0.57 × 0.06 = $0.0342 — три знака.
+        # Дробный хвост меньше шэра продать нечем; он уходит в остатки и
+        # забирается Redeem'ом, а бот перестаёт долбить биржу.
+        sellable = float(math.floor(theirs + 1e-9))
+        if sellable <= 0:
+            self.log.error(
+                "на бирже %.6f шэр %s — меньше одного целого шэра, продать "
+                "нечем (цена в целых центах требует целый размер). Снимаю "
+                "ногу с торговли, остаток заберётся Redeem'ом.",
+                theirs, leg["outcome"])
+            self._park_dust(leg, theirs)
+            return True
+        if theirs - sellable > 1e-9:
+            self.log.warning(
+                "дробный хвост %.6f шэр %s продать нечем — останется под "
+                "Redeem", theirs - sellable, leg["outcome"])
+
+        self.log.warning(
+            "правлю ногу %s: было %.4f, на бирже %.6f — продаю %.2f",
+            leg["outcome"], leg["shares"], theirs, sellable)
+        leg["shares"] = sellable
+        leg["cost"] = round(leg["entry_price"] * sellable, 2)
+        for lg in self.strategy.legs:
+            if lg.idx == leg["idx"]:
+                lg.shares = sellable
+                lg.cost = leg["cost"]
+        return True
+
+    def _note_sell_failure(self, leg: dict, why) -> None:
+        """Считать подряд идущие отказы и снять ногу, если их слишком много.
+
+        Предохранитель, не зависящий от ПРИЧИНЫ. Выход сознательно не
+        придерживается паузой (стоп обязан срабатывать сразу на падении),
+        поэтому любой устойчивый отказ — не только нехватка баланса —
+        превращается в десяток запросов в секунду до конца раунда. После
+        `jump_max_sell_fails` подряд нога снимается с торговли и уходит в
+        остатки: продать её всё равно не выходит, а долбить биржу вредно.
+        """
+        leg["sell_fails"] = leg.get("sell_fails", 0) + 1
+        limit = getattr(self.cfg, "jump_max_sell_fails", 5)
+        if limit <= 0 or leg["sell_fails"] < limit:
+            self.log.error("нога оставлена (отказ %d из %d): %s",
+                           leg["sell_fails"], limit, _short(why))
+            return
+        self.log.error(
+            "ПРОДАЖА %s не проходит %d раз подряд (%s) — снимаю ногу с "
+            "торговли, чтобы не долбить биржу. %.4f шэр остаются на кошельке, "
+            "забери их вручную (Redeem/Sell на сайте).",
+            leg["outcome"], leg["sell_fails"], _short(why), leg["shares"])
+        self._park_dust(leg, leg["shares"])
+
+    def _park_dust(self, leg: dict, shares: float) -> None:
+        """Снять непродаваемый остаток с торговли, не потеряв его из вида."""
+        if shares > 0:
+            self._watch_leftover({**leg, "shares": shares})
+        self.legs = [x for x in self.legs if x["idx"] != leg["idx"]]
+        self.strategy.legs = [lg for lg in self.strategy.legs
+                              if lg.idx != leg["idx"]]
+
     async def _sell_leg(self, idx: Optional[int], sell_limit: Optional[float],
                         tag: str, result: str = "SOLD") -> bool:
         """Продать ногу. Возвращает True, только если продажа состоялась.
@@ -559,15 +663,21 @@ class JumpEngine(FlowEngine):
                            "проверь позиции на сайте")
             return False
         except Exception as exc:  # noqa: BLE001
+            if await self._fix_short_balance(leg, exc):
+                return False
             self._back_off("SELL", exc)
-            self.log.error("нога оставлена")
+            self._note_sell_failure(leg, exc)
             return False
 
         got = interpret(resp, shares)
         if not got.ok:
-            self.log.error("ПРОДАЖА %s ОТКЛОНЕНА биржей: %s | ответ: %s "
-                           "(нога оставлена)", leg["outcome"], got.note, resp)
+            if await self._fix_short_balance(leg, resp):
+                return False
+            self.log.error("ПРОДАЖА %s ОТКЛОНЕНА биржей: %s | ответ: %s",
+                           leg["outcome"], got.note, resp)
+            self._note_sell_failure(leg, got.note)
             return False
+        leg["sell_fails"] = 0
         if got.kind == UNKNOWN:
             self.log.warning(
                 "ПРОДАЖА %s: ответ биржи не разобран (%s). Считаю "
@@ -581,7 +691,11 @@ class JumpEngine(FlowEngine):
             proceeds = round(fill * sold, 2)
             self.trader.settle(proceeds)
             self._invalidate_balance()
-            leg["shares"] = round(leg["shares"] - sold, 2)
+            # Усечение вниз, а не round: остаток ноги — это «сколько мы ещё
+            # можем продать», и он не имеет права вырасти от арифметики.
+            # round(0.0678 - 0.0, 2) давал 0.07 при фактических 0.0678, и
+            # следующая продажа уходила на несуществующие шэры.
+            leg["shares"] = floor2(leg["shares"] - sold)
             leg["cost"] = round(leg["entry_price"] * leg["shares"], 2)
             self.strategy.record_partial_sell(idx, sold, proceeds, time.time())
             self.log.warning(
