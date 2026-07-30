@@ -18,7 +18,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import fast_monitor
 
@@ -57,6 +57,12 @@ class JumpEngine(FlowEngine):
         self._busy_since = 0.0
         self._last_skip_log = 0.0
         self._last_reconcile = 0.0
+        # Шэры, доставшиеся нам от ЗАКОНЧИВШИХСЯ раундов. Сверка спрашивала
+        # биржу только про два токена текущего окна, поэтому остаток от
+        # прошлого раунда был невидим по построению: на Polymarket висит
+        # позиция, а бот показывает «поз —». Продать её нельзя (книги уже
+        # нет), но знать о ней и сказать про неё вслух — обязан.
+        self._leftovers: Dict[str, dict] = {}
         if cfg.record_path:
             self._rec = open(cfg.record_path, "a", encoding="utf-8")
             self.log.info("запись рынка: %s", cfg.record_path)
@@ -200,19 +206,18 @@ class JumpEngine(FlowEngine):
         """
         if self.market is None or self.cfg.dry_run:
             return
-        for outcome, token in (("Up", self.market["up"]),
-                               ("Down", self.market["down"])):
-            try:
-                resp = await asyncio.wait_for(
-                    asyncio.to_thread(self.trader.position, token),
-                    timeout=self.cfg.order_timeout_s)
-            except Exception as exc:  # noqa: BLE001 - сверка не должна ронять бота
-                self.log.debug("сверка позиции %s: %s", outcome, exc)
+        current = (self.market["up"], self.market["down"])
+        for outcome, token in (("Up", current[0]), ("Down", current[1])):
+            theirs = await self._ask_position(token, outcome)
+            if theirs is None:
                 continue
-
-            theirs = shares_from_balance(resp)
+            # Сравниваем по ТОКЕНУ, а не по стороне. Расчёт пропускается,
+            # если на смене окна был ордер в полёте (`if not self.busy`), и
+            # тогда нога прошлого раунда доживает до нового. Считать её по
+            # стороне значило бы приписать её балансу чужого токена: биржа
+            # ответила бы «меньше», и живая нога улетела бы как фантом.
             ours = sum(lg["shares"] for lg in self.legs
-                       if lg["outcome"] == outcome)
+                       if lg.get("token") == token)
             diff = reconcile(ours, theirs)
             if not diff:
                 continue
@@ -220,7 +225,76 @@ class JumpEngine(FlowEngine):
             if diff > 0:
                 self._adopt(outcome, token, diff)
             else:
-                self._drop_phantom(outcome, -diff)
+                self._drop_phantom(token, outcome, -diff)
+
+        await self._check_leftovers(current)
+
+    async def _ask_position(self, token: str,
+                            outcome: str) -> Optional[float]:
+        """Сколько шэров этого токена у нас по мнению биржи. None = не знаем."""
+        try:
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(self.trader.position, token),
+                timeout=self.cfg.order_timeout_s)
+        except Exception as exc:  # noqa: BLE001 - сверка не должна ронять бота
+            self.log.debug("сверка позиции %s: %s", outcome, exc)
+            return None
+        return shares_from_balance(resp)
+
+    async def _check_leftovers(self, current: tuple) -> None:
+        """Остатки от закончившихся раундов: проверить, живы ли они ещё.
+
+        Отдельная ветка, а не обычная сверка, потому что с такой позицией
+        НЕЛЬЗЯ обращаться как с ногой. Раунд закончен, книги больше нет,
+        продать не во что: попытка выйти дала бы отказ на каждом такте. Выплату
+        по ней забирают кнопкой Redeem/Claim на сайте, и сделать это за юзера
+        мы не можем — это перевод на блокчейне, а не ордер в CLOB.
+
+        Поэтому здесь ровно две задачи: не потерять остаток из вида и сказать
+        про него человеку. Как только биржа ответит «ноль» — забываем.
+        """
+        for token in list(self._leftovers):
+            if token in current:
+                continue                # текущий раунд ведёт обычная сверка
+            info = self._leftovers[token]
+            theirs = await self._ask_position(token, info["outcome"])
+            if theirs is None:
+                continue                # «не знаю» — не трогаем
+            if theirs <= 0:
+                self._leftovers.pop(token, None)
+                self.log.info(
+                    "ОСТАТОК: %.2f шэр %s из раунда %s больше не на балансе — "
+                    "выплата получена, снимаю с наблюдения.",
+                    info["shares"], info["outcome"], info["slug"])
+                continue
+
+            info["shares"] = theirs
+            now = time.time()
+            if now - info["warned"] < self.cfg.jump_leftover_warn_s:
+                continue
+            info["warned"] = now
+            self.log.error(
+                "ОСТАТОК: на бирже висят %.2f шэр %s из ЗАКОНЧИВШЕГОСЯ раунда "
+                "%s. Продать их нельзя — книги этого раунда больше нет, "
+                "«Market Sell» на сайте отвечает «balance: 0». Выплату надо "
+                "забрать кнопкой Redeem/Claim в позициях на Polymarket.",
+                theirs, info["outcome"], info["slug"])
+
+    def _watch_leftover(self, leg: dict) -> None:
+        """Запомнить ногу, дожившую до конца раунда, как остаток."""
+        token = leg.get("token")
+        if not token or self.cfg.dry_run:
+            return
+        old = self._leftovers.get(token)
+        self._leftovers[token] = {
+            "outcome": leg["outcome"],
+            "slug": (self.market or {}).get("slug") or "—",
+            "shares": leg["shares"] + (old["shares"] if old else 0.0),
+            "warned": 0.0,
+        }
+        # Список не должен расти без предела: держим только последние.
+        while len(self._leftovers) > 12:
+            self._leftovers.pop(next(iter(self._leftovers)))
 
     def _adopt(self, outcome: str, token: str, shares: float) -> None:
         """На бирже есть шэры, о которых бот не знал — берём их под управление."""
@@ -242,7 +316,7 @@ class JumpEngine(FlowEngine):
             "secs_at_entry": int(self.market["end_ts"] - time.time()),
         })
 
-    def _drop_phantom(self, outcome: str, shares: float) -> None:
+    def _drop_phantom(self, token: str, outcome: str, shares: float) -> None:
         """Бот считал ноги своими, а на бирже их нет — выбрасываем."""
         self.log.error(
             "СВЕРКА: бот считал своими %.2f шэр %s, но на бирже их нет — "
@@ -250,7 +324,7 @@ class JumpEngine(FlowEngine):
             "разобрался как успех.", shares, outcome)
         left = shares
         for lg in list(self.legs):
-            if lg["outcome"] != outcome or left <= 0:
+            if lg.get("token") != token or left <= 0:
                 continue
             take = min(lg["shares"], left)
             lg["shares"] = round(lg["shares"] - take, 2)
@@ -569,6 +643,10 @@ class JumpEngine(FlowEngine):
                 payout = round(leg["shares"] * mark, 2)
                 result = "UNSETTLED"
                 tail = f"не определён (по {mark:.2f})"
+            # В бою «расчёт» — это НАША запись, а не факт. Шэры остаются на
+            # балансе до Redeem, поэтому ногу, дожившую до конца окна, берём
+            # под наблюдение: иначе она пропадает из вида навсегда.
+            self._watch_leftover(leg)
             pnl = round(payout - leg["cost"], 2)
             payout_total += payout
             self._book_pnl(pnl)
@@ -710,6 +788,12 @@ class JumpEngine(FlowEngine):
                            for lg in self.legs)
         else:
             pos = "—"
+        # Остаток от прошлого раунда — не нога (продать нечем), но и молчать
+        # про него нельзя: именно так «поз —» соседствовало с висящей на
+        # Polymarket позицией.
+        left = sum(i["shares"] for i in self._leftovers.values())
+        if left > 0:
+            pos += f" +ост {left:.1f} (Redeem)"
         tgt = (f" цель {snap.target:,.0f}" if snap.target is not None else
                " цель —")
         how = ("экстр" if self.cfg.jump_trigger_mode == "swing"
