@@ -88,6 +88,10 @@ def _cfg(**over):
     c.jump_min_shift_cents = 0.0
     c.jump_min_edge_cents = 0.0
     c.jump_ladder_grace_s = 0.0
+    # СТАРЫЙ разворот: продать ногу и сразу купить обратную. Тест ниже про
+    # предел ступеней, а он относится именно к нему. Новый разворот ступеней
+    # не строит — он закрывает ногу и отдаёт решение обычным воротам.
+    c.jump_ladder_reenters = False
     for k, v in over.items():
         setattr(c, k, v)
     return c

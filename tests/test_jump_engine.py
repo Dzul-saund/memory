@@ -31,6 +31,11 @@ def _engine(**over):
     # лестницы. Тесты ниже про саму лестницу — там он выключается, а его
     # приоритет над ней проверяется отдельно (TestStopLoss в стратегии).
     cfg.jump_stop_loss = 0.0
+    cfg.stats_enabled = False           # не писать журнал в домашнюю папку
+    # СТАРЫЙ разворот (продать и сразу купить обратную). Он остался под
+    # флагом и покрыт тестами ниже; новый — только закрывает ногу, и его
+    # проверяет TestLadderReenters в тестах стратегии.
+    cfg.jump_ladder_reenters = False
     for k, v in over.items():
         setattr(cfg, k, v)
     eng = JumpEngine(cfg)

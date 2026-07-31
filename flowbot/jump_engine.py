@@ -26,10 +26,12 @@ import fast_monitor
 from btc_bot.prob import expected_shift
 from btc_bot.util import floor2, whole_shares
 
+from .bookfeat import BookFeatures
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
 from .fills import UNKNOWN, interpret
 from .positions import reconcile, shares_from_balance
+from .stats import TradeJournal
 from .jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                    ladder_shares)
 
@@ -64,6 +66,16 @@ class JumpEngine(FlowEngine):
         # позиция, а бот показывает «поз —». Продать её нельзя (книги уже
         # нет), но знать о ней и сказать про неё вслух — обязан.
         self._leftovers: Dict[str, dict] = {}
+        # Признаки структуры книги (перекос, стены, уход ликвидности).
+        self.bookfeat = BookFeatures(
+            levels=getattr(cfg, "jump_book_levels", 5),
+            window_s=getattr(cfg, "jump_book_window_s", 3.0))
+        # Журнал сделок С ПРИЗНАКАМИ, вне папки проекта — чтобы переезд на
+        # новую сборку не обнулял историю (а он обнулял её трижды подряд).
+        self.journal = TradeJournal(getattr(cfg, "stats_path", "") or None,
+                                    getattr(cfg, "stats_enabled", True))
+        if self.journal.enabled:
+            self.log.info("журнал сделок: %s", self.journal.path)
         if cfg.record_path:
             self._rec = open(cfg.record_path, "a", encoding="utf-8")
             self.log.info("запись рынка: %s", cfg.record_path)
@@ -134,6 +146,17 @@ class JumpEngine(FlowEngine):
         # None до прогрева трекера — режим impulse честно ждёт данных.
         imp = self.price.imp.state()
 
+        # Структура книги: перекос глубины, стены, уход ликвидности. Считается
+        # ВСЕГДА и всегда пишется в журнал — даже когда ворота по книге
+        # выключены. Иначе ответить «влияет ли книга на исход» будет нечем.
+        t_now = time.time()
+        bu = self.book.books.get(str(up)) if up else None
+        bd_ = self.book.books.get(str(dn)) if dn else None
+        self.bookfeat.feed(t_now, up, bu)
+        self.bookfeat.feed(t_now, dn, bd_)
+        fu = self.bookfeat.state(up, bu)
+        fd = self.bookfeat.state(dn, bd_)
+
         snap = JumpSnapshot(
             t=time.time(),
             seconds_left=max(0.0, self.market["end_ts"] - time.time()),
@@ -148,9 +171,15 @@ class JumpEngine(FlowEngine):
             accel=imp.accel if imp else None,
             imp_age_s=imp.age_s if imp else None,
             imp_hold=imp.hold if imp else None,
+            up_imb=fu.imbalance if fu else None,
+            down_imb=fd.imbalance if fd else None,
+            up_wall=fu.wall if fu else None,
+            down_wall=fd.wall if fd else None,
+            up_ask_trend=fu.ask_trend if fu else None,
+            down_ask_trend=fd.ask_trend if fd else None,
             # Покупки сейчас не пройдут — значит и разворот не пройдёт, и
             # стоп не имеет права рассчитывать на него (см. _ladder_blocked).
-            entries_paused=time.time() < self._retry_after,
+            entries_paused=t_now < self._retry_after,
         )
         # В режиме impulse скачок меряется коротким окном трекера, а не
         # 60-секундным swing: старое дно не имеет отношения к движению.
@@ -511,13 +540,18 @@ class JumpEngine(FlowEngine):
         # спред выглядел бы как мгновенная просадка.
         leg = self.strategy.record_entry(outcome, fill, shares, cost,
                                          action.track, time.time(),
-                                         entry_bid=bid if bid is not None else fill)
+                                         entry_bid=bid if bid is not None else fill,
+                                         feat=action.feat)
         self.legs.append({
             "idx": leg.idx, "outcome": outcome, "token": token,
             "entry_price": fill, "shares": shares, "cost": cost,
             "track": action.track, "last_bid": bid,
             "coin_at_entry": self.price.price(),
             "secs_at_entry": int(self.market["end_ts"] - time.time()),
+            # Признаки сигнала едут с ногой до закрытия и оттуда — в журнал.
+            "feat": dict(action.feat or {}),
+            "entry_bid": bid,
+            "entry_ts": time.time(),
         })
         self.log.warning(
             "КУПЛЕНО [%s#%d] %s — %.2f шэр @ $%.2f (=$%.2f) | вложено за раунд "
@@ -733,7 +767,40 @@ class JumpEngine(FlowEngine):
             shares, fill, proceeds, pnl, self._round_pnl, self.realized_pnl,
             _short(resp))
         self._log_trade_row(_row(leg), result, fill, proceeds, pnl)
+        self._journal(leg, result, fill, proceeds, pnl)
         return True
+
+    def _journal(self, leg: dict, result: str, exit_price: float,
+                 payout: float, pnl: float) -> None:
+        """Одна закрытая нога -> одна строка журнала со ВСЕМИ признаками.
+
+        Пишем и по продаже, и по расчёту в конце окна: без второй половины
+        выборка состояла бы только из сделок, которые бот успел закрыть сам,
+        то есть была бы смещена в сторону быстрых движений.
+        """
+        feat = dict(leg.get("feat") or {})
+        row = {
+            "mode": "DRY" if self.cfg.dry_run else "LIVE",
+            "asset": self.cfg.asset,
+            "entry_mode": getattr(self.cfg, "jump_entry_mode", "jump"),
+            "slug": (self.market or {}).get("slug", ""),
+            "outcome": leg.get("outcome"),
+            "leg_idx": leg.get("idx"),
+            "entry_price": leg.get("entry_price"),
+            "entry_bid": leg.get("entry_bid"),
+            "shares": leg.get("shares"),
+            "cost": leg.get("cost"),
+            "exit_price": round(exit_price, 4),
+            "payout": payout,
+            "pnl": pnl,
+            "result": result,
+            "held_s": (round(time.time() - leg["entry_ts"], 1)
+                       if leg.get("entry_ts") else None),
+            "coin_at_entry": leg.get("coin_at_entry"),
+            "secs_at_entry": leg.get("secs_at_entry"),
+        }
+        row.update(feat)          # q, speed, hold, accel, edge, книга и т.д.
+        self.journal.append(row)
 
     # ======================================================================
     #  Расчёт в конце окна: платит только выигравшая сторона
@@ -777,6 +844,7 @@ class JumpEngine(FlowEngine):
             # под наблюдение: иначе она пропадает из вида навсегда.
             self._watch_leftover(leg)
             pnl = round(payout - leg["cost"], 2)
+            self._journal(leg, result, mark, payout, pnl)
             payout_total += payout
             self._book_pnl(pnl)
             self.trader.settle(payout)
@@ -967,18 +1035,40 @@ class JumpEngine(FlowEngine):
             self.log.info(
                 "ВХОД ПО КАЧЕСТВУ ИМПУЛЬСА: скачок >=%.1fσ И скорость "
                 ">=%.1fσ $/с И удержание >=%.0f%% И без затухания "
-                "(ускорение >=%.2f); запас >= max(%.1f¢, %.1f×спред); "
-                "ставка от качества: $%.0f/$%.0f/$%.0f/$%.0f",
+                "(ускорение >=%.2f) И импульс не старше %.0fс; "
+                "запас >= max(%.1f¢, %.1f×спред); Q >= %.2f",
                 c.jump_imp_jump_sigmas, c.jump_imp_speed_sigmas,
                 c.jump_imp_min_hold * 100, c.jump_imp_min_accel,
-                c.jump_min_edge_cents, c.jump_edge_spread_mult,
-                c.jump_stake_usdc, c.jump_stake_good, c.jump_stake_strong,
-                c.jump_stake_best)
+                c.jump_imp_max_age_s, c.jump_min_edge_cents,
+                c.jump_edge_spread_mult, c.jump_imp_min_score)
+            self.log.info(
+                "веса Q: скорость %.2f / запас %.2f / ход %.2f / сдвиг %.2f"
+                "%s", c.jump_w_speed, c.jump_w_edge, c.jump_w_jump,
+                c.jump_w_shift,
+                f" / книга {c.jump_w_book:.2f}" if c.jump_w_book > 0 else "")
+            if c.jump_stake_by_quality:
+                self.log.info("ставка от качества: $%.0f/$%.0f/$%.0f/$%.0f",
+                              c.jump_stake_usdc, c.jump_stake_good,
+                              c.jump_stake_strong, c.jump_stake_best)
+            else:
+                self.log.info(
+                    "ставка ПЛОСКАЯ $%.2f на любой сигнал (ступени от "
+                    "качества выключены: пока пороги не проверены историей, "
+                    "множитель к ставке множит и ошибку)", c.jump_stake_usdc)
             self.log.info(
                 "окно экстремума %.0fс; потолок цены ноги по качеству: "
                 "%.2f/%.2f/%.2f", c.jump_imp_lookback_s,
                 c.jump_max_leg_price_weak, c.jump_max_leg_price,
                 c.jump_max_leg_price_strong)
+            gates = []
+            if c.jump_book_min_imbalance > 0:
+                gates.append(f"перекос >= {c.jump_book_min_imbalance:+.2f}")
+            if c.jump_book_max_wall > 0:
+                gates.append(f"стена <= {c.jump_book_max_wall:.0%}")
+            self.log.info(
+                "книга: %s", "; ".join(gates) if gates else
+                "признаки считаются и пишутся в журнал, но НЕ фильтруют "
+                "(сначала измерить, потом отбирать)")
         elif c.jump_entry_mode == "lag":
             self.log.info(
                 "ВХОД ПО ОТСТАВАНИЮ ЯКОРЯ: Phi(z по нашей цене) − Phi(z по "
@@ -998,11 +1088,25 @@ class JumpEngine(FlowEngine):
                 "скачок >=$%.0f и не дальше $%.0f от таргета",
                 c.jump_small_usd, c.jump_price_split,
                 c.jump_big_usd, c.jump_max_target_dist_usd)
-        self.log.info(
-            "ставка $%.2f; провал ниже %.2f → добор противоположной стороны на "
-            "(вложено+%.2f)/(1-цена); максимум %d доборов и $%.0f за раунд",
-            c.jump_stake_usdc, c.jump_price_split, c.jump_ladder_profit_usdc,
-            c.jump_max_ladder_legs, c.jump_max_round_usdc)
+        if not c.jump_ladder_enabled:
+            self.log.info("разворот выключен; потолок $%.0f за раунд",
+                          c.jump_max_round_usdc)
+        elif c.jump_ladder_reenters:
+            self.log.info(
+                "РАЗВОРОТ = ЗАКРЫТЬ ногу (просадка %.0f¢ от бида на входе, "
+                "выдержка %.1fс) и ВСЁ. Обратную сторону покупаем, только "
+                "если она сама пройдёт все ворота при Q >= %.2f в ближайшие "
+                "%.0fс; потолок $%.0f за раунд",
+                c.jump_ladder_loss * 100, c.jump_ladder_grace_s,
+                max(c.jump_imp_min_score, c.jump_ladder_min_q),
+                c.jump_ladder_strict_s, c.jump_max_round_usdc)
+        else:
+            self.log.info(
+                "СТАРЫЙ разворот: провал ниже %.2f → добор противоположной "
+                "стороны на (вложено+%.2f)/(1-цена); максимум %d доборов и "
+                "$%.0f за раунд", c.jump_price_split,
+                c.jump_ladder_profit_usdc, c.jump_max_ladder_legs,
+                c.jump_max_round_usdc)
         if c.jump_tp_enabled:
             self.log.info(
                 "дешёвая дорожка: фиксируем прибыль (+%.2f от входа), если до "

@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from btc_bot.prob import expected_shift, fair_up_probability
 from btc_bot.util import floor2
@@ -83,6 +83,13 @@ class JumpSnapshot:
     accel: Optional[float] = None     # >1 разгон, <1 затухание, <=0 разворот
     imp_age_s: Optional[float] = None # возраст локального экстремума, с
     imp_hold: Optional[float] = None  # доля удержанного хода [0..1]
+    # --- структура книги (flowbot/bookfeat.py), по каждой стороне отдельно ---
+    up_imb: Optional[float] = None    # перекос глубины [−1..+1], + = биды
+    down_imb: Optional[float] = None
+    up_wall: Optional[float] = None   # доля крупнейшей заявки в ask, [0..1]
+    down_wall: Optional[float] = None
+    up_ask_trend: Optional[float] = None   # уходит ли ask-ликвидность
+    down_ask_trend: Optional[float] = None
     # Движок сейчас не пропустит покупку (пауза после отказа биржи). Стратегии
     # это знать ОБЯЗАТЕЛЬНО: с приоритетом лестницы стоп стоит в стороне,
     # пока ногу способен взять разворот, — а разворот это покупка. Без этого
@@ -98,6 +105,15 @@ class JumpSnapshot:
 
     def flow(self, outcome: str) -> float:
         return self.up_flow if outcome == "Up" else self.down_flow
+
+    def imbalance(self, outcome: str) -> Optional[float]:
+        return self.up_imb if outcome == "Up" else self.down_imb
+
+    def wall(self, outcome: str) -> Optional[float]:
+        return self.up_wall if outcome == "Up" else self.down_wall
+
+    def ask_trend(self, outcome: str) -> Optional[float]:
+        return self.up_ask_trend if outcome == "Up" else self.down_ask_trend
 
 
 @dataclass
@@ -120,6 +136,11 @@ class Leg:
     # «импульс умер»: трейлинг реагирует только после отката процента, а
     # скорость умирает раньше отката.
     peak_speed: float = 0.0
+    # Признаки сигнала В МОМЕНТ ВХОДА. Едут с ногой до самого закрытия и
+    # оттуда попадают в журнал: без них по истории нельзя ответить, какой
+    # фильтр реально влияет на прибыль, а это единственное, ради чего
+    # история и собирается.
+    feat: Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -133,6 +154,7 @@ class Action:
     track: Optional[str] = None
     sell_idx: Optional[int] = None        # какую ногу продать (sell)
     sell_outcome: Optional[str] = None
+    feat: Dict = field(default_factory=dict)   # признаки сигнала (для журнала)
 
 
 def opposite(outcome: str) -> str:
@@ -173,6 +195,9 @@ class JumpStrategy:
         self.depth = 0                       # сколько доборов уже сделали
         self._below_since: Optional[float] = None
         self._last_fill_t: Optional[float] = None
+        # До какого момента вход считается ПОВТОРНЫМ (после выхода в минус) и
+        # обязан пройти повышенную планку качества. None = обычные правила.
+        self._strict_until: Optional[float] = None
 
     # -- границы раунда --------------------------------------------------------
     def reset_round(self) -> None:
@@ -182,18 +207,22 @@ class JumpStrategy:
         self.depth = 0
         self._below_since = None
         self._last_fill_t = None
+        # Новый раунд — новая история. Строгая планка не должна тянуться из
+        # прошлого окна: там был другой таргет и другой рынок.
+        self._strict_until = None
 
     # -- колбэки исполнения (зовёт движок по факту филла) ---------------------
     def record_entry(self, outcome: str, price: float, shares: float,
                      cost: float, track: str, t: float,
-                     entry_bid: Optional[float] = None) -> Leg:
+                     entry_bid: Optional[float] = None,
+                     feat: Optional[Dict] = None) -> Leg:
         # Пик ведём по БИДУ (за него реально можно продать), стартуя от бида
         # на входе. От уплаченного ask пик показывал бы весь спред как
         # мгновенный откат.
         eb = entry_bid if entry_bid is not None else price
         leg = Leg(outcome=outcome, entry_price=price, shares=shares, cost=cost,
                   track=track, entry_t=t, peak_bid=eb, idx=len(self.legs),
-                  entry_bid=eb, peak_t=t)
+                  entry_bid=eb, peak_t=t, feat=dict(feat or {}))
         self.legs.append(leg)
         self.net_out += cost
         if len(self.legs) > 1:
@@ -259,7 +288,10 @@ class JumpStrategy:
             # (см. _ladder_blocked). Стоп остаётся страховкой ровно на те
             # случаи, когда развернуться не во что.
             lad = self._maybe_ladder(s)
-            if lad.kind == LADDER:
+            # LADDER — старый переворот (продать и сразу купить обратную);
+            # SELL — новый разворот, который только закрывает ногу, а вход
+            # обратной стороны решается заново обычными воротами.
+            if lad.kind in (LADDER, SELL):
                 return lad
             act = self._stop_out(s)
             return act if act is not None else lad
@@ -391,10 +423,11 @@ class JumpStrategy:
             picked = self._trigger_jump(s)
         if isinstance(picked, Action):
             return picked                      # отказ с объяснением
-        # Триггер отдаёт (сторона, дорожка, причина) и, опционально,
-        # четвёртым элементом — ставку от качества сигнала (режим impulse).
+        # Триггер отдаёт (сторона, дорожка, причина), а режим impulse ещё и
+        # ставку четвёртым элементом и признаки сигнала пятым.
         side, track, why = picked[0], picked[1], picked[2]
         stake_want = picked[3] if len(picked) > 3 else c.jump_stake_usdc
+        feat = picked[4] if len(picked) > 4 else {}
 
         ask = s.ask(side)
         # Поздний вход: в последние секунды окна берём ТОЛЬКО сторону,
@@ -410,7 +443,7 @@ class JumpStrategy:
         stake = min(stake_want, c.jump_max_round_usdc)
         return Action(
             ENTER, outcome=side, limit_price=round(ask, 2), size_usdc=stake,
-            track=track, reason=f"{why}, ставка ${stake:.2f}",
+            track=track, reason=f"{why}, ставка ${stake:.2f}", feat=feat,
         )
 
     # ---- режим "edge": триггер — запас цены ---------------------------------
@@ -521,8 +554,21 @@ class JumpStrategy:
 
     # ---- режим "impulse": качество импульса, а не голая дистанция -----------
     def stake_for_quality(self, q: float) -> float:
-        """Размер ставки от качества сигнала: лучшие входы получают больше."""
+        """Размер ставки от качества сигнала.
+
+        ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО (`jump_stake_by_quality`), и ставка всегда
+        `jump_stake_usdc`. Причины две, и обе важнее удобства:
+
+        1. Ступени рвут непрерывное качество на куски. Q=2.99 брал на $4,
+           Q=3.01 — на $8, хотя разницы между сигналами нет.
+        2. Пока ни один порог не подтверждён историей, множитель к ставке
+           множит и ошибку. А ещё он ломает саму статистику: разный размер
+           позиции смешивает «сигнал был лучше» с «мы поставили больше», и
+           разделить их потом нечем.
+        """
         c = self.cfg
+        if not getattr(c, "jump_stake_by_quality", False):
+            return c.jump_stake_usdc
         if q >= c.jump_q_best:
             return c.jump_stake_best
         if q >= c.jump_q_strong:
@@ -530,6 +576,27 @@ class JumpStrategy:
         if q >= c.jump_q_good:
             return c.jump_stake_good
         return c.jump_stake_usdc
+
+    def min_quality(self, s: JumpSnapshot) -> Tuple[float, str]:
+        """Планка качества для входа ПРЯМО СЕЙЧАС и почему она такая.
+
+        Обычный вход — `jump_imp_min_score`. Но сразу после выхода в минус
+        планка поднимается до `jump_ladder_min_q`: повторный вход против
+        только что проигранной стороны рискованнее первого, поэтому сигнал
+        обязан быть сильнее среднего. Это и есть новая лестница — не
+        автоматический переворот, а вход по более строгим правилам.
+        """
+        c = self.cfg
+        base = c.jump_imp_min_score
+        if not getattr(c, "jump_ladder_reenters", False):
+            return base, ""
+        until = self._strict_until
+        if until is None or s.t >= until:
+            return base, ""
+        need = max(base, c.jump_ladder_min_q)
+        return need, (f" (повторный вход после разворота: планка поднята "
+                      f"с {base:.2f} до {need:.2f}, осталось "
+                      f"{until - s.t:.0f}с)")
 
     def max_leg_price_for_quality(self, q: float) -> float:
         """Потолок цены ноги от качества: сильному сигналу можно дороже."""
@@ -593,6 +660,16 @@ class JumpStrategy:
                 f"{side}: импульс затухает (ускорение {accel:.2f} < "
                 f"{c.jump_imp_min_accel:.2f}) — вход отменён"))
 
+        # ВОЗРАСТ САМОГО ИМПУЛЬСА, а не только свежесть экстремума. Движение
+        # может идти двадцать секунд: все фильтры пройдут (ход большой, ход
+        # держится, скорость есть), а покупать уже нечего — вход придётся на
+        # самый конец хода. Ограничение отсекает ровно это.
+        max_age = getattr(c, "jump_imp_max_age_s", 0.0)
+        if max_age > 0 and s.imp_age_s > max_age:
+            return Action(NONE, (
+                f"{side}: импульс идёт уже {s.imp_age_s:.0f}с "
+                f"(> {max_age:.0f}с) — вход был бы в конце движения"))
+
         # Близость к таргету — для ОБЕИХ сторон: далеко от таргета исход
         # решён, и проценты не сдвинет даже идеальный импульс.
         if s.target is not None:
@@ -621,20 +698,55 @@ class JumpStrategy:
                 f"-> запас {edge*100:+.1f}¢ < {edge_min:.1f}¢ "
                 f"(спред {spread*100:.0f}¢) — переплачиваем"))
 
-        # --- оценка качества: среднее компонентов, каждый нормирован на свой
-        # порог (1.0 = ровно на пороге) и ограничен тройкой, чтобы один
-        # аномальный компонент не покупал сделку в одиночку.
-        comps = [min(abs(jump) / need_jump, 3.0),
-                 min(spd / need_speed, 3.0),
-                 min(edge * 100 / edge_min, 3.0)]
+        # --- СТРУКТУРА КНИГИ ------------------------------------------------
+        # Жёсткие ворота по книге по умолчанию ВЫКЛЮЧЕНЫ (пороги 0). Признаки
+        # при этом считаются всегда и попадают в журнал каждой сделки — чтобы
+        # потом ответить, влияют ли они на исход, ДАННЫМИ, а не рассуждением.
+        imb = s.imbalance(side)
+        wall = s.wall(side)
+        need_imb = getattr(c, "jump_book_min_imbalance", 0.0)
+        if need_imb > 0 and imb is not None and imb < need_imb:
+            return Action(NONE, (
+                f"{side}: книга не подтверждает — перекос {imb:+.2f} < "
+                f"{need_imb:+.2f} (продавцов больше, чем покупателей)"))
+        max_wall = getattr(c, "jump_book_max_wall", 0.0)
+        if max_wall > 0 and wall is not None and wall > max_wall:
+            return Action(NONE, (
+                f"{side}: {wall:.0%} всей ask-ликвидности в одной заявке "
+                f"(> {max_wall:.0%}) — стена на пути движения"))
+
+        # --- ВЗВЕШЕННАЯ оценка качества --------------------------------------
+        # Каждый компонент нормирован на свой порог (1.0 = ровно на пороге) и
+        # ограничен тройкой, чтобы один аномальный признак не покупал сделку
+        # в одиночку. Раньше бралось простое среднее — то есть заявлялось,
+        # что все четыре признака одинаково важны. Это заведомо неверно, а
+        # проверить нечем, поэтому веса вынесены в настройки и участвуют в
+        # переборе наравне с порогами.
+        parts = [
+            ("speed", c.jump_w_speed, min(spd / need_speed, 3.0)),
+            ("edge", c.jump_w_edge, min(edge * 100 / edge_min, 3.0)),
+            ("jump", c.jump_w_jump, min(abs(jump) / need_jump, 3.0)),
+        ]
         shift = self._expected_shift(s, jump)
         if shift is not None and c.jump_min_shift_cents > 0:
-            comps.append(min(abs(shift) * 100 / c.jump_min_shift_cents, 3.0))
-        quality = sum(comps) / len(comps)
-        if quality < c.jump_imp_min_score:
+            parts.append(("shift", c.jump_w_shift,
+                          min(abs(shift) * 100 / c.jump_min_shift_cents, 3.0)))
+        if imb is not None and c.jump_w_book > 0:
+            # Перекос [−1..+1] переводим в ту же шкалу «доля от порога»:
+            # 0 перекоса = 1.0 (нейтрально), полный перекос в нашу сторону = 2.0.
+            parts.append(("book", c.jump_w_book, max(0.0, 1.0 + imb)))
+
+        wsum = sum(w for _n, w, _v in parts)
+        if wsum <= 0:                      # все веса обнулены — простое среднее
+            quality = sum(v for _n, _w, v in parts) / max(len(parts), 1)
+        else:
+            quality = sum(w * v for _n, w, v in parts) / wsum
+
+        need_q, why_strict = self.min_quality(s)
+        if quality < need_q:
             return Action(NONE, (
-                f"{side}: качество {quality:.2f} < {c.jump_imp_min_score:.2f} "
-                f"— импульс есть, но слабый"))
+                f"{side}: качество {quality:.2f} < {need_q:.2f}"
+                f"{why_strict} — импульс есть, но слабый"))
 
         cap = self.max_leg_price_for_quality(quality)
         if ask > cap:
@@ -643,11 +755,40 @@ class JumpStrategy:
                 f"{quality:.2f} — риск не по сигналу"))
 
         stake = self.stake_for_quality(quality)
+        # Признаки входа едут вместе с решением: движок положит их в ногу, а
+        # при закрытии — в журнал. Без этого «какой фильтр влияет на прибыль»
+        # остаётся вопросом без ответа.
+        feat = {
+            "q": round(quality, 3),
+            "jump_usd": round(jump, 2),
+            "jump_sigmas": round(abs(jump) / sigma, 2),
+            "speed": round(spd, 3),
+            "speed_sigmas": round(spd / sigma, 2),
+            "accel": round(accel, 3),
+            "hold": round(s.imp_hold, 3),
+            "imp_age_s": round(s.imp_age_s, 2),
+            "edge_cents": round(edge * 100, 2),
+            "edge_min_cents": round(edge_min, 2),
+            "spread_cents": round(spread * 100, 2),
+            "sigma": round(sigma, 3),
+            "secs_left": round(s.seconds_left, 1),
+            "dist_target": (round(abs(s.coin_price - s.target), 1)
+                            if s.target is not None else None),
+            "book_imb": None if imb is None else round(imb, 3),
+            "book_wall": None if wall is None else round(wall, 3),
+            "book_ask_trend": (None if s.ask_trend(side) is None
+                               else round(s.ask_trend(side), 3)),
+            "flow": round(s.flow(side), 3),
+            "strict_entry": bool(why_strict),
+            "q_parts": {n: round(v, 3) for n, _w, v in parts},
+        }
         return (side, "Q", (
-            f"ИМПУЛЬС {side}: Q={quality:.2f} (скачок ${jump:+.2f}"
+            f"ИМПУЛЬС {side}: Q={quality:.2f}{why_strict} (скачок ${jump:+.2f}"
             f"={abs(jump)/sigma:.1f}σ, скорость {spd:.1f}$/с, "
             f"удержание {s.imp_hold:.0%}, ускорение {accel:.2f}, "
-            f"запас +{edge*100:.1f}¢ при пороге {edge_min:.1f}¢)"), stake)
+            f"запас +{edge*100:.1f}¢ при пороге {edge_min:.1f}¢"
+            + (f", перекос книги {imb:+.2f}" if imb is not None else "")
+            + ")"), stake, feat)
 
     # ---- режим "jump": исходный триггер по скачку цены ----------------------
     def _trigger_jump(self, s: JumpSnapshot):
@@ -930,8 +1071,14 @@ class JumpStrategy:
         c = self.cfg
         if not c.jump_ladder_enabled:
             return "лестница выключена"
-        # Разворот — это ПОКУПКА, а покупки сейчас не проходят. Ждать нельзя:
-        # пока идёт пауза, ногу должен забрать стоп.
+        # В режиме повторного входа разворот — это ПРОДАЖА и ничего больше.
+        # Продать можно всегда: ни пауза после отказа (она держит только
+        # покупки), ни цена обратной стороны, ни предел ступеней тут ни при
+        # чём. Значит ногу разворот заберёт, и стопу вмешиваться незачем.
+        if getattr(c, "jump_ladder_reenters", False):
+            return None
+        # Дальше — старый переворот, а он ПОКУПАЕТ обратную сторону.
+        # Покупки сейчас не проходят, ждать нельзя: ногу должен забрать стоп.
         if s.entries_paused:
             return "пауза после отказа биржи — покупка не пройдёт"
         # Предел ступеней: 0 = без ограничений (долг всё равно сходится).
@@ -990,6 +1137,26 @@ class JumpStrategy:
             return Action(HOLD, f"{leg.outcome} просел до {bid:.2f}, жду "
                                 f"подтверждения {waited:.1f}/"
                                 f"{c.jump_ladder_grace_s:.1f}с")
+
+        # РАЗВОРОТ БОЛЬШЕ НЕ ПОКУПАЕТ ВСЛЕПУЮ.
+        # Прежняя логика молча принимала, что убыток по одной стороне —
+        # подтверждение другой. Это неверно: рынок мог просто встать, и тогда
+        # плохи ОБЕ, а автоматический переворот лишь удваивал число сделок и
+        # риск. Теперь разворот = ЗАКРЫТЬ убыточную ногу, а противоположная
+        # сторона обязана заново пройти все ворота стратегии как новая сделка
+        # (и по более высокой планке качества — см. min_quality).
+        if getattr(c, "jump_ladder_reenters", False):
+            self._strict_until = s.t + c.jump_ladder_strict_s
+            return Action(
+                SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
+                limit_price=round(bid, 2),
+                reason=(
+                    f"РАЗВОРОТ {leg.outcome}: упал до {bid:.2f} (бид на входе "
+                    f"{leg.entry_bid:.2f}) — закрываю. Обратную сторону "
+                    f"куплю, только если она сама пройдёт все ворота при "
+                    f"Q>={max(c.jump_imp_min_score, c.jump_ladder_min_q):.2f} "
+                    f"(итог {bid - leg.entry_price:+.2f})"),
+            )
 
         blocked = self._ladder_blocked(s, leg, bid)
         if blocked is not None:

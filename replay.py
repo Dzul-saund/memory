@@ -233,6 +233,32 @@ SWEEPS = {
     # ЧТО ГЛАВНЕЕ — РАЗВОРОТ ИЛИ ВЫХОД. Единственный способ решить это
     # честно: --sweep ladder-first true false на одной записи.
     "ladder-first": ("jump_ladder_before_stop", _flag),
+    # --- режим impulse: КАЖДЫЙ порог обязан пройти перебор ------------------
+    # Все они выбраны руками и держатся только на здравом смысле. Пока по
+    # ним не прогнали запись, «2σ» ничем не лучше «1.8σ» — просто число,
+    # которое кто-то назвал первым.
+    "imp-jump": ("jump_imp_jump_sigmas", float),
+    "imp-speed": ("jump_imp_speed_sigmas", float),
+    "imp-hold": ("jump_imp_min_hold", float),
+    "imp-accel": ("jump_imp_min_accel", float),
+    "imp-score": ("jump_imp_min_score", float),
+    "imp-lookback": ("jump_imp_lookback_s", float),
+    "imp-max-age": ("jump_imp_max_age_s", float),
+    "edge-mult": ("jump_edge_spread_mult", float),
+    # веса компонентов Q
+    "w-speed": ("jump_w_speed", float),
+    "w-edge": ("jump_w_edge", float),
+    "w-jump": ("jump_w_jump", float),
+    "w-shift": ("jump_w_shift", float),
+    "w-book": ("jump_w_book", float),
+    # разворот: повторный вход против автоматического переворота
+    "ladder-reenters": ("jump_ladder_reenters", _flag),
+    "ladder-min-q": ("jump_ladder_min_q", float),
+    "ladder-strict-s": ("jump_ladder_strict_s", float),
+    "stake-by-quality": ("jump_stake_by_quality", _flag),
+    # ворота по книге (по умолчанию выключены — 0)
+    "book-imbalance": ("jump_book_min_imbalance", float),
+    "book-wall": ("jump_book_max_wall", float),
     "edge-cents": ("jump_min_edge_cents", float),
     "max-legs": ("jump_max_ladder_legs", int),
     "min-shift": ("jump_min_shift_cents", float),

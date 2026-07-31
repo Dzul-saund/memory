@@ -233,12 +233,35 @@ class FlowConfig:
     jump_imp_min_score: float = 1.0
     # Размер ставки от качества сигнала: база jump_stake_usdc ($1), дальше
     # хороший/сильный/исключительный. Пороги — по оценке качества Q.
+    # СТАВКА ОТ КАЧЕСТВА — ВЫКЛЮЧЕНА по умолчанию.
+    # Ступени $1/$2/$4/$8 давали разрыв на ровном месте: Q=2.99 покупал на $4,
+    # Q=3.01 — на $8, хотя сигналы неразличимы. Пока ни один порог не проверен
+    # на истории, множитель к ставке множит и ошибку тоже. Плоский $1 делает
+    # статистику сравнимой между сделками: разный размер позиции смешивал бы
+    # «сигнал был лучше» с «мы поставили больше».
+    jump_stake_by_quality: bool = False
     jump_stake_good: float = 2.0
     jump_stake_strong: float = 4.0
     jump_stake_best: float = 8.0
     jump_q_good: float = 1.5
     jump_q_strong: float = 2.0
     jump_q_best: float = 3.0
+    # ВЕСА КОМПОНЕНТОВ Q. Простое среднее объявляло все четыре признака
+    # одинаково важными, а это заведомо неверно: скорость и запас объясняют
+    # исход сделки не так, как размер хода. Веса нормируются сами, поэтому
+    # задавать их можно в любых единицах (0.4/0.3/0.2/0.1 или 4/3/2/1).
+    # ВНИМАНИЕ: эти числа — тоже догадка, ровно как и пороги. Их обязан
+    # подтвердить перебор по журналу сделок, а до тех пор они не «правильные»,
+    # а всего лишь более осмысленные, чем равные.
+    jump_w_speed: float = 0.40
+    jump_w_edge: float = 0.30
+    jump_w_jump: float = 0.20
+    jump_w_shift: float = 0.10
+    jump_w_book: float = 0.0        # перекос книги: считается, но пока не весит
+    # ВОЗРАСТ ИМПУЛЬСА. Экстремум может быть свежим по меркам окна поиска и
+    # при этом движение уже идёт 20 секунд — все фильтры пройдут, а покупать
+    # будет нечего: ход закончился. 0 = не ограничивать.
+    jump_imp_max_age_s: float = 8.0
     # Динамический запас: edge_min = max(jump_min_edge_cents, это * спред).
     # При спреде 5¢ порог 10¢ — широкий спред сам ужесточает требования.
     jump_edge_spread_mult: float = 2.0
@@ -331,6 +354,30 @@ class FlowConfig:
     # предел ступеней, у обратной стороны нет ask или она дороже потолка.
     # false = прежнее поведение (стоп режет первым, лестница редка).
     jump_ladder_before_stop: bool = True
+    # ЛЕСТНИЦА БОЛЬШЕ НЕ ПОКУПАЕТ ВСЛЕПУЮ.
+    # Прежняя логика: нога в минусе -> сразу берём противоположную сторону в
+    # размере, перекрывающем убыток. Ошибка в основании: убыток по одной
+    # стороне считался ПОДТВЕРЖДЕНИЕМ другой. А рынок мог просто встать —
+    # тогда плоха и та и другая, и переворот лишь удваивал число сделок.
+    # Теперь разворот = ЗАКРЫТЬ убыточную ногу, после чего противоположная
+    # сторона обязана заново пройти ВСЕ ворота стратегии как новая сделка.
+    # Не прошла — остаёмся без позиции и ждём сигнала.
+    jump_ladder_reenters: bool = True
+    # И планка для такого повторного входа ВЫШЕ обычной: переворот рискованнее
+    # первого входа, значит сигнал должен быть сильнее среднего. Действует
+    # jump_ladder_strict_s секунд после выхода в минус.
+    jump_ladder_min_q: float = 1.5
+    jump_ladder_strict_s: float = 30.0
+    # --- структура книги заявок (flowbot/bookfeat.py) ------------------------
+    # Сколько уровней считать глубиной и за какое окно мерить её изменение.
+    jump_book_levels: int = 5
+    jump_book_window_s: float = 3.0
+    # ЖЁСТКИЕ ворота по книге — ВЫКЛЮЧЕНЫ (0). Признаки уже считаются и
+    # пишутся в журнал каждой сделки; включать их в отбор до того, как по
+    # журналу видно их влияние, — это ровно та ошибка, на которой проект уже
+    # обжигался дважды. Сначала измерить, потом фильтровать.
+    jump_book_min_imbalance: float = 0.0    # перекос в нашу сторону, [0..1]
+    jump_book_max_wall: float = 0.0         # доля крупнейшей заявки, [0..1]
     # Выход по смерти импульса: мы в плюсе, а скорость монеты упала на эту
     # долю от пиковой за время позиции — забираем, не дожидаясь отката
     # процента (трейлинг реагирует только ПОСЛЕ отката). 0 = выключить.
@@ -389,6 +436,12 @@ class FlowConfig:
     tick_max_wait_seconds: float = 0.05
     max_consecutive_errors: int = 12
     trade_log_csv: str = "flowbot_trades.csv"   # "" отключает
+    # ЖУРНАЛ СДЕЛОК С ПРИЗНАКАМИ (flowbot/stats.py). Лежит ВНЕ папки проекта
+    # (`~/.flowbot/trades.jsonl`), поэтому переезд на новую сборку историю не
+    # обнуляет — а именно так она и терялась: bot16, bot18, bot20, и в каждой
+    # свой CSV с нуля. Пустая строка = путь по умолчанию.
+    stats_path: str = ""
+    stats_enabled: bool = True
     # Запись всего, что видел бот, в JSONL — сырьё для проигрывания и подбора
     # порогов на РЕАЛЬНОЙ истории вместо догадок. "" отключает.
     record_path: str = ""
@@ -442,12 +495,28 @@ class FlowConfig:
             jump_imp_min_hold=_f("JUMP_IMP_MIN_HOLD", 0.7),
             jump_imp_min_accel=_f("JUMP_IMP_MIN_ACCEL", 0.5),
             jump_imp_min_score=_f("JUMP_IMP_MIN_SCORE", 1.0),
+            jump_stake_by_quality=_b("JUMP_STAKE_BY_QUALITY", False),
             jump_stake_good=_f("JUMP_STAKE_GOOD", 2.0),
             jump_stake_strong=_f("JUMP_STAKE_STRONG", 4.0),
             jump_stake_best=_f("JUMP_STAKE_BEST", 8.0),
             jump_q_good=_f("JUMP_Q_GOOD", 1.5),
             jump_q_strong=_f("JUMP_Q_STRONG", 2.0),
             jump_q_best=_f("JUMP_Q_BEST", 3.0),
+            jump_w_speed=_f("JUMP_W_SPEED", 0.40),
+            jump_w_edge=_f("JUMP_W_EDGE", 0.30),
+            jump_w_jump=_f("JUMP_W_JUMP", 0.20),
+            jump_w_shift=_f("JUMP_W_SHIFT", 0.10),
+            jump_w_book=_f("JUMP_W_BOOK", 0.0),
+            jump_imp_max_age_s=_f("JUMP_IMP_MAX_AGE_S", 8.0),
+            jump_ladder_reenters=_b("JUMP_LADDER_REENTERS", True),
+            jump_ladder_min_q=_f("JUMP_LADDER_MIN_Q", 1.5),
+            jump_ladder_strict_s=_f("JUMP_LADDER_STRICT_S", 30.0),
+            jump_book_levels=_i("JUMP_BOOK_LEVELS", 5),
+            jump_book_window_s=_f("JUMP_BOOK_WINDOW_S", 3.0),
+            jump_book_min_imbalance=_f("JUMP_BOOK_MIN_IMBALANCE", 0.0),
+            jump_book_max_wall=_f("JUMP_BOOK_MAX_WALL", 0.0),
+            stats_path=_s("FLOW_STATS_PATH", ""),
+            stats_enabled=_b("FLOW_STATS_ENABLED", True),
             jump_edge_spread_mult=_f("JUMP_EDGE_SPREAD_MULT", 2.0),
             jump_max_leg_price_weak=_f("JUMP_MAX_LEG_PRICE_WEAK", 0.92),
             jump_max_leg_price_strong=_f("JUMP_MAX_LEG_PRICE_STRONG", 0.97),

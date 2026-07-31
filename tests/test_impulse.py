@@ -189,8 +189,20 @@ class TestDynamicEdge:
 
 
 class TestQualitySizing:
-    def test_stake_grows_with_quality(self):
+    """Ставка от качества ВЫКЛЮЧЕНА по умолчанию — проверяем оба режима."""
+
+    def test_flat_stake_by_default(self):
+        """Ступени $1/$2/$4/$8 рвали непрерывное качество на куски: Q=2.99
+        брало на $4, Q=3.01 — на $8. Пока пороги не подтверждены историей,
+        множитель к ставке множит и ошибку, и вдобавок ломает статистику:
+        разный размер позиции смешивает «сигнал был лучше» с «мы поставили
+        больше»."""
         s = JumpStrategy(cfg_imp())
+        for q in (0.5, 1.6, 2.1, 3.5, 99.0):
+            assert s.stake_for_quality(q) == 1.0
+
+    def test_stake_grows_with_quality(self):
+        s = JumpStrategy(cfg_imp(jump_stake_by_quality=True))
         assert s.stake_for_quality(0.5) == 1.0
         assert s.stake_for_quality(1.6) == 2.0
         assert s.stake_for_quality(2.1) == 4.0
@@ -203,19 +215,27 @@ class TestQualitySizing:
         assert s.max_leg_price_for_quality(2.5) == pytest.approx(0.97)
 
     def test_strong_signal_buys_more(self):
-        """Сильный импульс должен получить ставку больше базовой."""
-        act = JumpStrategy(cfg_imp()).on_tick(
+        """Сильный импульс получает ставку больше базовой — если включено."""
+        act = JumpStrategy(cfg_imp(jump_stake_by_quality=True)).on_tick(
             isnap(jump=12.0, speed=9.0, accel=2.5, hold=1.0))
         assert act.kind == ENTER
         assert act.size_usdc > 1.0
 
     def test_weak_signal_gets_less_than_a_strong_one(self):
-        s = JumpStrategy(cfg_imp())
+        s = JumpStrategy(cfg_imp(jump_stake_by_quality=True))
         weak = s.on_tick(isnap(jump=2.1, speed=1.05, accel=0.9, hold=0.75,
                                up_bid=0.61, up_ask=0.62))
         strong = s.on_tick(isnap(jump=12.0, speed=9.0, accel=2.5, hold=1.0))
         assert weak.kind == ENTER and strong.kind == ENTER
         assert weak.size_usdc < strong.size_usdc
+
+    def test_same_stake_regardless_of_quality_by_default(self):
+        s = JumpStrategy(cfg_imp())
+        weak = s.on_tick(isnap(jump=2.1, speed=1.05, accel=0.9, hold=0.75,
+                               up_bid=0.61, up_ask=0.62))
+        strong = s.on_tick(isnap(jump=12.0, speed=9.0, accel=2.5, hold=1.0))
+        assert weak.kind == ENTER and strong.kind == ENTER
+        assert weak.size_usdc == strong.size_usdc == 1.0
 
 
 # ---------------------------------------------------------------------------
