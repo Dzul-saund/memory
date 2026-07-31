@@ -83,6 +83,12 @@ class JumpSnapshot:
     accel: Optional[float] = None     # >1 разгон, <1 затухание, <=0 разворот
     imp_age_s: Optional[float] = None # возраст локального экстремума, с
     imp_hold: Optional[float] = None  # доля удержанного хода [0..1]
+    # Движок сейчас не пропустит покупку (пауза после отказа биржи). Стратегии
+    # это знать ОБЯЗАТЕЛЬНО: с приоритетом лестницы стоп стоит в стороне,
+    # пока ногу способен взять разворот, — а разворот это покупка. Без этого
+    # флага пауза давала дыру: разворот отложен, стоп молчит «его возьмут»,
+    # и нога висит без выхода ровно тогда, когда цена падает.
+    entries_paused: bool = False
 
     def bid(self, outcome: str) -> Optional[float]:
         return self.up_bid if outcome == "Up" else self.down_bid
@@ -243,6 +249,21 @@ class JumpStrategy:
         act = self._take_profit(s)
         if act is not None:
             return act
+
+        if self.cfg.jump_ladder_before_stop:
+            # ЛЕСТНИЦА ВЫШЕ СТОПА.
+            # Порядок вызовов сам по себе ничего не решает: порог стопа (1¢)
+            # МЕНЬШЕ порога лестницы (2¢ + выдержка), поэтому по цене стоп
+            # наступает раньше в любом случае. Приоритет даёт не очередь, а
+            # то, что стоп СТОИТ В СТОРОНЕ, пока ногу способен взять разворот
+            # (см. _ladder_blocked). Стоп остаётся страховкой ровно на те
+            # случаи, когда развернуться не во что.
+            lad = self._maybe_ladder(s)
+            if lad.kind == LADDER:
+                return lad
+            act = self._stop_out(s)
+            return act if act is not None else lad
+
         act = self._stop_out(s)
         if act is not None:
             return act
@@ -832,9 +853,21 @@ class JumpStrategy:
         нашу ногу в момент покупки, поэтому уход ниже неё и есть движение
         против нас.
 
-        Проверяется ПОСЛЕ фиксации прибыли и ДО лестницы: если мы в плюсе,
-        забирать прибыль важнее; если в минусе, выйти дешевле, чем
-        разворачиваться.
+        КОГДА ОН ВООБЩЕ СРАБАТЫВАЕТ (`jump_ladder_before_stop`, по умолчанию
+        включено). Порог стопа (1¢) меньше порога лестницы (2¢ + выдержка
+        0.6с), поэтому по цене стоп наступает раньше ВСЕГДА, и просто
+        поменять вызовы местами недостаточно — разворот всё равно не
+        случился бы ни разу. Приоритет лестницы означает буквально: пока
+        ногу способен взять разворот, стоп её не трогает. Стоп остаётся
+        страховкой на случаи, когда развернуться не во что: лестница
+        выключена, упёрлась в предел ступеней, у обратной стороны нет ask
+        или она дороже потолка.
+
+        Плата за это названа честно: между 1¢ и 2¢ нога больше не режется,
+        а в течение выдержки 0.6с падение может уйти дальше. Это тот самый
+        размен «выйти дёшево» против «отыграться разворотом», и теперь он
+        сдвинут в сторону разворота. Вернуть прежнее —
+        `JUMP_LADDER_BEFORE_STOP=false`.
         """
         c = self.cfg
         if c.jump_stop_loss <= 0:
@@ -846,6 +879,12 @@ class JumpStrategy:
                 continue
             if bid > leg.entry_bid - stop + 1e-9:
                 continue
+            tail = ""
+            if c.jump_ladder_before_stop:
+                blocked = self._ladder_blocked(s, leg, bid)
+                if blocked is None:
+                    continue          # ногу возьмёт разворот — не мешаем
+                tail = f", развернуться нельзя: {blocked}"
             return Action(
                 SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
                 limit_price=round(bid, 2),
@@ -854,7 +893,7 @@ class JumpStrategy:
                         f"{(leg.entry_bid - bid) * 100:.0f}¢ "
                         f"(порог {stop*100:.1f}¢, вошли по "
                         f"{leg.entry_price:.2f}, итог "
-                        f"{bid - leg.entry_price:+.2f})"),
+                        f"{bid - leg.entry_price:+.2f}{tail})"),
             )
         return None
 
@@ -878,6 +917,42 @@ class JumpStrategy:
     # ======================================================================
     #  Лестница-переворот: продаём провалившуюся ногу и берём другую сторону
     # ======================================================================
+    def _ladder_blocked(self, s: JumpSnapshot, leg: Leg,
+                        bid: Optional[float]) -> Optional[str]:
+        """Почему разворот НЕ сможет взять эту ногу. None = сможет.
+
+        Ответ нужен в двух местах, и он обязан быть ОДИН: сама лестница
+        печатает его как причину «держу», а жёсткий стоп по нему решает,
+        стоять ли ему в стороне. Если бы каждый считал сам, появилась бы
+        дыра — стоп молчит «её возьмёт разворот», а разворот в тот же тик
+        отказывается по своей причине, и нога не выходит вообще.
+        """
+        c = self.cfg
+        if not c.jump_ladder_enabled:
+            return "лестница выключена"
+        # Разворот — это ПОКУПКА, а покупки сейчас не проходят. Ждать нельзя:
+        # пока идёт пауза, ногу должен забрать стоп.
+        if s.entries_paused:
+            return "пауза после отказа биржи — покупка не пройдёт"
+        # Предел ступеней: 0 = без ограничений (долг всё равно сходится).
+        if 0 < c.jump_max_ladder_legs <= self.depth:
+            return (f"лестница на пределе "
+                    f"({self.depth}/{c.jump_max_ladder_legs})")
+        opp = opposite(leg.outcome)
+        opp_ask = s.ask(opp)
+        if opp_ask is None:
+            return f"нет ask по {opp} для разворота"
+        if opp_ask > c.jump_max_leg_price:
+            return (f"разворот в {opp} по {opp_ask:.2f} дороже потолка "
+                    f"{c.jump_max_leg_price:.2f} — шэров нужно слишком много")
+        if bid is not None:
+            proceeds = bid * leg.shares
+            debt_after = max(0.0, self.net_out - proceeds)
+            if ladder_shares(debt_after, c.jump_ladder_profit_usdc,
+                             opp_ask) <= 0:
+                return f"разворот {opp}: расчёт дал 0 шэров"
+        return None
+
     def _maybe_ladder(self, s: JumpSnapshot) -> Action:
         """Проценты пошли против нас — разворачиваемся.
 
@@ -916,23 +991,14 @@ class JumpStrategy:
                                 f"подтверждения {waited:.1f}/"
                                 f"{c.jump_ladder_grace_s:.1f}с")
 
-        if not c.jump_ladder_enabled:
-            return Action(HOLD, f"{leg.outcome} просел до {bid:.2f}, лестница "
-                                f"выключена — держу до расчёта")
-        # Предел ступеней: 0 = без ограничений (долг всё равно сходится).
-        if 0 < c.jump_max_ladder_legs <= self.depth:
+        blocked = self._ladder_blocked(s, leg, bid)
+        if blocked is not None:
             return Action(HOLD, (
-                f"{leg.outcome} просел до {bid:.2f}, но лестница на пределе "
-                f"({self.depth}/{c.jump_max_ladder_legs}) — держу до расчёта"))
+                f"{leg.outcome} просел до {bid:.2f}, но развернуться нельзя: "
+                f"{blocked}"))
 
         opp = opposite(leg.outcome)
         opp_ask = s.ask(opp)
-        if opp_ask is None:
-            return Action(HOLD, f"{opp}: нет ask для разворота")
-        if opp_ask > c.jump_max_leg_price:
-            return Action(HOLD, (
-                f"разворот в {opp} по {opp_ask:.2f} дороже потолка "
-                f"{c.jump_max_leg_price:.2f} — шэров нужно слишком много"))
 
         # Долг ПОСЛЕ продажи старой ноги: вернём bid*shares, останется только
         # реализованный убыток. Движок пересчитает по факту филла.
@@ -940,8 +1006,6 @@ class JumpStrategy:
         debt_after = max(0.0, self.net_out - proceeds)
         shares = ladder_shares(debt_after, c.jump_ladder_profit_usdc, opp_ask)
         cost = shares * opp_ask
-        if shares <= 0:
-            return Action(HOLD, f"разворот {opp}: расчёт дал 0 шэров")
 
         return Action(
             LADDER, outcome=opp, limit_price=round(opp_ask, 2),

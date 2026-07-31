@@ -148,6 +148,9 @@ class JumpEngine(FlowEngine):
             accel=imp.accel if imp else None,
             imp_age_s=imp.age_s if imp else None,
             imp_hold=imp.hold if imp else None,
+            # Покупки сейчас не пройдут — значит и разворот не пройдёт, и
+            # стоп не имеет права рассчитывать на него (см. _ladder_blocked).
+            entries_paused=time.time() < self._retry_after,
         )
         # В режиме impulse скачок меряется коротким окном трекера, а не
         # 60-секундным swing: старое дно не имеет отношения к движению.

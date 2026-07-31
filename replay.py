@@ -216,6 +216,11 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
     return res
 
 
+def _flag(v: str) -> bool:
+    """bool('false') это True — поэтому разбираем сами, а не через bool."""
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "да")
+
+
 SWEEPS = {
     # Сравнение трёх режимов входа на ОДНОЙ записи — самый честный способ
     # их сопоставить: рынок буквально один и тот же, отличается только повод
@@ -225,6 +230,9 @@ SWEEPS = {
     "trail": ("jump_tp_trail", float),
     "trail-arm": ("jump_tp_trail_arm", float),
     "stop-loss": ("jump_stop_loss", float),
+    # ЧТО ГЛАВНЕЕ — РАЗВОРОТ ИЛИ ВЫХОД. Единственный способ решить это
+    # честно: --sweep ladder-first true false на одной записи.
+    "ladder-first": ("jump_ladder_before_stop", _flag),
     "edge-cents": ("jump_min_edge_cents", float),
     "max-legs": ("jump_max_ladder_legs", int),
     "min-shift": ("jump_min_shift_cents", float),

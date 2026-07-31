@@ -88,25 +88,42 @@ class TestEngineReconciliation:
         # Нога попала и в стратегию — иначе её никто не стал бы продавать.
         assert len(eng.strategy.legs) == 1
 
-    def test_adopted_position_is_then_managed_normally(self):
-        """Взяли под управление — дальше её должен закрыть обычный стоп."""
-        from flowbot.jump import SELL
+    def _adopted(self, **cfg_kw):
+        """Нога, принятая с биржи, и цена, ушедшая против неё."""
+        from flowbot.jump import JumpSnapshot
 
-        eng, cfg = _live_engine(jump_stop_loss=0.01)
+        eng, cfg = _live_engine(jump_stop_loss=0.01, **cfg_kw)
         eng.trader.position = lambda token: (
             {"balance": "2000000"} if token == "DNTOK" else {"balance": "0"})
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         asyncio.run(eng._reconcile())
-
-        # Цена ушла против нас — стоп обязан сработать по принятой ноге.
         _book(eng, 0.60, 0.61, 0.39, 0.40)
-        from flowbot.jump import JumpSnapshot
 
-        act = eng.strategy.on_tick(JumpSnapshot(
+        return eng.strategy.on_tick(JumpSnapshot(
             t=time.time() + 5, seconds_left=200.0, coin_price=65_000.0,
             target=65_000.0, jump_usd=0.0, sigma_1s=1.0,
             up_bid=0.60, up_ask=0.61, down_bid=0.39, down_ask=0.40))
+
+    def test_adopted_position_is_then_managed_normally(self):
+        """Взяли под управление — дальше её ведут обычные выходы.
+
+        При нынешнем приоритете это РАЗВОРОТ: он тоже продаёт ногу, просто
+        одновременно берёт другую сторону. Проверяем именно то, ради чего
+        сверка и нужна, — принятая нога не висит без присмотра.
+        """
+        from flowbot.jump import LADDER
+
+        act = self._adopted()
+        assert act.kind == LADDER
+        assert act.sell_outcome == "Down", "принятая нога обязана продаваться"
+
+    def test_adopted_position_falls_to_the_stop_without_a_ladder(self):
+        """Разворачиваться не во что — принятую ногу закрывает стоп."""
+        from flowbot.jump import SELL
+
+        act = self._adopted(jump_ladder_enabled=False)
         assert act.kind == SELL
+        assert act.sell_outcome == "Down"
 
     def test_drops_a_phantom_the_exchange_does_not_have(self):
         eng, _ = _live_engine()

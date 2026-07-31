@@ -37,12 +37,14 @@ def cfg() -> FlowConfig:
 
 def snap(t=100.0, left=200.0, price=65_000.0, target=65_000.0, jump=0.0,
          up_bid=None, up_ask=None, down_bid=None, down_ask=None,
-         up_flow=0.0, down_flow=0.0, sigma=None) -> JumpSnapshot:
+         up_flow=0.0, down_flow=0.0, sigma=None,
+         entries_paused=False) -> JumpSnapshot:
     return JumpSnapshot(
         t=t, seconds_left=left, coin_price=price, target=target,
         jump_usd=jump, up_bid=up_bid, up_ask=up_ask,
         down_bid=down_bid, down_ask=down_ask,
         up_flow=up_flow, down_flow=down_flow, sigma_1s=sigma,
+        entries_paused=entries_paused,
     )
 
 
@@ -775,8 +777,12 @@ class TestStopLoss:
     ногу в момент покупки.
     """
 
-    def _leg(self, cfg, ask=0.53, entry_bid=0.51):
+    def _leg(self, cfg, ask=0.53, entry_bid=0.51, ladder=False):
         cfg.jump_stop_loss = 0.01
+        # По умолчанию проверяем МЕХАНИКУ САМОГО СТОПА, поэтому лестница
+        # выключена: при включённой она забирает ногу себе (см. отдельный
+        # класс TestLadderBeforeStop), и стоп до неё просто не доходит.
+        cfg.jump_ladder_enabled = ladder
         s = JumpStrategy(cfg)
         s.record_entry("Up", ask, 1.89, 1.00, TRACK_A, t=0.0,
                        entry_bid=entry_bid)
@@ -804,14 +810,44 @@ class TestStopLoss:
         s = self._leg(cfg, ask=0.53, entry_bid=0.48)
         assert self._tick(s, 1.0, 0.48).kind == HOLD
 
-    def test_beats_the_ladder_to_the_exit(self, cfg):
-        """Стоп (1¢) срабатывает раньше лестницы (2¢ плюс выдержка)."""
+    def test_stands_aside_while_the_ladder_can_take_the_leg(self, cfg):
+        """Пока ногу способен взять разворот, стоп её не трогает.
+
+        Это и есть «лестница первее стопа». Поменять порядок вызовов было
+        бы мало: порог стопа (1¢) МЕНЬШЕ порога лестницы (2¢ + выдержка),
+        поэтому по цене стоп наступает раньше при любой очерёдности.
+        """
         cfg.jump_ladder_enabled = True
         cfg.jump_ladder_loss = 0.02
         cfg.jump_ladder_grace_s = 0.6
-        s = self._leg(cfg)
+        s = self._leg(cfg, ladder=True)
+        act = self._tick(s, 1.0, 0.50)          # −1¢: стоп бы сработал
+        assert act.kind == HOLD, "стоп опередил лестницу"
+        assert "СТОП" not in act.reason
+
+    def test_fires_when_the_ladder_cannot_help(self, cfg):
+        """Разворачиваться не во что — стоп обязан вернуться к работе.
+
+        Страховка нужна ровно здесь: обратная сторона дороже потолка, то
+        есть перекрыть минус нечем. Без этой ветки нога висела бы до
+        расчёта, потому что лестница «занята» ею только на словах.
+        """
+        cfg.jump_ladder_enabled = True
+        cfg.jump_max_leg_price = 0.40           # Down по 0.50 не пройдёт
+        s = self._leg(cfg, ladder=True)
         act = self._tick(s, 1.0, 0.50)
-        assert act.kind == SELL, "лестница не должна опережать стоп"
+        assert act.kind == SELL
+        assert "СТОП" in act.reason
+        assert "развернуться нельзя" in act.reason
+
+    def test_flag_restores_the_old_priority(self, cfg):
+        """JUMP_LADDER_BEFORE_STOP=false возвращает прежнее поведение."""
+        cfg.jump_ladder_enabled = True
+        cfg.jump_ladder_before_stop = False
+        s = self._leg(cfg, ladder=True)
+        act = self._tick(s, 1.0, 0.50)
+        assert act.kind == SELL
+        assert "СТОП" in act.reason
 
     def test_profit_taking_still_wins_over_the_stop(self, cfg):
         """Если мы в плюсе, забрать прибыль важнее — порядок проверок."""
@@ -827,3 +863,79 @@ class TestStopLoss:
         s = self._leg(cfg)
         s.cfg.jump_stop_loss = 0.0
         assert self._tick(s, 1.0, 0.30).kind == HOLD
+
+
+class TestLadderBeforeStop:
+    """Разворот теперь главнее выхода — весь путь ноги целиком.
+
+    До этой правки лестница была почти недостижима: стоп на 1¢ срабатывал
+    раньше, чем нога успевала просесть на 2¢ и выдержать 0.6с. Здесь
+    проверяется, что она действительно случается, и что стоп при этом не
+    исчез, а стал страховкой.
+    """
+
+    def _leg(self, cfg, ask=0.53, entry_bid=0.51):
+        cfg.jump_stop_loss = 0.01
+        cfg.jump_ladder_enabled = True
+        cfg.jump_ladder_loss = 0.02
+        cfg.jump_ladder_grace_s = 0.6
+        cfg.jump_max_leg_price = 0.95
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", ask, 1.89, 1.00, TRACK_A, t=0.0,
+                       entry_bid=entry_bid)
+        return s
+
+    def _tick(self, s, t, bid):
+        return s.on_tick(snap(t=t, left=200.0, jump=2.0,
+                              up_bid=bid, up_ask=round(bid + 0.02, 2),
+                              down_bid=round(1 - bid - 0.02, 2),
+                              down_ask=round(1 - bid, 2)))
+
+    def test_leg_survives_to_the_reversal(self, cfg):
+        """−1¢ держим, −2¢ ждём выдержку, после выдержки разворачиваемся."""
+        s = self._leg(cfg)
+        assert self._tick(s, 1.0, 0.50).kind == HOLD      # стоп бы срезал
+
+        act = self._tick(s, 2.0, 0.49)                    # порог лестницы
+        assert act.kind == HOLD
+        assert "жду подтверждения" in act.reason
+
+        act = self._tick(s, 2.7, 0.49)                    # выдержка вышла
+        assert act.kind == LADDER
+        assert act.outcome == "Down"
+        assert act.sell_idx == 0, "старая нога обязана продаваться"
+
+    def test_recovery_cancels_everything(self, cfg):
+        """Отскок выше порога — ни разворота, ни стопа."""
+        s = self._leg(cfg)
+        self._tick(s, 1.0, 0.49)
+        act = self._tick(s, 1.2, 0.52)
+        assert act.kind == HOLD
+        act = self._tick(s, 2.5, 0.52)
+        assert act.kind == HOLD, "выдержка обязана начаться заново"
+
+    def test_profit_taking_still_wins(self, cfg):
+        """Порядок остался: прибыль забираем раньше, чем разворачиваемся."""
+        cfg.jump_tp_trail = 0.02
+        s = self._leg(cfg)
+        self._tick(s, 1.0, 0.60)
+        act = self._tick(s, 2.0, 0.58)
+        assert act.kind == SELL
+        assert "ФИКСИРУЮ" in act.reason
+
+    def test_pause_after_a_rejection_hands_the_leg_back_to_the_stop(self, cfg):
+        """Разворот — это ПОКУПКА, а покупки на паузе. Выходит стоп.
+
+        Дыра, которую этот приоритет чуть не открыл: движок придерживает
+        входы и добор после отказа биржи, но не продажи. Если бы стоп
+        по-прежнему считал «ногу возьмёт разворот», нога висела бы без
+        выхода все пять секунд паузы — ровно тогда, когда цена падает.
+        """
+        s = self._leg(cfg)
+        act = s.on_tick(snap(t=1.0, left=200.0, jump=2.0,
+                             up_bid=0.50, up_ask=0.52,
+                             down_bid=0.48, down_ask=0.50,
+                             entries_paused=True))
+        assert act.kind == SELL
+        assert "СТОП" in act.reason
+        assert "пауза" in act.reason
