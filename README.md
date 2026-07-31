@@ -282,39 +282,23 @@ cumulative_pnl, balance_after
 
 ---
 
-## Edge Bot (paper measurement — combines both monitors)
+## Trading bot (clean slate)
 
-`edge_bot.py` ties the two monitors together and **measures, without risking
-money**, whether the "buy the stale quote" idea actually pays from your
-location. It imports the price bot (`fast_monitor`) and the book bot
-(`book_monitor`) unchanged and runs both feeds in one process.
+The previous strategy has been removed in full — every entry rule, filter,
+score and exit condition. What remains is infrastructure: price consensus,
+order book, round target, order execution with whole-share sizing, position
+reconciliation against the exchange, DRY/LIVE modes and the trade journal.
 
-Each tick it compares the **fair value** of UP/DOWN — `Φ(diff/(σ√t))` from the
-price bot, measured against the exact Polymarket round target — with the **live
-best ask** from the book bot. When a side's fair value exceeds its ask by more
-than the edge threshold *and that edge is fresh* (it just opened after a BTC
-move, not a stale model-vs-market disagreement), it opens a **paper** position.
-
-It honestly models the race that decides profitability:
-
-* on a signal, the fill is checked `--order-latency-ms` later — if the quote is
-  gone by then, it's a **miss** (the market maker cancelled first); only if the
-  size survives do you fill;
-* set `--order-latency-ms` to your real order latency (home ~150-250ms, VPS
-  us-east ~20-50ms) and the paper results become a prediction of live results.
-
-Every signal, fill/miss and exit is written to `edge_<coin>_paper.csv`. Run it
-a week, then read the CSV: fill rate and cumulative P&L answer the question
-definitively. No real orders are ever sent.
+New logic goes into `flowbot/strategy.py`. Three methods — `should_enter`,
+`should_exit`, `on_tick` — currently return "do nothing", and that is the
+only place where trading decisions belong.
 
 ```bash
-pip install websockets          # orjson optional (faster)
-python edge_bot.py --coin btc --order-latency-ms 200
+python trader.py                        # dry-run, BTC, no trades yet
+python trader.py --record market.jsonl  # record the market for replay
+python replay.py market.jsonl           # run a strategy over the recording
+python stats.py                         # read the trade journal
 ```
-
-Guards against false edges: a warmup period (σ/offsets settle), both books must
-have a snapshot, and the freshness filter rejects persistent gaps (which are
-usually the model being wrong, not a real stale quote).
 
 ---
 

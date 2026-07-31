@@ -8,7 +8,7 @@
   │    цены как на сайте      ├───────────────────────────┤
   │                           │ 3. КНИГА (book_monitor)   │
   ├───────────────────────────┴───────────────────────────┤
-  │ 4. СКАЧКОВАЯ СИСТЕМА (jump_trader) — сделки           │
+  │ 4. ТОРГОВЛЯ (trader.py) — сделки           │
   └───────────────────────────────────────────────────────┘
   ▏ОБЩЕЕ СОСТОЯНИЕ: BTC … цель … diff … | Up …/… Down …/… | поз … P&L … ▕
 
@@ -16,7 +16,7 @@
 данным, что и остальные три (цена из fast_monitor, книга из book_monitor,
 таргет раунда с Polymarket), и на резком скачке цены сама открывает сделку.
 По умолчанию — dry-run (симуляция, без реальных ордеров); реальные ордера
-только с --live. Правила сделок — в JUMP.md.
+только с --live. Логика сделок — flowbot/strategy.py.
 
 ╔══ ПОЧЕМУ СКОРОСТЬ И ТОЧНОСТЬ НЕ ПОСТРАДАЛИ ══════════════════════════════╗
 ║ Системы остаются ОТДЕЛЬНЫМИ процессами ОС — их код не изменён и НЕ слит  ║
@@ -37,11 +37,11 @@
 Запуск:
     python dashboard.py                  # btc, 4 панели, торговля в dry-run
     python dashboard.py --coin eth       # другая монета во всех системах
-    python dashboard.py --no-jump        # только три монитора, без торговли
+    python dashboard.py --no-trade        # только три монитора, без торговли
     python dashboard.py --no-trader      # без зеркала Polymarket
     python dashboard.py --trader-bot     # вместо зеркала — старый бот run.py
     python dashboard.py --live           # РЕАЛЬНЫЕ деньги (нужны креды)
-    python dashboard.py --stake 2        # ставка скачковой системы, USDC
+    python dashboard.py --stake 2        # размер входа, USDC
     python dashboard.py --layout grid    # другая раскладка панелей
 Клавиши: q или Ctrl-C — выход;  1/2/3/4 — развернуть панель на весь экран;
          0 — вернуть все панели;  p — пауза прокрутки.
@@ -232,8 +232,8 @@ class Shared:
         self.bal = self.bought = None
         self.signal = ""
         self.last_trade = ""
-        # 4-я система (скачковая): позиция, вложено за раунд, P&L, скачок
-        self.j_pos = self.j_spent = self.j_bal = self.j_pnl = self.j_jump = None
+        # Торговая панель: позиция, вложено за раунд, P&L, баланс
+        self.j_pos = self.j_spent = self.j_bal = self.j_pnl = None
 
     # регулярки построены по реальному формату вывода трёх систем
     RE_PRICE = re.compile(r"BTC|ETH|SOL|XRP|DOGE")
@@ -251,9 +251,8 @@ class Shared:
     RE_TR_BOOK = re.compile(
         r"Up px=[\d.]+ \(bid ([\d.]+)/ask ([\d.]+)\).*?"
         r"Down px=[\d.]+ \(bid ([\d.]+)/ask ([\d.]+)\)")
-    # Строка состояния скачковой системы (jump_engine._log_status):
-    #   … | скачок +2.30$/3с | … | поз A0:Up@0.60×1.7 | вложено $1.00 | $99.00 | …
-    RE_J_JUMP = re.compile(r"скачок\s+([-+][\d.]+)\$")
+    # Строка состояния торговой панели (trading._log_status):
+    #   … | поз #0:Up@0.60×1.7 | вложено $1.00 | $99.00 | …
     # «вложено» бывает ОТРИЦАТЕЛЬНЫМ (раунд уже в плюсе) — минус обязателен
     # в шаблоне, иначе строка не разберётся и в статусе застынут старые числа.
     RE_J_POS = re.compile(
@@ -301,10 +300,7 @@ class Shared:
                     if m and self.up_bid is None:
                         self.up_bid, self.up_ask = m.group(1), m.group(2)
                         self.dn_bid, self.dn_ask = m.group(3), m.group(4)
-                elif key == "jump":
-                    m = self.RE_J_JUMP.search(line)
-                    if m:
-                        self.j_jump = m.group(1)
+                elif key == "trade":
                     m = self.RE_J_POS.search(line)
                     if m:
                         self.j_pos = m.group(1)
@@ -330,18 +326,16 @@ class Shared:
             sig = f" СИГНАЛ:{self.signal}" if self.signal else ""
             trd = f" | сделка {self.last_trade}" if self.last_trade else ""
             # Хвост от торгующей системы: что держим, сколько вложено, итог.
-            jump = []
-            if self.j_jump is not None:
-                jump.append(f"скачок {self.j_jump}$")
+            bits = []
             if self.j_pos is not None:
-                jump.append(f"поз {self.j_pos}")
+                bits.append(f"поз {self.j_pos}")
             if self.j_spent not in (None, "0.00") and not self.j_spent.startswith("-"):
-                jump.append(f"влож ${self.j_spent}")
+                bits.append(f"влож ${self.j_spent}")
             if self.j_pnl is not None:
-                jump.append(f"P&L {self.j_pnl}")
+                bits.append(f"P&L {self.j_pnl}")
             if self.j_bal is not None:
-                jump.append(f"${self.j_bal}")
-            jtail = f" │ {' '.join(jump)}" if jump else ""
+                bits.append(f"${self.j_bal}")
+            jtail = f" │ {' '.join(bits)}" if bits else ""
         tail = f" │ {bal} {pos}".rstrip() if (bal or pos) else ""
         s = (f" {p} │ {tgt} │ ост {left} │ {pup} │ {up}  {dn}"
              f"{tail}{sig}{trd}{jtail}")
@@ -548,16 +542,16 @@ def parse_env_file(path: str) -> dict:
 TRADER_BOT = False   # --trader-bot: вернуть старую панель run.py
 
 
-def build_jump_pane(coin: str, live: bool, stake, max_round,
-                    record=None, entry_mode=None) -> Pane:
-    """4-я система: скачковая лестница. Единственная, кто реально торгует.
+def build_trade_pane(coin: str, live: bool, stake, max_round,
+                    record=None) -> Pane:
+    """Торговая панель — единственная, которая реально отправляет ордера.
 
     Работает поверх тех же источников, что и первые три панели (фиды
     fast_monitor, книга book_monitor, таргет раунда с Polymarket), но своим
     процессом и своими соединениями — чтобы отрисовка окна не могла её
     притормозить.
     """
-    argv = [PY, "-u", "jump_trader.py", "--coin", coin]
+    argv = [PY, "-u", "trader.py", "--coin", coin]
     argv += ["--live"] if live else ["--dry-run"]
     if stake is not None:
         argv += ["--stake", str(stake)]
@@ -565,17 +559,15 @@ def build_jump_pane(coin: str, live: bool, stake, max_round,
         argv += ["--max-round", str(max_round)]
     if record:
         argv += ["--record", record]
-    if entry_mode:
-        argv += ["--entry-mode", entry_mode]
-    how = f", вход по «{entry_mode}»" if entry_mode else ""
-    title = (f"СДЕЛКИ — скачковая система ({coin.upper()}, "
+    how = ""
+    title = (f"СДЕЛКИ ({coin.upper()}, "
              f"{'LIVE' if live else 'dry-run'}{how})")
-    return Pane("jump", title, argv, None, PANE_COLORS[3])
+    return Pane("trade", title, argv, None, PANE_COLORS[3])
 
 
 def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int,
-                include_jump: bool = True, stake=None, max_round=None,
-                record=None, entry_mode=None):
+                include_trade: bool = True, stake=None, max_round=None,
+                record=None):
     price = Pane("price", f"ЦЕНА — fast_monitor ({coin.upper()})",
                  [PY, "-u", "fast_monitor.py", "--coin", coin, "--auto-target"],
                  None, PANE_COLORS[0])
@@ -611,8 +603,8 @@ def build_panes(coin: str, live: bool, include_trader: bool, book_depth: int,
     # КНИГА — в правую нижнюю, СДЕЛКИ — широкой полосой внизу. Цвет закреплён
     # за системой, а не за местом.
     panes = [trader, price, book] if trader is not None else [price, book]
-    if include_jump:
-        panes.append(build_jump_pane(coin, live, stake, max_round, record))
+    if include_trade:
+        panes.append(build_trade_pane(coin, live, stake, max_round, record))
     return panes
 
 
@@ -631,21 +623,15 @@ def main(argv=None) -> int:
                     help="в первой панели показать торговый бот run.py вместо зеркала Polymarket")
     ap.add_argument("--no-trader", action="store_true",
                     help="убрать зеркало Polymarket (оставить цену + книгу)")
-    ap.add_argument("--no-jump", action="store_true",
+    ap.add_argument("--no-trade", action="store_true",
                     help="не запускать 4-ю (торгующую) систему — только показ")
     ap.add_argument("--stake", type=float,
-                    help="ставка скачковой системы, USDC (по умолч. 1)")
+                    help="размер входа, USDC (по умолч. 1)")
     ap.add_argument("--max-round", type=float,
-                    help="потолок вложений скачковой системы за раунд, USDC "
-                         "(по умолч. 25)")
-    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
-                    help="повод для входа 4-й системы: jump — скачок цены "
-                         "(деф.), edge — запас Phi(z)−ask, lag — отставание "
-                         "якоря Polymarket. Разные режимы = разные замки и "
-                         "разные файлы, их можно держать запущенными разом")
+                    help="потолок вложений за раунд, USDC (по умолч. 25)")
     ap.add_argument("--record", metavar="FILE",
                     help="писать всё, что видит торгующая система, в JSONL "
-                         "(потом: python replay.py FILE / features.py FILE)")
+                         "(потом: python replay.py FILE)")
     ap.add_argument("--layout", choices=["columns", "grid"], default="columns",
                     help="раскладка: columns (как на фото) или grid")
     ap.add_argument("--book-depth", type=int, default=1,
@@ -662,9 +648,9 @@ def main(argv=None) -> int:
     global TRADER_BOT
     TRADER_BOT = args.trader_bot
     panes = build_panes(args.coin, args.live, not args.no_trader,
-                        args.book_depth, include_jump=not args.no_jump,
+                        args.book_depth, include_trade=not args.no_trade,
                         stake=args.stake, max_round=args.max_round,
-                        record=args.record, entry_mode=args.entry_mode)
+                        record=args.record)
 
     # --- самопроверка раскладки без запуска процессов ---
     if args.selftest:
@@ -678,10 +664,10 @@ def main(argv=None) -> int:
         STATE.feed("book", "Δтоп   Up   bid 0.44×11  ask 0.45×35")
         STATE.feed("book", "Δтоп   Down bid 0.55×35  ask 0.56×11")
         STATE.feed("trader", "t-289s | bal $50.00 | bought=False")
-        STATE.feed("jump", "t-176s | BTC 63,976 цель 63,978 | скачок +6.40$/3с "
+        STATE.feed("trade", "t-176s | BTC 63,976 цель 63,978 "
                            "| Up 0.44/0.45 Down 0.55/0.56 | поз A0:Up@0.45×2.2 "
                            "| вложено $1.00 | $99.00 | держу до расчёта")
-        STATE.feed("jump", "ПРОДАНО (фиксация) [#0] Up — P&L +0.31 "
+        STATE.feed("trade", "ПРОДАНО (фиксация) [#0] Up — P&L +0.31 "
                            "(раунд +0.31, итого +0.31)")
         sys.stdout.write(CLEAR_ALL
                          + render(panes, args.coin, args.layout, 0, False, size)

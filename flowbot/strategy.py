@@ -1,242 +1,216 @@
-"""Ядро стратегии flowbot — ЧИСТАЯ логика входа/удержания/выхода, без I/O.
+"""ЧИСТЫЙ ЛИСТ: сюда пишется новая торговая стратегия.
 
-Ровно то, что описал пользователь:
+Здесь нет ни одного торгового правила. Ни порогов, ни фильтров, ни оценок,
+ни условий входа и выхода. Всё это удалено вместе с прежней стратегией.
 
-  ВХОД. Если по цене BTC (быстрый слой бирж) произошло РЕЗКОЕ ДВИЖЕНИЕ и
-  «проценты» Up/Down ещё могут измениться в нашу сторону — покупаем ту
-  сторону, КУДА пошла цена (вверх => Up, вниз => Down), по текущему ask.
+Что здесь есть и почему это НЕ стратегия:
 
-  Предосторожность №1 (не успели по доскачковому проценту). Если книга
-  уже поехала (например, Down был 56, а сейчас дороже), догоняем, но не
-  дороже, чем ref + 1-2 цента. Ушло дальше — вход пропускаем.
+  * `Snapshot` — форма, в которой движок отдаёт СЫРОЙ рынок: цены, книга,
+    таргет, время. Никаких производных величин (волатильности, скоростей,
+    импульсов, перекосов) — если новой стратегии что-то из этого нужно, она
+    считает это сама и хранит у себя.
+  * `Leg` и учёт позиции — это память о СОБСТВЕННЫХ действиях, а не решение.
+    Движку нужно знать, чем он владеет и сколько потратил, чтобы продавать,
+    сверяться с биржей и считать P&L.
+  * `Action` — словарь того, что движок умеет исполнить.
 
-  УДЕРЖАНИЕ. Держим позицию, пока (а) «процент» купленной стороны растёт и
-  (б) движение цены BTC, из-за которого мы вошли, ПРОДОЛЖАЕТ идти туда же.
-  Как только одно из двух ломается (и это подтверждается grace-периодом) —
-  выходим.
+Решения принимают три метода: `should_enter`, `should_exit` и `on_tick`.
+Сейчас они возвращают «ничего не делать». Это единственное место, куда
+нужно писать новую логику.
 
-  Предосторожность №2 (резкий разворот). Если после покупки цена резко и
-  СИЛЬНО пошла в противоположную сторону — сразу берём противоположную
-  сторону на $3-4, а свою продаём как можно раньше.
+Контракт с движком:
 
-Модуль не знает ни про сеть, ни про трейдера: он принимает снимок рынка и
-возвращает действие. Реальные исполнения (с задержкой из-за пинга) делает
-движок и сообщает сюда через record_entry/record_exit. Благодаря этому вся
-логика решений покрывается юнит-тестами без сети и без ключей.
+    act = strategy.on_tick(snapshot)     # каждое событие книги
+    -> Action(NONE)                      # ничего не делать
+    -> Action(BUY,  outcome=..., limit_price=..., size_usdc=...)
+    -> Action(SELL, sell_idx=..., sell_outcome=..., limit_price=...)
+
+    strategy.record_entry(...)           # движок сообщает о факте покупки
+    strategy.record_sell(...)            # и о факте продажи
+    strategy.reset_round()               # начало нового 5-минутного окна
+
+Движок сам следит за исполнением, таймаутами, частичными филлами и сверкой
+с биржей. Стратегии об этом знать не нужно — она видит рынок и свою
+позицию, и отвечает, что делать.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
-# Виды действий
-ENTER = "enter"     # купить сторону outcome по limit_price на size_usdc
-EXIT = "exit"       # продать текущую позицию (sell_outcome) по sell_limit
-FLIP = "flip"       # продать текущую и купить противоположную (разворот)
-HOLD = "hold"       # держать
-NONE = "none"       # ничего не делать (позиции нет)
+# --- что движок умеет исполнить ---------------------------------------------
+NONE = "none"       # ничего не делать
+BUY = "buy"         # купить сторону
+SELL = "sell"       # продать конкретную ногу
+HOLD = "hold"       # позиция есть, трогать её не надо
 
 
 @dataclass
-class MarketSnapshot:
-    """Снимок рынка на один такт (всё, что нужно для решения)."""
-    t: float                         # монотонное время, сек
-    seconds_left: float              # до конца 5-минутного окна
-    btc_price: Optional[float]
-    burst_z: float                   # знаковый всплеск скорости в σ (+вверх/-вниз)
-    move_bps: float                  # знаковое движение за горизонт, б.п.
+class Snapshot:
+    """Сырой рынок на один такт. Производных величин здесь нет намеренно."""
+
+    t: float                              # монотонное время, секунды
+    seconds_left: float                   # до конца 5-минутного окна
+    coin_price: Optional[float]           # консенсусная цена монеты
+    target: Optional[float]               # openPrice раунда
     up_bid: Optional[float] = None
     up_ask: Optional[float] = None
     down_bid: Optional[float] = None
     down_ask: Optional[float] = None
-    up_ask_ref: Optional[float] = None    # ask Up «до скачка» (lookback назад)
-    down_ask_ref: Optional[float] = None
-    up_flow: float = 0.0             # имбаланс потока Up в [-1,1] (>0 = давят вверх)
-    down_flow: float = 0.0
+    # Цена, по которой считает раунд САМА площадка (якорь Chainlink).
+    pm_price: Optional[float] = None
+    pm_age_ms: Optional[float] = None
+    # Движок сейчас не пропустит покупку (пауза после отказа биржи).
+    # Стратегия обязана это учитывать, если её выход рассчитывает на покупку.
+    entries_paused: bool = False
+
+    def bid(self, outcome: str) -> Optional[float]:
+        return self.up_bid if outcome == "Up" else self.down_bid
+
+    def ask(self, outcome: str) -> Optional[float]:
+        return self.up_ask if outcome == "Up" else self.down_ask
+
+
+@dataclass
+class Leg:
+    """Одна купленная позиция: память о собственной сделке, не решение."""
+
+    outcome: str                          # "Up" | "Down"
+    entry_price: float                    # уплаченный ask
+    shares: float
+    cost: float
+    entry_t: float
+    idx: int                              # порядковый номер в раунде
+    # Бид в момент входа. Спред между ним и уплаченным ask — стоимость входа,
+    # а не движение рынка против нас. Любой расчёт «пошло против» должен
+    # считаться от него, иначе сработает в тот же тик на каждой сделке.
+    entry_bid: float = 0.0
+    # Свободное место под признаки сигнала: что стратегия положит сюда при
+    # входе, то и попадёт в журнал при закрытии. Движок в содержимое не
+    # заглядывает.
+    feat: Dict = field(default_factory=dict)
 
 
 @dataclass
 class Action:
     kind: str
     reason: str = ""
-    outcome: Optional[str] = None        # что КУПИТЬ (enter/flip)
-    limit_price: Optional[float] = None  # потолок покупки / (для sell) пол продажи
-    size_usdc: Optional[float] = None
-    sell_outcome: Optional[str] = None   # что ПРОДАТЬ (exit/flip)
-    sell_limit: Optional[float] = None
+    outcome: Optional[str] = None         # что купить
+    limit_price: Optional[float] = None   # потолок покупки / пол продажи
+    size_usdc: Optional[float] = None     # сколько купить, в долларах
+    sell_idx: Optional[int] = None        # какую ногу продать
+    sell_outcome: Optional[str] = None
+    feat: Dict = field(default_factory=dict)   # признаки сигнала для журнала
 
 
-@dataclass
-class Position:
-    outcome: str                     # "Up" | "Down"
-    entry_price: float
-    size_usdc: float
-    entry_t: float
-    peak_bid: float                  # максимум «процента» с момента входа
-    fade_since: Optional[float] = None
-    is_flip: bool = False
+def opposite(outcome: str) -> str:
+    return "Down" if outcome == "Up" else "Up"
 
 
-def _fav_dir(outcome: str) -> float:
-    """Направление движения BTC, ВЫГОДНОЕ для стороны: Up->+1, Down->-1."""
-    return 1.0 if outcome == "Up" else -1.0
+class Strategy:
+    """Пустая стратегия: смотрит рынок и не делает ничего.
 
-
-class FlowStrategy:
-    """Стейт-машина позиции. Чистая: без сети, без трейдера."""
+    Учёт позиции (`legs`, `net_out`) остался — он нужен движку, чтобы
+    продавать и сверяться с биржей. Решения — ниже, в трёх методах, и они
+    пустые.
+    """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.position: Optional[Position] = None
+        self.legs: List[Leg] = []
+        # Чистый отток кэша за раунд: куплено минус продано.
+        self.net_out = 0.0
+        self._next_idx = 0
 
-    # -- колбэки исполнения (зовёт движок по факту филла) ---------------------
-    def record_entry(self, outcome: str, price: float, size_usdc: float,
-                     t: float, is_flip: bool = False) -> None:
-        self.position = Position(
-            outcome=outcome, entry_price=price, size_usdc=size_usdc,
-            entry_t=t, peak_bid=price, is_flip=is_flip,
-        )
+    # ======================================================================
+    #  РЕШЕНИЯ — сюда пишется новая стратегия
+    # ======================================================================
+    def should_enter(self, s: Snapshot) -> Optional[Action]:
+        """Открывать ли позицию. Зовётся, только когда позиции нет.
 
-    def record_exit(self) -> None:
-        self.position = None
+        Вернуть Action(BUY, outcome="Up"|"Down", limit_price=ask,
+        size_usdc=...) чтобы купить, или None чтобы пропустить такт.
+        """
+        return None
 
-    # -- основной такт ---------------------------------------------------------
-    def on_tick(self, s: MarketSnapshot) -> Action:
-        if self.position is None:
-            return self._maybe_enter(s)
-        return self._manage(s)
+    def should_exit(self, s: Snapshot, leg: Leg) -> Optional[Action]:
+        """Закрывать ли эту ногу. Зовётся по каждой открытой ноге.
 
-    # -- вход ------------------------------------------------------------------
-    def _maybe_enter(self, s: MarketSnapshot) -> Action:
-        c = self.cfg
-        if s.btc_price is None:
-            return Action(NONE, "нет цены BTC")
-        if s.seconds_left <= c.settle_hold_s:
-            return Action(NONE, f"конец окна {s.seconds_left:.0f}s — "
-                                f"новые входы не открываю")
+        Вернуть Action(SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
+        limit_price=bid) чтобы продать, или None чтобы держать.
+        """
+        return None
 
-        sharp = (abs(s.burst_z) >= c.entry_burst_z
-                 and abs(s.move_bps) >= c.entry_min_move_bps)
-        if not sharp:
-            return Action(NONE, f"нет резкого движения (z={s.burst_z:+.2f}<"
-                                f"{c.entry_burst_z:.2f} или move="
-                                f"{s.move_bps:+.2f}б.п.)")
+    def on_tick(self, s: Snapshot) -> Action:
+        """Один такт. Только диспетчер: сам ничего не решает.
 
-        up = s.burst_z > 0
-        if up:
-            side, ask, ref, flow = "Up", s.up_ask, s.up_ask_ref, s.up_flow
-        else:
-            side, ask, ref, flow = "Down", s.down_ask, s.down_ask_ref, s.down_flow
+        Порядок намеренно простой — сначала выходы по открытым ногам, потом
+        вход, если позиции нет. Новая стратегия вольна переопределить этот
+        метод целиком, если ей нужен другой порядок.
+        """
+        for leg in list(self.legs):
+            act = self.should_exit(s, leg)
+            if act is not None:
+                return act
+        if not self.legs:
+            act = self.should_enter(s)
+            if act is not None:
+                return act
+            return Action(NONE, "стратегия не задана")
+        return Action(HOLD, "стратегия не задана")
 
-        if ask is None:
-            return Action(NONE, f"{side}: нет ask в книге")
-        if not (c.entry_price_min <= ask <= c.entry_price_max):
-            return Action(NONE, f"{side} ask {ask:.2f} вне диапазона входа "
-                                f"[{c.entry_price_min:.2f},{c.entry_price_max:.2f}]")
+    # ======================================================================
+    #  Учёт позиции — движок сообщает сюда о фактах исполнения
+    # ======================================================================
+    def reset_round(self) -> None:
+        """Новое 5-минутное окно: позиция и счётчики с нуля."""
+        self.legs = []
+        self.net_out = 0.0
+        self._next_idx = 0
 
-        # Предосторожность №1: догоняем не дороже, чем доскачковый ask + chase.
-        limit = ask
-        if ref is not None:
-            cap = ref + c.chase_cents
-            if ask > cap + 1e-9:
-                return Action(NONE, f"{side}: книга ушла — ask {ask:.2f} > "
-                                    f"доскачкового {ref:.2f}+{c.chase_cents:.2f} "
-                                    f"(вход пропущен)")
-            limit = cap   # готовы платить до cap; FAK исполнит по ask (<= cap)
+    def record_entry(self, outcome: str, price: float, shares: float,
+                     cost: float, t: float,
+                     entry_bid: Optional[float] = None,
+                     feat: Optional[Dict] = None) -> Leg:
+        leg = Leg(outcome=outcome, entry_price=price, shares=shares,
+                  cost=cost, entry_t=t, idx=self._next_idx,
+                  entry_bid=entry_bid if entry_bid is not None else price,
+                  feat=dict(feat or {}))
+        self._next_idx += 1
+        self.legs.append(leg)
+        self.net_out += cost
+        return leg
 
-        # Мягкое вето по потоку заявок: не лезем против сильного давления.
-        if c.flow_confirm and flow < c.flow_veto:
-            return Action(NONE, f"{side}: поток заявок против нас "
-                                f"({flow:+.2f} < {c.flow_veto:+.2f})")
+    def record_partial_sell(self, idx: int, shares_sold: float,
+                            proceeds: float, t: float) -> None:
+        """Продалась ЧАСТЬ ноги — уменьшаем её, а не закрываем.
 
-        return Action(
-            ENTER, outcome=side, limit_price=round(limit, 2),
-            size_usdc=c.stake_usdc,
-            reason=(f"резкое {'ВВЕРХ' if up else 'ВНИЗ'} z={s.burst_z:+.2f} "
-                    f"({s.move_bps:+.2f}б.п.); {side} ask {ask:.2f} лимит "
-                    f"{limit:.2f}, поток {flow:+.2f}"),
-        )
+        Так бывает только в бою: ордер уходит как FAK, и если в книге на
+        нашей цене лежало меньше, чем мы продаём, остаток отменяется. Нога
+        никуда не девается — шэры всё ещё у нас, и забыть про них нельзя.
+        """
+        for lg in self.legs:
+            if lg.idx != idx:
+                continue
+            # Усечение ВНИЗ, а не round: остаток — это «сколько ещё можно
+            # продать», и он не имеет права вырасти от арифметики.
+            lg.shares = max(0.0, floor2(lg.shares - shares_sold))
+            lg.cost = round(lg.entry_price * lg.shares, 2)
+            if lg.shares <= 0:
+                self.legs = [x for x in self.legs if x.idx != idx]
+            break
+        self.net_out -= proceeds
 
-    # -- управление открытой позицией -----------------------------------------
-    def _manage(self, s: MarketSnapshot) -> Action:
-        c = self.cfg
-        pos = self.position
-        assert pos is not None
-        fav = _fav_dir(pos.outcome)
+    def record_sell(self, idx: int, proceeds: float, t: float) -> None:
+        self.legs = [lg for lg in self.legs if lg.idx != idx]
+        self.net_out -= proceeds
 
-        if pos.outcome == "Up":
-            bid, opp, opp_ask = s.up_bid, "Down", s.down_ask
-        else:
-            bid, opp, opp_ask = s.down_bid, "Up", s.up_ask
-
-        if bid is not None and bid > pos.peak_bid:
-            pos.peak_bid = bid
-        held = s.t - pos.entry_t
-        z_fav = s.burst_z * fav          # >0 = движение в нашу сторону
-
-        # Предосторожность №2 — разворот: сильный всплеск ПРОТИВ нас.
-        if (c.flip_enabled and held >= c.min_hold_s
-                and z_fav <= -c.flip_burst_z
-                and abs(s.move_bps) >= c.flip_min_move_bps):
-            return Action(
-                FLIP, outcome=opp,
-                limit_price=(round(opp_ask + c.chase_cents, 2)
-                             if opp_ask is not None else None),
-                size_usdc=c.flip_size_usdc,
-                sell_outcome=pos.outcome,
-                sell_limit=(round(bid, 2) if bid is not None else None),
-                reason=(f"РАЗВОРОТ: сильное движение против {pos.outcome} "
-                        f"(z={s.burst_z:+.2f}, {s.move_bps:+.2f}б.п.); беру "
-                        f"{opp} на ${c.flip_size_usdc:.1f}, {pos.outcome} продаю"),
-            )
-
-        # Не дёргаемся первые доли секунды (пинг мог дать шумный первый тик).
-        if held < c.min_hold_s:
-            return Action(HOLD, f"мин. удержание {held:.2f}<{c.min_hold_s:.2f}s")
-
-        # Глубоко в деньгах — едем до расчёта (сеттл платит $1/шт).
-        if bid is not None and bid >= c.take_profit_price:
-            pos.fade_since = None
-            return Action(HOLD, f"глубоко в деньгах ({pos.outcome} bid {bid:.2f})"
-                                f" — держу до расчёта")
-
-        # Конец окна: выигрываем — держим до сеттла; проигрываем — спасаем кэш.
-        if s.seconds_left <= c.settle_hold_s:
-            if bid is not None and bid >= 0.5:
-                return Action(HOLD, f"конец окна {s.seconds_left:.0f}s, "
-                                    f"{pos.outcome} bid {bid:.2f}>=0.50 — держу")
-            return self._exit(pos, bid, f"конец окна {s.seconds_left:.0f}s и "
-                                        f"проигрываем — выхожу спасать деньги")
-
-        # Движение ещё идёт И «процент» ещё растёт?
-        mom_ok = z_fav >= c.hold_burst_z
-        token_ok = bid is not None and bid >= (pos.peak_bid - c.token_retrace_exit)
-        if mom_ok and token_ok:
-            pos.fade_since = None
-            return Action(HOLD, f"движение идёт (z*dir={z_fav:+.2f}) и % растёт "
-                                f"({pos.outcome} bid {_p(bid)} пик "
-                                f"{pos.peak_bid:.2f})")
-
-        # Фейд: подтверждаем grace-периодом, чтобы не выйти на одном тике.
-        if pos.fade_since is None:
-            pos.fade_since = s.t
-        if s.t - pos.fade_since < c.momentum_fade_grace_s:
-            return Action(HOLD, f"фейд {s.t - pos.fade_since:.2f}<"
-                                f"{c.momentum_fade_grace_s:.2f}s — жду подтверждения")
-
-        why = []
-        if not mom_ok:
-            why.append(f"движение выдохлось (z*dir={z_fav:+.2f}<{c.hold_burst_z:.2f})")
-        if not token_ok:
-            why.append(f"% откатился ({pos.outcome} bid {_p(bid)} < пик "
-                       f"{pos.peak_bid:.2f}-{c.token_retrace_exit:.2f})")
-        return self._exit(pos, bid, "; ".join(why))
-
-    def _exit(self, pos: Position, bid: Optional[float], reason: str) -> Action:
-        return Action(EXIT, sell_outcome=pos.outcome,
-                      sell_limit=(round(bid, 2) if bid is not None else None),
-                      reason=reason)
+    @property
+    def debt(self) -> float:
+        """Сколько кэша надо отбить (0, если раунд уже в плюсе)."""
+        return max(0.0, self.net_out)
 
 
-def _p(x: Optional[float]) -> str:
-    return "—" if x is None else f"{x:.2f}"
+def floor2(x: float) -> float:
+    """Усечение вниз до сотых. Продать больше, чем лежит, физически нельзя."""
+    return int(x * 100) / 100.0

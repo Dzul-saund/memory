@@ -8,10 +8,10 @@
   3) pm_view.py       — ЗЕРКАЛО POLYMARKET: цена, Целевая цена и UP/DOWN
                         в центах ровно как на сайте, БЕЗ торговли
                         (старый торговый бот run.py: флаг --trader-bot)
-  4) jump_trader.py   — СКАЧКОВАЯ СИСТЕМА: единственная, кто реально
+  4) trader.py   — ТОРГОВЛЯ: единственная панель, которая реально
                         торгует. Подключена к тем же данным, что и первые
-                        три. По умолчанию dry-run; правила — в JUMP.md,
-                        выключить — флаг --no-jump.
+                        три. По умолчанию dry-run; стратегия — flowbot/strategy.py,
+                        выключить — флаг --no-trade.
 
 ╔══ ГЛАВНОЕ: скорость и точность НЕ трогаем ═══════════════════════════════╗
 ║ Каждая — ОТДЕЛЬНЫЙ процесс операционной системы. Мы НИЧЕГО в них не      ║
@@ -35,7 +35,7 @@
     python launch_all.py                     # btc, торговля в dry-run
     python launch_all.py --coin eth          # то же для ETH (пресет bot2.env)
     python launch_all.py --restart           # + авто-подъём упавшей системы
-    python launch_all.py --no-jump           # без торговли, только мониторы
+    python launch_all.py --no-trade           # без торговли, только мониторы
     python launch_all.py --no-trader         # без зеркала Polymarket
     python launch_all.py --trader-bot        # вместо зеркала — старый бот run.py
     python launch_all.py --live --stake 2    # РЕАЛЬНЫЕ деньги, ставка $2
@@ -67,7 +67,7 @@ TRADER_BOT = False   # --trader-bot: вернуть старую панель ru
 
 
 def build_commands(coin: str, live: bool, include_trader: bool,
-                   include_jump: bool = True, stake=None, max_round=None):
+                   include_trade: bool = True, stake=None, max_round=None):
     """Список (title, argv, env_overrides|None) — по одному на окно."""
     cmds = [
         ("Fast Monitor — цена",
@@ -75,15 +75,15 @@ def build_commands(coin: str, live: bool, include_trader: bool,
         ("Book Monitor — книга",
          [PY, "book_monitor.py", "--coin", coin], None),
     ]
-    if include_jump:
-        # 4-я система — единственная, кто реально торгует (см. JUMP.md).
-        jargv = [PY, "jump_trader.py", "--coin", coin]
+    if include_trade:
+        # 4-я система — единственная, кто реально торгует (flowbot/strategy.py).
+        jargv = [PY, "trader.py", "--coin", coin]
         jargv += ["--live"] if live else ["--dry-run"]
         if stake is not None:
             jargv += ["--stake", str(stake)]
         if max_round is not None:
             jargv += ["--max-round", str(max_round)]
-        cmds.append((f"Сделки — скачковая система "
+        cmds.append((f"Сделки "
                      f"({'LIVE' if live else 'dry-run'})", jargv, None))
     if include_trader:
         # Первая панель — ЗЕРКАЛО POLYMARKET (pm_view.py): цена, Целевая цена,
@@ -316,12 +316,12 @@ def main(argv=None) -> int:
                          "run.py вместо зеркала Polymarket")
     ap.add_argument("--no-trader", action="store_true",
                     help="запустить только два монитора (просто смотреть)")
-    ap.add_argument("--no-jump", action="store_true",
+    ap.add_argument("--no-trade", action="store_true",
                     help="не запускать 4-ю (торгующую) систему — только показ")
     ap.add_argument("--stake", type=float,
-                    help="ставка скачковой системы, USDC (по умолч. 1)")
+                    help="размер входа, USDC (по умолч. 1)")
     ap.add_argument("--max-round", type=float,
-                    help="потолок вложений скачковой системы за раунд, USDC")
+                    help="потолок вложений за раунд, USDC")
     ap.add_argument("--restart", action="store_true",
                     help="авто-подъём упавшей системы (организм лечит сам себя)")
     backend = ap.add_mutually_exclusive_group()
@@ -341,7 +341,7 @@ def main(argv=None) -> int:
     TRADER_BOT = args.trader_bot
     cmds = build_commands(args.coin, live=args.live,
                           include_trader=not args.no_trader,
-                          include_jump=not args.no_jump,
+                          include_trade=not args.no_trade,
                           stake=args.stake, max_round=args.max_round)
 
     print(f"=== launch_all: {args.coin.upper()} | "

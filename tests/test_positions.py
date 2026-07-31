@@ -16,7 +16,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flowbot.positions import reconcile, shares_from_balance  # noqa: E402
-from test_jump_engine import FakeTrader, _book, _engine  # noqa: E402
+from test_engine import FakeTrader, _book, _engine  # noqa: E402
 
 
 class TestParsing:
@@ -88,42 +88,22 @@ class TestEngineReconciliation:
         # Нога попала и в стратегию — иначе её никто не стал бы продавать.
         assert len(eng.strategy.legs) == 1
 
-    def _adopted(self, **cfg_kw):
-        """Нога, принятая с биржи, и цена, ушедшая против неё."""
-        from flowbot.jump import JumpSnapshot
+    def test_adopted_position_can_then_be_sold(self):
+        """Взяли под управление — значит ногу можно закрыть обычным путём.
 
-        eng, cfg = _live_engine(jump_stop_loss=0.01, **cfg_kw)
+        Ради этого сверка и нужна: позиция, о которой бот не знал, попадает
+        и в его учёт, и в учёт стратегии, иначе продавать было бы нечего.
+        """
+        eng, _ = _live_engine()
         eng.trader.position = lambda token: (
             {"balance": "2000000"} if token == "DNTOK" else {"balance": "0"})
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         asyncio.run(eng._reconcile())
-        _book(eng, 0.60, 0.61, 0.39, 0.40)
+        assert len(eng.strategy.legs) == 1
 
-        return eng.strategy.on_tick(JumpSnapshot(
-            t=time.time() + 5, seconds_left=200.0, coin_price=65_000.0,
-            target=65_000.0, jump_usd=0.0, sigma_1s=1.0,
-            up_bid=0.60, up_ask=0.61, down_bid=0.39, down_ask=0.40))
-
-    def test_adopted_position_is_then_managed_normally(self):
-        """Взяли под управление — дальше её ведут обычные выходы.
-
-        При нынешнем приоритете это РАЗВОРОТ: он тоже продаёт ногу, просто
-        одновременно берёт другую сторону. Проверяем именно то, ради чего
-        сверка и нужна, — принятая нога не висит без присмотра.
-        """
-        from flowbot.jump import LADDER
-
-        act = self._adopted()
-        assert act.kind == LADDER
-        assert act.sell_outcome == "Down", "принятая нога обязана продаваться"
-
-    def test_adopted_position_falls_to_the_stop_without_a_ladder(self):
-        """Разворачиваться не во что — принятую ногу закрывает стоп."""
-        from flowbot.jump import SELL
-
-        act = self._adopted(jump_ladder_enabled=False)
-        assert act.kind == SELL
-        assert act.sell_outcome == "Down"
+        ok = asyncio.run(eng._sell_leg(eng.legs[0]["idx"], None, "тест"))
+        assert ok is True
+        assert eng.legs == [] and eng.strategy.legs == []
 
     def test_drops_a_phantom_the_exchange_does_not_have(self):
         eng, _ = _live_engine()
@@ -131,9 +111,9 @@ class TestEngineReconciliation:
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         eng.legs.append({
             "idx": 0, "outcome": "Up", "token": "UPTOK", "entry_price": 0.52,
-            "shares": 2.0, "cost": 1.04, "track": "A", "last_bid": 0.51,
+            "shares": 2.0, "cost": 1.04, "last_bid": 0.51,
             "coin_at_entry": 65_000.0, "secs_at_entry": 100})
-        eng.strategy.record_entry("Up", 0.52, 2.0, 1.04, "A", time.time(),
+        eng.strategy.record_entry("Up", 0.52, 2.0, 1.04, time.time(),
                                   entry_bid=0.51)
 
         asyncio.run(eng._reconcile())
@@ -152,9 +132,9 @@ class TestEngineReconciliation:
         eng.trader.position = lambda token: {"balance": "0"}
         eng.legs.append({
             "idx": 0, "outcome": "Down", "token": "OLD-DNTOK",
-            "entry_price": 0.65, "shares": 2.0, "cost": 1.30, "track": "A",
+            "entry_price": 0.65, "shares": 2.0, "cost": 1.30, 
             "last_bid": 0.64, "coin_at_entry": 65_000.0, "secs_at_entry": 10})
-        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, "A", time.time(),
+        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, time.time(),
                                   entry_bid=0.64)
         _book(eng, 0.51, 0.52, 0.48, 0.49)
 
@@ -170,7 +150,7 @@ class TestEngineReconciliation:
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         eng.legs.append({
             "idx": 0, "outcome": "Up", "token": "UPTOK", "entry_price": 0.52,
-            "shares": 2.0, "cost": 1.04, "track": "A", "last_bid": 0.51,
+            "shares": 2.0, "cost": 1.04, "last_bid": 0.51,
             "coin_at_entry": 65_000.0, "secs_at_entry": 100})
         asyncio.run(eng._reconcile())
         assert len(eng.legs) == 1
@@ -191,9 +171,9 @@ class TestLeftoversFromFinishedRounds:
         _book(eng, 0.02, 0.03, 0.97, 0.98)      # книга схлопнулась: Down взял
         eng.legs.append({
             "idx": 0, "outcome": "Down", "token": "DNTOK", "entry_price": 0.65,
-            "shares": 2.0, "cost": 1.30, "track": "A", "last_bid": 0.97,
+            "shares": 2.0, "cost": 1.30, "last_bid": 0.97,
             "coin_at_entry": 65_000.0, "secs_at_entry": 10})
-        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, "A", time.time(),
+        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, time.time(),
                                   entry_bid=0.64)
         eng._settle_open_position("конец окна")
         return eng, cfg
@@ -268,7 +248,7 @@ class TestLeftoversFromFinishedRounds:
         assert "DNTOK" in eng._leftovers
 
     def test_warning_is_throttled(self):
-        eng, cfg = self._settled(jump_leftover_warn_s=120.0)
+        eng, cfg = self._settled(leftover_warn_s=120.0)
         eng.trader.position = lambda token: (
             {"balance": "2000000"} if token == "DNTOK" else {"balance": "0"})
         eng.market = dict(eng.market, up="UP2", down="DN2")
@@ -284,16 +264,16 @@ class TestLeftoversFromFinishedRounds:
 
     def test_leftover_shows_up_in_the_status_line(self):
         """Ровно то, чего не хватало на скриншоте: «поз —» рядом с позицией."""
-        from flowbot.jump import Action, HOLD
-        from flowbot.jump import JumpSnapshot
+        from flowbot.strategy import Action, HOLD
+        from flowbot.strategy import Snapshot
 
         eng, cfg = self._settled()
         cfg.status_log_interval_seconds = 0.0
         said = []
         eng.log.info = lambda *a, **k: said.append(a[0] % a[1:])
-        eng._log_status(JumpSnapshot(
+        eng._log_status(Snapshot(
             t=time.time(), seconds_left=100.0, coin_price=65_000.0,
-            target=65_000.0, jump_usd=0.0, sigma_1s=1.0,
+            target=65_000.0,
             up_bid=0.51, up_ask=0.52, down_bid=0.48, down_ask=0.49),
             Action(HOLD, reason="—"))
         assert any("ост 2.0" in line for line in said)
@@ -304,9 +284,9 @@ class TestLeftoversFromFinishedRounds:
         _book(eng, 0.02, 0.03, 0.97, 0.98)
         eng.legs.append({
             "idx": 0, "outcome": "Down", "token": "DNTOK", "entry_price": 0.65,
-            "shares": 2.0, "cost": 1.30, "track": "A", "last_bid": 0.97,
+            "shares": 2.0, "cost": 1.30, "last_bid": 0.97,
             "coin_at_entry": 65_000.0, "secs_at_entry": 10})
-        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, "A", time.time(),
+        eng.strategy.record_entry("Down", 0.65, 2.0, 1.30, time.time(),
                                   entry_bid=0.64)
         eng._settle_open_position("конец окна")
         assert eng._leftovers == {}
@@ -349,7 +329,7 @@ class TestShortBalanceOnSell:
         """round(0.0678 - 0.0, 2) давал 0.07 — нога РОСЛА после неудачи."""
         eng, _ = _live_engine()
         _book(eng, 0.51, 0.52, 0.48, 0.49)
-        eng.strategy.record_entry("Up", 0.57, 0.0678, 0.04, "A", time.time(),
+        eng.strategy.record_entry("Up", 0.57, 0.0678, 0.04, time.time(),
                                   entry_bid=0.56)
         eng.strategy.record_partial_sell(0, 0.0, 0.0, time.time())
         assert eng.strategy.legs[0].shares <= 0.0678
@@ -359,10 +339,10 @@ class TestShortBalanceOnSell:
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         eng.trader.position = lambda token: {"balance": "2500000"}   # 2.5 шэра
         leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
-               "entry_price": 0.57, "shares": 3.0, "cost": 1.71, "track": "A",
+               "entry_price": 0.57, "shares": 3.0, "cost": 1.71, 
                "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
         eng.legs.append(leg)
-        eng.strategy.record_entry("Up", 0.57, 3.0, 1.71, "A", time.time(),
+        eng.strategy.record_entry("Up", 0.57, 3.0, 1.71, time.time(),
                                   entry_bid=0.56)
 
         handled = asyncio.run(eng._fix_short_balance(
@@ -379,10 +359,10 @@ class TestShortBalanceOnSell:
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         eng.trader.position = lambda token: {"balance": str(self.RAW)}
         leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
-               "entry_price": 0.57, "shares": 0.07, "cost": 0.04, "track": "A",
+               "entry_price": 0.57, "shares": 0.07, "cost": 0.04, 
                "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
         eng.legs.append(leg)
-        eng.strategy.record_entry("Up", 0.57, 0.07, 0.04, "A", time.time(),
+        eng.strategy.record_entry("Up", 0.57, 0.07, 0.04, time.time(),
                                   entry_bid=0.56)
 
         handled = asyncio.run(eng._fix_short_balance(
@@ -399,7 +379,7 @@ class TestShortBalanceOnSell:
         eng, _ = _live_engine()
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
-               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, "track": "A",
+               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, 
                "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
         eng.legs.append(leg)
         assert asyncio.run(eng._fix_short_balance(leg, "503 service unavailable")) is False
@@ -411,15 +391,15 @@ class TestSellNeverLoopsForever:
 
     def _leg(self, eng):
         leg = {"idx": 0, "outcome": "Up", "token": "UPTOK",
-               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, "track": "A",
+               "entry_price": 0.57, "shares": 2.0, "cost": 1.14, 
                "last_bid": 0.51, "coin_at_entry": 65_000.0, "secs_at_entry": 100}
         eng.legs.append(leg)
-        eng.strategy.record_entry("Up", 0.57, 2.0, 1.14, "A", time.time(),
+        eng.strategy.record_entry("Up", 0.57, 2.0, 1.14, time.time(),
                                   entry_bid=0.56)
         return leg
 
     def test_leg_is_parked_after_n_consecutive_failures(self):
-        eng, cfg = _live_engine(jump_max_sell_fails=3)
+        eng, cfg = _live_engine(max_sell_fails=3)
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         leg = self._leg(eng)
         for i in range(2):
@@ -431,7 +411,7 @@ class TestSellNeverLoopsForever:
         assert "UPTOK" in eng._leftovers      # шэры не потеряны из вида
 
     def test_counter_resets_after_a_good_sell(self):
-        eng, _ = _live_engine(jump_max_sell_fails=3)
+        eng, _ = _live_engine(max_sell_fails=3)
         _book(eng, 0.51, 0.52, 0.48, 0.49)
         leg = self._leg(eng)
         eng._note_sell_failure(leg, "timeout")

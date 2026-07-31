@@ -1,18 +1,12 @@
-"""Асинхронный движок flowbot: фиды цены + книга + стратегия + трейдер.
+"""Базовый движок: фиды, окно раунда, поток книги, цикл, баланс, лог сделок.
 
-Собирает всё вместе:
+ЗДЕСЬ НЕТ ТОРГОВЫХ РЕШЕНИЙ. Этот класс отвечает только за то, чтобы бот жил:
+поднимает фиды цены, слушает поток CLOB, отслеживает границы 5-минутного
+окна, крутит главный цикл и не падает от одной ошибки. Что делать с рынком —
+решает стратегия, а исполняет `flowbot.trading.TradingEngine`.
 
-  * фиды цены из fast_monitor (7 бирж + якорь Polymarket) наполняют
-    консенсус; PriceEngine считает всплеск скорости;
-  * поток CLOB (тот же, что рисует «Книгу заявок» на сайте) наполняет
-    BookEngine — обе стороны Up/Down, доскачковый ask, поток заявок;
-  * каждый такт строится снимок рынка и отдаётся чистой стратегии;
-  * действия (вход/выход/разворот) исполняются трейдером через пул потоков,
-    чтобы не блокировать событийный цикл; в dry-run исполнение ЗАДЕРЖИВАЕТСЯ
-    на реалистичный пинг и цена берётся уже на момент «прилёта» ордера.
-
-Движок владеет ФАКТИЧЕСКОЙ позицией (шэры, стоимость, P&L); стратегия владеет
-логикой решений. По факту филла движок сообщает стратегии record_entry/exit.
+Разделение намеренное: инфраструктуру можно тестировать и чинить, не трогая
+логику, а логику переписывать с нуля, не боясь сломать сеть и ордера.
 """
 from __future__ import annotations
 
@@ -23,18 +17,15 @@ import time
 from typing import Optional
 
 import fast_monitor
-import book_monitor
 from book_monitor import CLOB_WS, WINDOW_SECONDS, discover_market, loads
 
 from btc_bot.config import Config as BtcConfig
 from btc_bot.trader import build_trader
 from btc_bot.tradelog import TradeLogger
-from btc_bot.util import floor2
 
 from .config import FlowConfig
 from .latency import LatencyModel
 from .signals import BookEngine, PriceEngine
-from .strategy import ENTER, EXIT, FLIP, FlowStrategy, MarketSnapshot
 
 try:
     import websockets
@@ -47,6 +38,8 @@ def now_ms() -> float:
 
 
 class FlowEngine:
+    """Инфраструктура бота. Торговую часть добавляет подкласс."""
+
     def __init__(self, cfg: FlowConfig, logger: Optional[logging.Logger] = None):
         self.cfg = cfg
         self.log = logger or logging.getLogger("flowbot")
@@ -54,7 +47,6 @@ class FlowEngine:
         self.price = PriceEngine(cfg)
         self.book = BookEngine(cfg)
         self.latency = LatencyModel(cfg, self.log)
-        self.strategy = FlowStrategy(cfg)
 
         # Трейдер (live/dry) поверх btc_bot: тот же CLOB-клиент и баланс.
         btc_cfg = BtcConfig.from_env()
@@ -64,8 +56,8 @@ class FlowEngine:
         self.trader = build_trader(btc_cfg, self.log)
         self.tradelog = TradeLogger(cfg.trade_log_csv)
 
-        self.market: Optional[dict] = None       # {up,down,window_ts,end_ts,slug,question}
-        self.pos: Optional[dict] = None           # фактическая позиция движка
+        # {up, down, window_ts, end_ts, slug, question}
+        self.market: Optional[dict] = None
         self.busy = False                         # ордер в полёте
         self._stop = False
         self.stop_reason: Optional[str] = None
@@ -120,11 +112,7 @@ class FlowEngine:
             self._summary()
 
     def _extra_tasks(self):
-        """Дополнительные фоновые корутины подкласса (по умолчанию — нет).
-
-        Скачковой стратегии нужен ещё и таргет раунда с Polymarket, обычному
-        flowbot — нет, поэтому лишний HTTP-опрос не поднимаем без нужды.
-        """
+        """Дополнительные фоновые корутины подкласса (по умолчанию — нет)."""
         return []
 
     async def _measure_ping(self) -> None:
@@ -133,7 +121,7 @@ class FlowEngine:
         self.log.info(self.latency.describe())
 
     # ======================================================================
-    #  Поток книги (Бот 2) — по одному 5-мин окну за раз
+    #  Поток книги — по одному 5-минутному окну за раз
     # ======================================================================
     async def _book_loop(self) -> None:
         while not self._stop:
@@ -164,11 +152,7 @@ class FlowEngine:
         return end_ts + 1.0
 
     def _book_resolved(self) -> bool:
-        """Книга уже схлопнулась к 0/1 (победитель раунда очевиден)?
-
-        База не умеет этого определять и всегда слушает до дедлайна.
-        Подкласс может прервать ожидание раньше.
-        """
+        """Книга уже схлопнулась к 0/1? База не умеет, подкласс может."""
         return False
 
     async def _stream_window(self, market: dict) -> None:
@@ -198,7 +182,7 @@ class FlowEngine:
                         # больше ждать нечего.
                         if time.time() >= end_ts and self._book_resolved():
                             return
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 - обрыв потока штатен
                 if time.time() >= deadline:
                     break
                 await asyncio.sleep(backoff)
@@ -221,7 +205,7 @@ class FlowEngine:
             fast_monitor.UPDATE_EVENT.set()   # разбудить цикл решений
 
     # ======================================================================
-    #  Главный цикл решений
+    #  Главный цикл
     # ======================================================================
     async def _run_loop(self, deadline: float) -> None:
         while time.time() < deadline and not self._stop:
@@ -246,183 +230,27 @@ class FlowEngine:
         if not self.stop_reason:
             self.stop_reason = "истекло время работы"
 
+    # ======================================================================
+    #  Точки расширения: их реализует торговый движок
+    # ======================================================================
     def _tick(self) -> None:
-        cfg = self.cfg
-        t_ms = now_ms()
-        self.price.update(t_ms)
-        price = self.price.price()
-        if self.market is None:
-            return
-        up, dn = self.market["up"], self.market["down"]
-        ub, ua = self.book.best(up)
-        db, da = self.book.best(dn)
-        burst_z, move_bps = self.price.burst()
+        """Один такт решения. База не торгует и ничего не делает."""
 
-        # запоминаем последний бид нашей стороны для сеттла
-        if self.pos is not None:
-            self.pos["last_bid"] = ub if self.pos["outcome"] == "Up" else db
-
-        snap = MarketSnapshot(
-            t=time.time(),
-            seconds_left=max(0.0, self.market["end_ts"] - time.time()),
-            btc_price=price, burst_z=burst_z, move_bps=move_bps,
-            up_bid=ub, up_ask=ua, down_bid=db, down_ask=da,
-            up_ask_ref=self.book.ask_ref(up, cfg.chase_lookback_s),
-            down_ask_ref=self.book.ask_ref(dn, cfg.chase_lookback_s),
-            up_flow=self.book.flow(up, cfg.flow_window_s),
-            down_flow=self.book.flow(dn, cfg.flow_window_s),
-        )
-
-        action = self.strategy.on_tick(snap)
-        self._log_status(snap, action)
-
-        if action.kind in (ENTER, EXIT, FLIP) and not self.busy:
-            self.busy = True
-            asyncio.create_task(self._execute(action))
-
-    # ======================================================================
-    #  Исполнение (с реалистичным пингом)
-    # ======================================================================
-    async def _execute(self, action) -> None:
-        try:
-            self.log.warning(">>> %s: %s", action.kind.upper(), action.reason)
-            if action.kind == ENTER:
-                await self._buy(action.outcome, action.limit_price,
-                                action.size_usdc, is_flip=False)
-            elif action.kind == EXIT:
-                await self._sell_current(action.sell_limit, "выход",
-                                         result="SOLD_EXIT")
-            elif action.kind == FLIP:
-                # Предосторожность №2: сначала «тут же» берём противоположную
-                # сторону (ловим разворот), ПОТОМ сбрасываем старую позицию.
-                old = self.pos
-                await self._buy(action.outcome, action.limit_price,
-                                action.size_usdc, is_flip=True)
-                await self._sell_position(old, action.sell_limit,
-                                          "разворот-выход",
-                                          result="SOLD_FLIP")
-        except Exception as exc:  # noqa: BLE001
-            self.log.error("исполнение упало: %s", exc)
-        finally:
-            self.busy = False
+    def _settle_open_position(self, reason: str) -> None:
+        """Закрыть учёт открытой позиции на границе окна."""
 
     async def _sim_latency(self) -> None:
+        """В dry-run честно подождать пинг, прежде чем «исполнить» ордер.
+
+        Без этого симуляция покупает по цене, которой в момент прилёта
+        ордера на биржу уже не было, и её результат систематически лучше
+        боевого.
+        """
         if self.cfg.dry_run and self.cfg.simulate_latency:
             await asyncio.sleep(self.latency.fill_delay_s)
 
-    async def _buy(self, outcome: str, limit_price: Optional[float],
-                   size_usdc: float, is_flip: bool) -> None:
-        if self.market is None:
-            return
-        token = self.market["up"] if outcome == "Up" else self.market["down"]
-        await self._sim_latency()   # книга могла уйти за время пинга
-        bid, ask = self.book.best(token)
-        if ask is None:
-            self.log.warning("ПОКУПКА %s не исполнена: нет ask", outcome)
-            return
-        if limit_price is not None and ask > limit_price + 1e-9:
-            self.log.warning(
-                "ПОКУПКА %s НЕ исполнена: ask %.2f > лимит %.2f — книга ушла "
-                "за пинг ~%.0fмс (предосторожность №1: не гонимся)",
-                outcome, ask, limit_price, self.latency.fill_delay_ms)
-            return
-        fill = round(ask, 2)
-        shares = floor2(size_usdc / fill)
-        if shares <= 0:
-            self.log.warning("ПОКУПКА %s: размер %.4f шэров <= 0, пропуск",
-                             outcome, shares)
-            return
-        cost = round(fill * shares, 2)
-        try:
-            resp = await asyncio.to_thread(self.trader.buy, token, fill, shares)
-        except Exception as exc:  # noqa: BLE001
-            self.log.error("ордер BUY упал: %s", exc)
-            return
-        self._invalidate_balance()
-        self.n_trades += 1
-        self.pos = {
-            "outcome": outcome, "token": token, "entry_price": fill,
-            "shares": shares, "cost": cost, "last_bid": bid,
-            "is_flip": is_flip, "btc_at_entry": self.price.price(),
-            "secs_at_entry": int(self.market["end_ts"] - time.time()),
-        }
-        self.strategy.record_entry(outcome, fill, size_usdc, time.time(),
-                                   is_flip=is_flip)
-        self.log.warning(
-            "КУПЛЕНО%s %s — %.2f шэр @ $%.2f (=$%.2f) | ответ: %s",
-            " (разворот)" if is_flip else "", outcome, shares, fill, cost,
-            _short(resp))
-
-    async def _sell_current(self, sell_limit: Optional[float],
-                            tag: str, result: str = "SOLD") -> None:
-        await self._sell_position(self.pos, sell_limit, tag, result)
-
-    async def _sell_position(self, pos: Optional[dict],
-                             sell_limit: Optional[float], tag: str,
-                             result: str = "SOLD") -> None:
-        """Продать конкретную позицию. Если это ТЕКУЩАЯ позиция движка —
-        обнулить её и сообщить стратегии о выходе; если старая (при флипе,
-        когда текущая уже стала противоположной) — только зафиксировать P&L."""
-        if pos is None:
-            return
-        token = pos["token"]
-        await self._sim_latency()
-        bid, ask = self.book.best(token)
-        px = bid if bid is not None else (pos.get("last_bid") or 0.0)
-        fill = round(px, 2)
-        shares = pos["shares"]
-        proceeds = round(fill * shares, 2)
-        try:
-            resp = await asyncio.to_thread(self.trader.sell, token, fill, shares)
-        except Exception as exc:  # noqa: BLE001
-            self.log.error("ордер SELL упал: %s (позиция оставлена)", exc)
-            return
-        self.trader.settle(proceeds)     # dry-run: вернуть кэш; live: no-op
-        self._invalidate_balance()
-        pnl = round(proceeds - pos["cost"], 2)
-        self.realized_pnl += pnl
-        if pnl >= 0:
-            self.wins += 1
-        else:
-            self.losses += 1
-        self.log.warning(
-            "ПРОДАНО (%s) %s — %.2f шэр @ $%.2f (=$%.2f) | P&L %+.2f "
-            "(итого %+.2f) | ответ: %s",
-            tag, pos["outcome"], shares, fill, proceeds, pnl,
-            self.realized_pnl, _short(resp))
-        # tag — человеку в лог, result — ASCII-код в CSV рядом с WON/LOST.
-        self._log_trade_row(pos, result, fill, proceeds, pnl)
-        if self.pos is pos:                 # продали текущую -> выходим во flat
-            self.pos = None
-            self.strategy.record_exit()
-
-    def _settle_open_position(self, reason: str) -> None:
-        """Сеттл открытой позиции на границе окна (держали до расчёта)."""
-        pos = self.pos
-        if pos is None:
-            return
-        last = pos.get("last_bid")
-        won = last is not None and last >= 0.5
-        payout = round(pos["shares"] * 1.0, 2) if won else 0.0
-        pnl = round(payout - pos["cost"], 2)
-        self.realized_pnl += pnl
-        if won:
-            self.wins += 1
-        else:
-            self.losses += 1
-        self.trader.settle(payout)
-        self._invalidate_balance()
-        self.log.warning(
-            "СЕТТЛ (%s) %s %s — payout $%.2f | P&L %+.2f (итого %+.2f, W/L %d/%d)",
-            reason, pos["outcome"], "ВЫИГРЫШ" if won else "проигрыш",
-            payout, pnl, self.realized_pnl, self.wins, self.losses)
-        self._log_trade_row(pos, "WON" if won else "LOST",
-                            last if last is not None else 0.0, payout, pnl)
-        self.pos = None
-        self.strategy.record_exit()
-
     # ======================================================================
-    #  Баланс / лог / вывод
+    #  Баланс, журнал, вывод
     # ======================================================================
     def _get_balance(self) -> float:
         now = time.time()
@@ -445,13 +273,14 @@ class FlowEngine:
         except Exception:  # noqa: BLE001
             bal = None
         self.tradelog.append({
-            "settled_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "settled_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime()),
             "slug": (self.market or {}).get("slug", ""),
-            "outcome": ("FLIP " if pos.get("is_flip") else "") + pos["outcome"],
+            "outcome": pos["outcome"],
             "entry_price": pos["entry_price"],
             "shares": pos["shares"],
             "cost": pos["cost"],
-            "btc_at_entry": pos.get("btc_at_entry"),
+            "btc_at_entry": pos.get("coin_at_entry"),
             "secs_to_end_at_entry": pos.get("secs_at_entry"),
             "result": result,
             "settle_price": round(settle_price, 2),
@@ -461,52 +290,20 @@ class FlowEngine:
             "balance_after": round(bal, 2) if bal is not None else "",
         })
 
-    def _log_status(self, snap: MarketSnapshot, action) -> None:
-        now = time.time()
-        if now - self._last_status < self.cfg.status_log_interval_seconds:
-            return
-        self._last_status = now
-        nc = self.price.nowcast()
-        pos = ("—" if self.pos is None
-               else f"{self.pos['outcome']}@{self.pos['entry_price']:.2f}")
-        self.log.info(
-            "t-%3ds | BTC %s%s z=%+.2f (%+.2fб.п.) | Up %s/%s(%+.2f) "
-            "Down %s/%s(%+.2f) | поз %s | $%.2f | %s",
-            int(snap.seconds_left),
-            _m(snap.btc_price), (f" nc={nc:,.0f}" if nc else ""),
-            snap.burst_z, snap.move_bps,
-            _p(snap.up_bid), _p(snap.up_ask), snap.up_flow,
-            _p(snap.down_bid), _p(snap.down_ask), snap.down_flow,
-            pos, self._get_balance(), action.reason,
-        )
-
     def _banner(self) -> None:
         c = self.cfg
         mode = "DRY-RUN (без реальных ордеров)" if c.dry_run else "*** LIVE ***"
         self.log.info("=" * 72)
         self.log.info("flowbot — %s Up/Down 5m — %s", c.asset.upper(), mode)
-        self.log.info(
-            "вход: резкое движение |z|>=%.1f (>=%.1fб.п.), сторона по движению, "
-            "ask в [%.2f,%.2f], догон <=+%.0f центов; ставка $%.2f",
-            c.entry_burst_z, c.entry_min_move_bps, c.entry_price_min,
-            c.entry_price_max, c.chase_cents * 100, c.stake_usdc)
-        self.log.info(
-            "держим, пока идёт движение (z*dir>=%.1f) и растёт %% (откат <=%.2f); "
-            "разворот при |z|>=%.1f -> $%.2f в противоход",
-            c.hold_burst_z, c.token_retrace_exit, c.flip_burst_z, c.flip_size_usdc)
         self.log.info("=" * 72)
 
     def _summary(self) -> None:
         self.log.info("=" * 72)
-        self.log.info("flowbot остановлен: %s", self.stop_reason or "—")
+        self.log.info("остановлен: %s", self.stop_reason or "—")
         settled = self.wins + self.losses
         self.log.info("сделок: %d | закрыто: %d (W/L %d/%d) | P&L: $%+.2f",
                       self.n_trades, settled, self.wins, self.losses,
                       self.realized_pnl)
-        if self.pos is not None:
-            self.log.info("открытая позиция (не сеттлилась): %s %.2f шэр @ $%.2f",
-                          self.pos["outcome"], self.pos["shares"],
-                          self.pos["entry_price"])
         try:
             self.log.info("баланс: $%.2f", self.trader.get_balance())
         except Exception as exc:  # noqa: BLE001

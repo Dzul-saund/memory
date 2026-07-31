@@ -2,15 +2,14 @@
 """Разбор журнала сделок: что реально влияет на прибыль.
 
 Журнал (`~/.flowbot/trades.jsonl`) пишется на каждой закрытой ноге и несёт
-не только исход, но и ВСЕ признаки сигнала: Q, скорость, ход в σ, удержание,
-ускорение, запас, спред, структуру книги. Здесь по нему отвечают на
-единственный вопрос, ради которого он и собирается: какие фильтры делают
-деньги, а какие только кажутся полезными.
+не только исход сделки, но и всё, что стратегия положила в `Action.feat` на
+входе. Здесь по нему отвечают на единственный вопрос, ради которого он и
+собирается: какие признаки делают деньги, а какие только кажутся полезными.
 
     python stats.py                      # сводка
     python stats.py --mode LIVE          # только реальные деньги
-    python stats.py --split q            # P&L по квартилям качества
-    python stats.py --split speed_sigmas
+    python stats.py --split pnl          # распределение результата
+    python stats.py --split entry_price
     python stats.py --csv out.csv        # выгрузить в таблицу
     python stats.py --file другой.jsonl
 
@@ -29,14 +28,17 @@ from typing import List, Optional
 
 from flowbot.stats import default_path, read_all
 
-# Признаки, по которым осмысленно резать выборку.
-FEATURES = ["q", "speed_sigmas", "jump_sigmas", "hold", "accel",
-            "edge_cents", "spread_cents", "imp_age_s", "book_imb",
-            "book_wall", "secs_left", "sigma",
-            # Оценки отдельных признаков (0..1). Ради них скоринг и вводился:
-            # по ним видно, КАКОЙ признак чаще всего тянет сделки вниз.
-            "s_speed", "s_edge", "s_jump", "s_hold", "s_age", "s_accel",
-            "s_shift", "s_book"]
+# По каким полям осмысленно резать выборку.
+#
+# Признаки прежней стратегии (Score и его компоненты, скорость, удержание,
+# ускорение, запас) удалены вместе с ней. Здесь остались только те поля,
+# которые пишет сам движок и которые не зависят от логики решений.
+#
+# Когда у новой стратегии появятся свои признаки, она кладёт их в
+# `Action.feat` — движок пронесёт их до журнала как есть. Добавь имена сюда,
+# и `--split` начнёт по ним резать.
+FEATURES = ["entry_price", "shares", "cost", "exit_price", "pnl",
+            "held_s", "secs_at_entry", "coin_at_entry"]
 
 
 def _num(v) -> Optional[float]:
@@ -82,18 +84,11 @@ def summary(rows: List[dict]) -> None:
     for side in ("Up", "Down"):
         print(_line(side, [r for r in rows if r.get("outcome") == side]))
 
-    strict = [r for r in rows if r.get("strict_entry")]
-    if strict:
-        print("\nповторные входы после разворота (строгая планка):")
-        print(_line("повторные", strict))
-        print(_line("обычные", [r for r in rows if not r.get("strict_entry")]))
-
     print("\nсамые дорогие ошибки:")
     worst = sorted(rows, key=lambda r: _num(r.get("pnl")) or 0.0)[:5]
     for r in worst:
-        q = _num(r.get("q"))
         print(f"  ${_num(r.get('pnl')) or 0:+6.2f}  {r.get('outcome','?'):4} "
-              f"@ {r.get('entry_price')}  Q={q if q is None else round(q, 2)}  "
+              f"@ {r.get('entry_price')}  "
               f"{r.get('result','?'):10} {r.get('ts','')}")
 
 
@@ -156,7 +151,6 @@ def main(argv=None) -> int:
     ap.add_argument("--file", help=f"путь к журналу (деф. {default_path()})")
     ap.add_argument("--mode", choices=["DRY", "LIVE"],
                     help="только симуляция или только реальные деньги")
-    ap.add_argument("--entry-mode", help="только этот режим входа")
     ap.add_argument("--split", metavar="ПРИЗНАК",
                     help="P&L по квантилям признака: " + ", ".join(FEATURES))
     ap.add_argument("--buckets", type=int, default=4)
@@ -168,8 +162,6 @@ def main(argv=None) -> int:
     print(f"журнал: {path}")
     if args.mode:
         rows = [r for r in rows if r.get("mode") == args.mode]
-    if args.entry_mode:
-        rows = [r for r in rows if r.get("entry_mode") == args.entry_mode]
 
     if args.csv:
         export_csv(rows, args.csv)
@@ -188,8 +180,8 @@ def main(argv=None) -> int:
 
     summary(rows)
     if rows:
-        print("\nдальше: python stats.py --split q     (или speed_sigmas, "
-              "hold, edge_cents…)")
+        print("\nдальше: python stats.py --split pnl   "
+              "(или entry_price, held_s, secs_at_entry)")
     return 0
 
 

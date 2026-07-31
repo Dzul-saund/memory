@@ -66,19 +66,13 @@ tmux kill-session -t bot     # ОСТАНОВИТЬ бота
 cd ~/flowbot_project
 tmux new -s bot
 source venv/bin/activate
-python jump_trader.py --record market.jsonl
+python trader.py --record market.jsonl
 ```
 
 Затем `Ctrl+B`, `D` — и можно закрывать окна.
 
-Другие режимы входа (свои замки и файлы, работают одновременно):
-
-```bash
-python jump_trader.py --entry-mode edge
-python jump_trader.py --entry-mode lag
-```
-
-Запись веди **одной** копией: рынок у всех один и тот же.
+Запись веди **одной** копией: рынок у всех один и тот же, а
+`--record` пишет около 10 ГБ в сутки.
 
 ---
 
@@ -120,7 +114,7 @@ python replay.py market.jsonl            # что дала бы стратеги
 Перебор порогов на реальной истории:
 
 ```bash
-python replay.py market.jsonl --sweep entry-mode jump edge lag
+python replay.py market.jsonl --sweep stake 1 2 5
 python replay.py market.jsonl --sweep trail      0.01 0.02 0.03 0.05
 python replay.py market.jsonl --sweep trail-arm  0.01 0.02 0.05 0.10
 python replay.py market.jsonl --sweep stop-loss  0 0.01 0.02 0.03
@@ -155,7 +149,7 @@ scp "C:\путь\flowbot_project_XX.zip" polybot@ТВОЙ_IP:/home/polybot/
 ```bash
 cd ~
 unzip -q flowbot_project_XX.zip -d new
-cp flowbot_project/flow_jump.env new/flowbot_project/     # пресет с ключом
+cp flowbot_project/flow.env new/flowbot_project/     # пресет с ключом
 cp flowbot_project/market.jsonl new/flowbot_project/      # если нужна запись
 tmux kill-session -t bot
 mv flowbot_project flowbot_project_old
@@ -166,7 +160,7 @@ pip install -r requirements.txt
 python -m pytest tests/ -q
 ```
 
-`flow_jump.env` копируется отдельно и всегда — в архиве его нет и не должно
+`flow.env` копируется отдельно и всегда — в архиве его нет и не должно
 быть.
 
 ---
@@ -187,7 +181,7 @@ sudo reboot                              # перезагрузка (бот НЕ
 ## Реальные деньги — только после разбора записи
 
 ```bash
-nano flow_jump.env
+nano flow.env
 ```
 
 ```
@@ -198,9 +192,9 @@ SIGNATURE_TYPE=3
 ```
 
 ```bash
-chmod 600 flow_jump.env
-python run.py --setup-allowances --env-file flow_jump.env   # один раз
-python jump_trader.py --live --stake 1 --max-round 3
+chmod 600 flow.env
+python run.py --setup-allowances --env-file flow.env   # один раз
+python trader.py --live --stake 1 --max-round 3
 ```
 
 Начинать с $1 на вход и $3 потолка за раунд. Поднимать — не раньше сотни
@@ -208,4 +202,4 @@ python jump_trader.py --live --stake 1 --max-round 3
 
 **Никогда:** не вписывать ключ в командную строку (попадёт в историю), не
 включать Automatic Backups в панели Vultr (снимок диска скопирует ключ), не
-показывать содержимое `flow_jump.env` никому.
+показывать содержимое `flow.env` никому.

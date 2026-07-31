@@ -1,16 +1,20 @@
-"""Движок 4-й системы: скачковая лестница поверх трёх существующих мониторов.
+"""Торговый движок: исполнение, учёт позиций, сверка с биржей, журнал.
 
-Ничего не дублирует. Берёт готовое:
+Здесь нет ни одного торгового правила — что делать, решает
+`flowbot.strategy.Strategy`. Этот класс отвечает за то, чтобы решение было
+исполнено честно и чтобы бот не потерял связь с реальностью:
 
-  * ЦЕНА  — фиды `fast_monitor` (7 бирж + якорь Polymarket) через PriceEngine;
-    здесь же таргет раунда (тот самый openPrice, что показывает сайт);
-  * КНИГА — поток CLOB через BookEngine: bid/ask обеих сторон и поток заявок;
-  * ТРЕЙДЕР — `btc_bot.trader` (LiveTrader / DryRunTrader), тот же клиент и
-    тот же баланс, что у остальных ботов.
+  * покупка и продажа целыми шэрами с разбором ответа биржи;
+  * таймаут ордера и сторож на залипший флаг «ордер в полёте»;
+  * пауза после отказа — но только для покупок, выход не откладывается;
+  * СВЕРКА: раз в N секунд спрашиваем биржу, чем владеем на самом деле, и
+    верим ей, а не своим записям;
+  * остатки от закончившихся раундов (их забирают через Redeem, продать
+    нечего — книги того окна больше нет);
+  * расчёт в конце окна и журнал сделок с признаками.
 
-Отличие от базового :class:`FlowEngine` — позиция не одна. Скачковая логика
-строит ЛЕСТНИЦУ из нескольких ног (после добора мы держим обе стороны сразу),
-поэтому здесь переопределены учёт позиции, исполнение и расчёт в конце окна.
+Всё это — инфраструктура, которая переживёт любую смену стратегии, и ровно
+поэтому она отделена от неё.
 """
 from __future__ import annotations
 
@@ -23,27 +27,24 @@ from typing import Dict, List, Optional
 
 import fast_monitor
 
-from btc_bot.prob import expected_shift
 from btc_bot.util import floor2, whole_shares
 
-from .bookfeat import BookFeatures
 from .config import FlowConfig
 from .engine import FlowEngine, now_ms, _m, _p, _short
 from .fills import UNKNOWN, interpret
 from .positions import reconcile, shares_from_balance
 from .stats import TradeJournal
-from .jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
-                   ladder_shares)
+from .strategy import BUY, SELL, Snapshot, Strategy
 
 
-class JumpEngine(FlowEngine):
-    """Скачковая стратегия: вход по скачку в $, лестница добора, фиксация."""
+class TradingEngine(FlowEngine):
+    """Исполнение решений стратегии: ордера, позиции, сверка, журнал."""
 
     def __init__(self, cfg: FlowConfig, logger: Optional[logging.Logger] = None):
-        super().__init__(cfg, logger or logging.getLogger("jumpbot"))
+        super().__init__(cfg, logger or logging.getLogger("flowbot"))
         # Базовый FlowEngine собрал σ-стратегию и позицию-одиночку — они здесь
         # не нужны: своя стратегия и свой список ног.
-        self.strategy = JumpStrategy(cfg)
+        self.strategy = Strategy(cfg)
         self.pos = None
         self.legs: List[dict] = []          # фактические ноги (шэры, стоимость)
         self._window_key: Optional[float] = None
@@ -66,10 +67,6 @@ class JumpEngine(FlowEngine):
         # позиция, а бот показывает «поз —». Продать её нельзя (книги уже
         # нет), но знать о ней и сказать про неё вслух — обязан.
         self._leftovers: Dict[str, dict] = {}
-        # Признаки структуры книги (перекос, стены, уход ликвидности).
-        self.bookfeat = BookFeatures(
-            levels=getattr(cfg, "jump_book_levels", 5),
-            window_s=getattr(cfg, "jump_book_window_s", 3.0))
         # Журнал сделок С ПРИЗНАКАМИ, вне папки проекта — чтобы переезд на
         # новую сборку не обнулял историю (а он обнулял её трижды подряд).
         self.journal = TradeJournal(getattr(cfg, "stats_path", "") or None,
@@ -111,7 +108,7 @@ class JumpEngine(FlowEngine):
             self.strategy.reset_round()
             # Новый раунд — новый отсчёт: дно прошлого окна не должно
             # выглядеть «скачком» на первой же секунде этого.
-            self.price.reset_swing()
+            self.price.reset()
             self._round_pnl = 0.0
             self.rounds += 1
 
@@ -127,14 +124,6 @@ class JumpEngine(FlowEngine):
         up, dn = self.market["up"], self.market["down"]
         ub, ua = self.book.best(up)
         db, da = self.book.best(dn)
-        # swing: движение от локального дна/пика — срабатывает в тот же тик,
-        # как только порог пройден. window: старое сравнение «сейчас против
-        # N секунд назад».
-        if cfg.jump_trigger_mode == "swing":
-            jump_usd, jump_bps = self.price.swing()
-        else:
-            jump_usd, jump_bps = self.price.move_usd(cfg.jump_window_s)
-
         # Якорь Polymarket: цена, по которой считает раунд САМА площадка.
         # В fast_monitor остальные биржи дебиасятся относительно него, поэтому
         # разрыв «наша цена − pm» — чистое опережение, а не базис площадок.
@@ -142,49 +131,17 @@ class JumpEngine(FlowEngine):
         pm_age = (now_ms() - fast_monitor.last_update.get("polymarket", 0)
                   if pm is not None else None)
 
-        # Качество импульса: скорость/ускорение/удержание/возраст экстремума.
-        # None до прогрева трекера — режим impulse честно ждёт данных.
-        imp = self.price.imp.state()
-
-        # Структура книги: перекос глубины, стены, уход ликвидности. Считается
-        # ВСЕГДА и всегда пишется в журнал — даже когда ворота по книге
-        # выключены. Иначе ответить «влияет ли книга на исход» будет нечем.
         t_now = time.time()
-        bu = self.book.books.get(str(up)) if up else None
-        bd_ = self.book.books.get(str(dn)) if dn else None
-        self.bookfeat.feed(t_now, up, bu)
-        self.bookfeat.feed(t_now, dn, bd_)
-        fu = self.bookfeat.state(up, bu)
-        fd = self.bookfeat.state(dn, bd_)
-
-        snap = JumpSnapshot(
-            t=time.time(),
-            seconds_left=max(0.0, self.market["end_ts"] - time.time()),
+        snap = Snapshot(
+            t=t_now,
+            seconds_left=max(0.0, self.market["end_ts"] - t_now),
             coin_price=price, target=self._target(),
-            jump_usd=jump_usd, jump_bps=jump_bps,
-            sigma_1s=self.price.sigma_1s(),
             up_bid=ub, up_ask=ua, down_bid=db, down_ask=da,
-            up_flow=self.book.flow(up, cfg.flow_window_s),
-            down_flow=self.book.flow(dn, cfg.flow_window_s),
             pm_price=pm, pm_age_ms=pm_age,
-            speed=imp.speed if imp else None,
-            accel=imp.accel if imp else None,
-            imp_age_s=imp.age_s if imp else None,
-            imp_hold=imp.hold if imp else None,
-            up_imb=fu.imbalance if fu else None,
-            down_imb=fd.imbalance if fd else None,
-            up_wall=fu.wall if fu else None,
-            down_wall=fd.wall if fd else None,
-            up_ask_trend=fu.ask_trend if fu else None,
-            down_ask_trend=fd.ask_trend if fd else None,
-            # Покупки сейчас не пройдут — значит и разворот не пройдёт, и
-            # стоп не имеет права рассчитывать на него (см. _ladder_blocked).
+            # Покупки сейчас не пройдут (пауза после отказа биржи). Стратегия
+            # обязана это знать, если её выход рассчитывает на покупку.
             entries_paused=t_now < self._retry_after,
         )
-        # В режиме impulse скачок меряется коротким окном трекера, а не
-        # 60-секундным swing: старое дно не имеет отношения к движению.
-        if cfg.jump_entry_mode == "impulse" and imp is not None:
-            snap.jump_usd = imp.jump_usd
 
         # Запоминаем последний bid каждой ноги — по нему считаем расчёт, если
         # книга к моменту сеттла уже закрылась.
@@ -195,7 +152,7 @@ class JumpEngine(FlowEngine):
 
         # Периодическая сверка с биржей. Дешёвая (два запроса) и редкая, но
         # это единственное, что ловит расхождение учёта с реальностью.
-        every = getattr(cfg, "jump_reconcile_s", 0.0)
+        every = getattr(cfg, "reconcile_s", 0.0)
         if every > 0 and snap.t - self._last_reconcile > every and not self.busy:
             self._last_reconcile = snap.t
             asyncio.create_task(self._reconcile())
@@ -203,7 +160,7 @@ class JumpEngine(FlowEngine):
         action = self.strategy.on_tick(snap)
         self._log_status(snap, action)
 
-        if action.kind not in (ENTER, LADDER, SELL):
+        if action.kind not in (BUY, SELL):
             return
         now = time.time()
 
@@ -315,7 +272,7 @@ class JumpEngine(FlowEngine):
 
             info["shares"] = theirs
             now = time.time()
-            if now - info["warned"] < self.cfg.jump_leftover_warn_s:
+            if now - info["warned"] < self.cfg.leftover_warn_s:
                 continue
             info["warned"] = now
             self.log.error(
@@ -350,13 +307,12 @@ class JumpEngine(FlowEngine):
             "управление по текущей цене %.2f. Скорее всего ордер прошёл, а "
             "ответ на него потерялся.", shares, outcome, px)
         leg = self.strategy.record_entry(outcome, px, shares,
-                                         round(px * shares, 2), "A",
-                                         time.time(),
+                                         round(px * shares, 2), time.time(),
                                          entry_bid=bid if bid is not None else px)
         self.legs.append({
             "idx": leg.idx, "outcome": outcome, "token": token,
             "entry_price": px, "shares": shares, "cost": round(px * shares, 2),
-            "track": "A", "last_bid": bid,
+            "last_bid": bid,
             "coin_at_entry": self.price.price(),
             "secs_at_entry": int(self.market["end_ts"] - time.time()),
         })
@@ -398,28 +354,11 @@ class JumpEngine(FlowEngine):
     async def _execute(self, action) -> None:
         try:
             self.log.warning(">>> %s: %s", action.kind.upper(), action.reason)
-            if action.kind == LADDER and action.sell_idx is not None:
-                # Разворот: сперва закрываем провалившуюся ногу — она вернёт
-                # капитал, и добор считается уже от РЕАЛИЗОВАННОГО убытка,
-                # а не от полной стоимости ноги.
-                #
-                # Добор идёт ДАЖЕ ЕСЛИ продать не удалось — так было
-                # изначально и так просил юзер. Плата за это: обе ноги
-                # остаются открытыми, а долг лестницы посчитан так, будто
-                # первую продали. Предупреждаем в лог, но не отменяем.
-                sold = await self._sell_leg(action.sell_idx, None, "разворот",
-                                            result="SOLD_FLIP")
-                if not sold:
-                    self.log.warning(
-                        "РАЗВОРОТ: продать старую ногу не удалось, но вторую "
-                        "сторону беру — открыты ОБЕ, долг считается от "
-                        "непроданной")
-                await self._buy_leg(action)
-            elif action.kind in (ENTER, LADDER):
+            if action.kind == BUY:
                 await self._buy_leg(action)
             elif action.kind == SELL:
                 await self._sell_leg(action.sell_idx, action.limit_price,
-                                     "фиксация", result="SOLD_TP")
+                                     "выход", result="SOLD")
         except Exception as exc:  # noqa: BLE001 - движок должен жить
             self.log.error("исполнение упало: %s", exc)
         finally:
@@ -432,7 +371,7 @@ class JumpEngine(FlowEngine):
         следующем такте бот попробует снова. Без паузы это «снова» наступает
         через 60мс, и один отказ превращается в сотни запросов в минуту.
         """
-        pause = getattr(self.cfg, "jump_error_cooldown_s", 5.0)
+        pause = getattr(self.cfg, "error_cooldown_s", 5.0)
         self._retry_after = time.time() + pause
         self.log.error("ордер %s упал: %s", side, exc)
         self.log.warning("пауза %.0fс перед следующей попыткой", pause)
@@ -455,9 +394,8 @@ class JumpEngine(FlowEngine):
             return
         fill = round(ask, 2)
 
-        # Добор считается в ШЭРАХ (их число решает уравнение перекрытия
-        # минуса), обычный вход — в долларах ставки. И то и другое надо
-        # пересчитать по РЕАЛЬНОЙ цене филла, а не по той, что была в решении.
+        # Размер пересчитывается по РЕАЛЬНОЙ цене филла, а не по той, что
+        # была в момент решения.
         # РАЗМЕР — ТОЛЬКО ЦЕЛЫМИ ШЭРАМИ.
         #
         # Polymarket отвергает покупку, если сумма в USDC (цена * размер)
@@ -466,12 +404,8 @@ class JumpEngine(FlowEngine):
         # 0.57 * 1.76 = $1.0032 -> 400 "invalid amounts", 0.57 * 2 = $1.14 ок.
         # Дробные размеры проходили dry-run, потому что там никто не считает
         # суммы, и падали на первом же живом ордере.
-        floor_usdc = getattr(self.cfg, "jump_min_order_usdc", 0.0)
-        if action.shares is not None:
-            want = ladder_shares(self.strategy.debt,
-                                 self.cfg.jump_ladder_profit_usdc, fill)
-        else:
-            want = (action.size_usdc or 0.0) / fill
+        floor_usdc = getattr(self.cfg, "min_order_usdc", 0.0)
+        want = (action.size_usdc or self.cfg.stake_usdc) / fill
         shares = whole_shares(want * fill, fill, floor_usdc)
         if shares <= 0:
             self.log.warning("ПОКУПКА %s: расчёт дал %.0f шэров — пропуск",
@@ -484,11 +418,11 @@ class JumpEngine(FlowEngine):
                           want * fill)
         # Потолок раунда проверяем ещё раз ЗДЕСЬ, а не только в стратегии:
         # за время пинга цена филла могла вырасти, а вместе с ней и стоимость.
-        if self.strategy.net_out + cost > self.cfg.jump_max_round_usdc + 1e-9:
+        if self.strategy.net_out + cost > self.cfg.max_round_usdc + 1e-9:
             self.log.warning(
                 "ПОКУПКА %s отменена: $%.2f + $%.2f вышли бы за потолок "
                 "раунда $%.2f", outcome, self.strategy.net_out, cost,
-                self.cfg.jump_max_round_usdc)
+                self.cfg.max_round_usdc)
             return
         try:
             # Таймаут обязателен: у клиента биржи его нет, а зависший запрос
@@ -533,19 +467,16 @@ class JumpEngine(FlowEngine):
 
         self._invalidate_balance()
         self.n_trades += 1
-        # Движение отработано — переставляем экстремум на текущую цену, иначе
-        # то же самое дно секунду спустя открыло бы ещё одну такую же сделку.
-        self.price.reset_swing()
         # bid на момент входа: от него считается движение против нас, иначе
         # спред выглядел бы как мгновенная просадка.
         leg = self.strategy.record_entry(outcome, fill, shares, cost,
-                                         action.track, time.time(),
+                                         time.time(),
                                          entry_bid=bid if bid is not None else fill,
                                          feat=action.feat)
         self.legs.append({
             "idx": leg.idx, "outcome": outcome, "token": token,
             "entry_price": fill, "shares": shares, "cost": cost,
-            "track": action.track, "last_bid": bid,
+            "last_bid": bid,
             "coin_at_entry": self.price.price(),
             "secs_at_entry": int(self.market["end_ts"] - time.time()),
             # Признаки сигнала едут с ногой до закрытия и оттуда — в журнал.
@@ -554,8 +485,8 @@ class JumpEngine(FlowEngine):
             "entry_ts": time.time(),
         })
         self.log.warning(
-            "КУПЛЕНО [%s#%d] %s — %.2f шэр @ $%.2f (=$%.2f) | вложено за раунд "
-            "$%.2f | ответ: %s", action.track, leg.idx, outcome, shares, fill,
+            "КУПЛЕНО [#%d] %s — %.2f шэр @ $%.2f (=$%.2f) | вложено за раунд "
+            "$%.2f | ответ: %s", leg.idx, outcome, shares, fill,
             cost, self.strategy.net_out, _short(resp))
 
     @staticmethod
@@ -637,11 +568,11 @@ class JumpEngine(FlowEngine):
         придерживается паузой (стоп обязан срабатывать сразу на падении),
         поэтому любой устойчивый отказ — не только нехватка баланса —
         превращается в десяток запросов в секунду до конца раунда. После
-        `jump_max_sell_fails` подряд нога снимается с торговли и уходит в
+        `max_sell_fails` подряд нога снимается с торговли и уходит в
         остатки: продать её всё равно не выходит, а долбить биржу вредно.
         """
         leg["sell_fails"] = leg.get("sell_fails", 0) + 1
-        limit = getattr(self.cfg, "jump_max_sell_fails", 5)
+        limit = getattr(self.cfg, "max_sell_fails", 5)
         if limit <= 0 or leg["sell_fails"] < limit:
             self.log.error("нога оставлена (отказ %d из %d): %s",
                            leg["sell_fails"], limit, _short(why))
@@ -686,10 +617,10 @@ class JumpEngine(FlowEngine):
 
         # Пол цены. Между решением и отправкой проходит пинг, и книга могла
         # просесть. SELL уходит как FAK с полом: ниже него не исполнится.
-        # Позволяем отдать не больше jump_max_sell_slip от цены решения,
+        # Позволяем отдать не больше max_sell_slip от цены решения,
         # иначе на обвале мы бы продавали по любой цене, какую покажет книга.
         floor_px = px
-        slip = getattr(self.cfg, "jump_max_sell_slip", 0.0)
+        slip = getattr(self.cfg, "max_sell_slip", 0.0)
         if sell_limit is not None and slip > 0:
             floor_px = max(px, sell_limit - slip)
             if floor_px > px + 1e-9:
@@ -782,7 +713,6 @@ class JumpEngine(FlowEngine):
         row = {
             "mode": "DRY" if self.cfg.dry_run else "LIVE",
             "asset": self.cfg.asset,
-            "entry_mode": getattr(self.cfg, "jump_entry_mode", "jump"),
             "slug": (self.market or {}).get("slug", ""),
             "outcome": leg.get("outcome"),
             "leg_idx": leg.get("idx"),
@@ -822,7 +752,7 @@ class JumpEngine(FlowEngine):
             self.log.warning(
                 "РАСЧЁТ (%s): книга не схлопнулась за %.0fс после конца окна "
                 "(Up %s / Down %s) — ноги закрываю по последней цене и помечаю "
-                "UNSETTLED, а не WON/LOST", reason, self.cfg.jump_settle_wait_s,
+                "UNSETTLED, а не WON/LOST", reason, self.cfg.settle_wait_s,
                 _p(top[0]) if top else "—", _p(top[1]) if top else "—")
 
         payout_total = 0.0
@@ -849,9 +779,8 @@ class JumpEngine(FlowEngine):
             self._book_pnl(pnl)
             self.trader.settle(payout)
             self.log.warning(
-                "СЕТТЛ (%s) [%s#%d] %s %s — payout $%.2f | P&L %+.2f",
-                reason, leg["track"], leg["idx"], leg["outcome"],
-                tail, payout, pnl)
+                "СЕТТЛ (%s) [#%d] %s %s — payout $%.2f | P&L %+.2f",
+                reason, leg["idx"], leg["outcome"], tail, payout, pnl)
             self._log_trade_row(_row(leg), result, mark, payout, pnl)
         self._invalidate_balance()
         self.log.warning(
@@ -865,7 +794,7 @@ class JumpEngine(FlowEngine):
     # ======================================================================
     #  Запись всего, что видел бот (сырьё для проигрывания)
     # ======================================================================
-    def _record(self, snap: JumpSnapshot) -> None:
+    def _record(self, snap: Snapshot) -> None:
         """Одна строка JSONL на такт — ровно тот снимок, что видит стратегия.
 
         Это и есть «память» системы: по такой записи можно потом прогнать
@@ -878,29 +807,25 @@ class JumpEngine(FlowEngine):
         try:
             up = (self.market or {}).get("up")
             dn = (self.market or {}).get("down")
-            ubs, uas, ubl, ual = self.book.depth(up)
-            dbs, das, _, _ = self.book.depth(dn)
-            w = self.cfg.flow_window_s
-            u_buy, u_sell, u_n = self.book.trade_counts(up, w)
-            d_buy, d_sell, d_n = self.book.trade_counts(dn, w)
+            ubl, ual = self.book.depth(up)
+            dbl, dal = self.book.depth(dn)
             # Якорь Polymarket берём ИЗ СНИМКА, а не читаем заново: иначе в
             # записи оказалась бы цена на миллисекунды свежее той, по которой
-            # стратегия принимала решение, и replay расходился бы с боевым.
-            pm, pm_age = snap.pm_price, snap.pm_age_ms
+            # стратегия принимала решение, и проигрывание разошлось бы с боем.
             self._rec.write(json.dumps({
                 "t": round(snap.t, 3), "slug": (self.market or {}).get("slug"),
                 "left": round(snap.seconds_left, 2),
                 "price": snap.coin_price, "target": snap.target,
-                "jump": round(snap.jump_usd, 4), "sigma": snap.sigma_1s,
                 "ub": snap.up_bid, "ua": snap.up_ask,
                 "db": snap.down_bid, "da": snap.down_ask,
-                "uf": round(snap.up_flow, 3), "df": round(snap.down_flow, 3),
-                # --- сырьё для признаков (по цене задним числом не считается)
-                "pm": pm, "pm_age": round(pm_age) if pm_age is not None else None,
-                "ubs": ubs, "uas": uas, "dbs": dbs, "das": das,
-                "lvl": [ubl, ual],
-                "tb": round(u_buy, 2), "tsl": round(u_sell, 2), "tn": u_n,
-                "dtb": round(d_buy, 2), "dts": round(d_sell, 2), "dtn": d_n,
+                "pm": snap.pm_price,
+                "pm_age": (round(snap.pm_age_ms)
+                           if snap.pm_age_ms is not None else None),
+                # Глубина книги: сырьё, которое по цене задним числом не
+                # восстановить. Новой стратегии оно понадобится, а второй раз
+                # этот рынок уже не запишешь.
+                "up_levels": [ubl, ual],
+                "down_levels": [dbl, dal],
             }, separators=(",", ":")) + "\n")
         except Exception:  # noqa: BLE001 - запись не должна ронять торговлю
             pass
@@ -921,12 +846,12 @@ class JumpEngine(FlowEngine):
 
     # -- ждём, пока книга схлопнется к 0/1 ------------------------------------
     def _stream_deadline(self, end_ts: float) -> float:
-        return end_ts + self.cfg.jump_settle_wait_s
+        return end_ts + self.cfg.settle_wait_s
 
     def _book_resolved(self) -> bool:
         """Победитель уже виден: одна из сторон дошла до порога схлопывания."""
         top = self._top_bids()
-        return top is not None and max(top) >= self.cfg.jump_settle_converge
+        return top is not None and max(top) >= self.cfg.settle_converge
 
     def _top_bids(self):
         """(bid Up, bid Down) — из книги, иначе последние виденные ногами."""
@@ -980,7 +905,7 @@ class JumpEngine(FlowEngine):
             return
         self._last_status = now
         if self.legs:
-            pos = " ".join(f"{lg['track']}{lg['idx']}:{lg['outcome']}"
+            pos = " ".join(f"#{lg['idx']}:{lg['outcome']}"
                            f"@{lg['entry_price']:.2f}×{lg['shares']:.1f}"
                            for lg in self.legs)
         else:
@@ -993,25 +918,17 @@ class JumpEngine(FlowEngine):
             pos += f" +ост {left:.1f} (Redeem)"
         tgt = (f" цель {snap.target:,.0f}" if snap.target is not None else
                " цель —")
-        how = ("экстр" if self.cfg.jump_trigger_mode == "swing"
-               else f"{self.cfg.jump_window_s:.0f}с")
-        # «чувств» — на сколько центов сдвинет процент скачок в jump_small_usd.
-        # Видно сразу, есть ли смысл вообще ждать сигнала в этой точке раунда.
-        sens = expected_shift(snap.coin_price, snap.target, snap.sigma_1s,
-                              max(snap.seconds_left, 0.5),
-                              self.cfg.jump_small_usd)
-        s_txt = f" чувств {abs(sens)*100:4.1f}¢" if sens is not None else ""
-        # Отставание от якоря — то, ради чего существует режим lag. Держим его
-        # в строке всегда: даже в других режимах видно, есть ли опережение.
+        # Отставание от якоря Polymarket: наше опережение по информации.
+        # Держим в строке всегда — это единственная величина, которая
+        # показывает, есть ли у бота вообще преимущество в данный момент.
         lag_txt = (f" лаг {snap.coin_price - snap.pm_price:+.1f}$"
                    if snap.pm_price is not None and snap.coin_price is not None
                    else "")
         self.log.info(
-            "[%s] t-%3ds | %s %s%s | скачок %+.2f$/%s%s%s | Up %s/%s "
-            "Down %s/%s | поз %s | вложено $%.2f | $%.2f | %s",
-            self.cfg.jump_entry_mode, int(snap.seconds_left),
-            self.cfg.asset.upper(), _m(snap.coin_price), tgt, snap.jump_usd,
-            how, s_txt, lag_txt,
+            "t-%3ds | %s %s%s%s | Up %s/%s Down %s/%s | поз %s | "
+            "вложено $%.2f | $%.2f | %s",
+            int(snap.seconds_left), self.cfg.asset.upper(),
+            _m(snap.coin_price), tgt, lag_txt,
             _p(snap.up_bid), _p(snap.up_ask), _p(snap.down_bid),
             _p(snap.down_ask), pos, self.strategy.net_out,
             self._get_balance(), action.reason,
@@ -1021,109 +938,22 @@ class JumpEngine(FlowEngine):
         c = self.cfg
         mode = "DRY-RUN (без реальных ордеров)" if c.dry_run else "*** LIVE ***"
         self.log.info("=" * 72)
-        self.log.info("СКАЧКОВАЯ система — %s Up/Down 5m — %s",
-                      c.asset.upper(), mode)
-        if c.jump_entry_mode == "edge":
-            self.log.info(
-                "ВХОД ПО ЗАПАСУ: считаем Phi(z)−ask по обеим сторонам, берём "
-                "лучшую при запасе >=%.1f¢. Скачок цены на вход НЕ влияет.",
-                c.jump_min_edge_cents)
-            self.log.info(
-                "потолок цены ноги %.2f — у краёв модель занижает хвост, "
-                "и «запас» там ненастоящий", c.jump_max_leg_price)
-        elif c.jump_entry_mode == "impulse":
-            self.log.info(
-                "ВХОД ПО ОЦЕНКЕ (Score 0..1), а не по обязательным воротам: "
-                "каждый признак даёт 0..1, они складываются с весами, и "
-                "решение одно — Score >= %.2f. Признак, просевший ниже "
-                "прежнего порога, теперь СНИЖАЕТ оценку, а не отменяет сделку",
-                c.jump_imp_min_score)
-            self.log.info(
-                "веса: скорость %.2f / запас %.2f / ход %.2f / удержание %.2f "
-                "/ возраст %.2f / ускорение %.2f / сдвиг %.2f%s",
-                c.jump_w_speed, c.jump_w_edge, c.jump_w_jump, c.jump_w_hold,
-                c.jump_w_age, c.jump_w_accel, c.jump_w_shift,
-                f" / книга {c.jump_w_book:.2f}" if c.jump_w_book > 0 else "")
-            self.log.info(
-                "опорные пороги шкал: ход %.1fσ, скорость %.1fσ/с, удержание "
-                "%.0f%%, возраст %.0fс, ускорение %.2f, запас max(%.1f¢, "
-                "%.1f×спред)",
-                c.jump_imp_jump_sigmas, c.jump_imp_speed_sigmas,
-                c.jump_imp_min_hold * 100, c.jump_imp_max_age_s,
-                c.jump_imp_min_accel, c.jump_min_edge_cents,
-                c.jump_edge_spread_mult)
-            if c.jump_score_veto_zero:
-                self.log.info(
-                    "НОЛЬ по любому признаку отменяет вход: в шкалах ноль "
-                    "значит не «слабо», а «у нужного сигнала так не бывает» "
-                    "(удержание <60%, ход <1.5σ, скорость <0.7σ)")
-            if c.jump_stake_by_quality:
-                self.log.info("ставка от качества: $%.0f/$%.0f/$%.0f/$%.0f",
-                              c.jump_stake_usdc, c.jump_stake_good,
-                              c.jump_stake_strong, c.jump_stake_best)
-            else:
-                self.log.info(
-                    "ставка ПЛОСКАЯ $%.2f на любой сигнал (ступени от "
-                    "качества выключены: пока пороги не проверены историей, "
-                    "множитель к ставке множит и ошибку)", c.jump_stake_usdc)
-            self.log.info(
-                "окно экстремума %.0fс; потолок цены ноги по качеству: "
-                "%.2f/%.2f/%.2f", c.jump_imp_lookback_s,
-                c.jump_max_leg_price_weak, c.jump_max_leg_price,
-                c.jump_max_leg_price_strong)
-            gates = []
-            if c.jump_book_min_imbalance > 0:
-                gates.append(f"перекос >= {c.jump_book_min_imbalance:+.2f}")
-            if c.jump_book_max_wall > 0:
-                gates.append(f"стена <= {c.jump_book_max_wall:.0%}")
-            self.log.info(
-                "книга: %s", "; ".join(gates) if gates else
-                "признаки считаются и пишутся в журнал, но НЕ фильтруют "
-                "(сначала измерить, потом отбирать)")
-        elif c.jump_entry_mode == "lag":
-            self.log.info(
-                "ВХОД ПО ОТСТАВАНИЮ ЯКОРЯ: Phi(z по нашей цене) − Phi(z по "
-                "цене Polymarket) >= %.1f¢, якорь не старше %.0fмс, и при "
-                "этом запас >= %.1f¢", c.jump_lag_min_cents,
-                c.jump_lag_max_age_ms, c.jump_min_edge_cents)
-        else:
-            if c.jump_trigger_mode == "swing":
-                how = (f"движение от локального дна/пика (окно поиска "
-                       f"экстремума {c.jump_swing_lookback_s:.0f}с, "
-                       f"срабатывает сразу)")
-            else:
-                how = f"движение за {c.jump_window_s:.0f}с"
-            self.log.info("детекция: %s", how)
-            self.log.info(
-                "вход: скачок >=$%.0f, если %% стороны >= %.2f; иначе нужен "
-                "скачок >=$%.0f и не дальше $%.0f от таргета",
-                c.jump_small_usd, c.jump_price_split,
-                c.jump_big_usd, c.jump_max_target_dist_usd)
-        if not c.jump_ladder_enabled:
-            self.log.info("разворот выключен; потолок $%.0f за раунд",
-                          c.jump_max_round_usdc)
-        elif c.jump_ladder_reenters:
-            self.log.info(
-                "РАЗВОРОТ = ЗАКРЫТЬ ногу (просадка %.0f¢ от бида на входе, "
-                "выдержка %.1fс) и ВСЁ. Обратную сторону покупаем, только "
-                "если она сама пройдёт все ворота при Q >= %.2f в ближайшие "
-                "%.0fс; потолок $%.0f за раунд",
-                c.jump_ladder_loss * 100, c.jump_ladder_grace_s,
-                max(c.jump_imp_min_score, c.jump_ladder_min_q),
-                c.jump_ladder_strict_s, c.jump_max_round_usdc)
-        else:
-            self.log.info(
-                "СТАРЫЙ разворот: провал ниже %.2f → добор противоположной "
-                "стороны на (вложено+%.2f)/(1-цена); максимум %d доборов и "
-                "$%.0f за раунд", c.jump_price_split,
-                c.jump_ladder_profit_usdc, c.jump_max_ladder_legs,
-                c.jump_max_round_usdc)
-        if c.jump_tp_enabled:
-            self.log.info(
-                "дешёвая дорожка: фиксируем прибыль (+%.2f от входа), если до "
-                "конца <=%.0fс или рост кончился (откат %% %.2f / поток %.2f)",
-                c.jump_tp_min_gain, c.jump_tp_deadline_s,
-                c.jump_tp_stall_retrace, c.jump_tp_flow_against)
+        self.log.info("flowbot — %s Up/Down 5m — %s", c.asset.upper(), mode)
+        self.log.info(
+            "СТРАТЕГИЯ НЕ ЗАДАНА: flowbot/strategy.py — чистый лист, "
+            "should_enter и should_exit возвращают None. Бот смотрит рынок, "
+            "ведёт учёт и сверку, но сделок не открывает.")
+        self.log.info(
+            "ставка по умолчанию $%.2f | минимум ордера $%.2f | потолок "
+            "раунда $%.0f", c.stake_usdc, c.min_order_usdc, c.max_round_usdc)
+        self.log.info(
+            "сверка с биржей раз в %.0fс | таймаут ордера %.0fс | пауза "
+            "после отказа %.0fс", c.reconcile_s, c.order_timeout_s,
+            c.error_cooldown_s)
+        if self.journal.enabled:
+            self.log.info("журнал сделок: %s", self.journal.path)
+        if c.record_path:
+            self.log.info("запись рынка: %s", c.record_path)
         self.log.info("=" * 72)
 
     def _summary(self) -> None:
@@ -1134,7 +964,7 @@ class JumpEngine(FlowEngine):
                 pass
             self._rec = None
         self.log.info("=" * 72)
-        self.log.info("скачковая система остановлена: %s",
+        self.log.info("остановлен: %s",
                       self.stop_reason or "—")
         self.log.info(
             "раундов: %d | покупок: %d | закрыто ног: %d (W/L %d/%d) | "
@@ -1152,19 +982,13 @@ class JumpEngine(FlowEngine):
 
 
 def _row(leg: dict) -> dict:
-    """Нога -> словарь в формате, который ждёт FlowEngine._log_trade_row.
-
-    Дорожка и номер ноги уезжают прямо в поле outcome ("A0 Up", "B1 Down"),
-    чтобы по CSV было видно, какая ветка логики её открыла. is_flip=False:
-    префикс "FLIP " базового логгера здесь только мешал бы.
-    """
+    """Нога -> словарь в формате, который ждёт FlowEngine._log_trade_row."""
     return {
-        "outcome": f"{leg['track']}{leg['idx']} {leg['outcome']}",
+        "outcome": f"#{leg['idx']} {leg['outcome']}",
         "entry_price": leg["entry_price"],
         "shares": leg["shares"],
         "cost": leg["cost"],
         "btc_at_entry": leg.get("coin_at_entry"),
         "secs_at_entry": leg.get("secs_at_entry"),
-        "is_flip": False,
         "token": leg["token"],
     }

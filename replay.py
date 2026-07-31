@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-"""Проигрывание записи рынка через скачковую стратегию.
+"""Проигрывание записи рынка через стратегию.
 
 Зачем. Пороги в этом проекте несколько раз подбирались на глаз, по десятку
-сделок. Так нельзя: на 9 наблюдениях любой вывод переворачивается парой
-случаев. Запись (`jump_trader.py --record FILE`) хранит ВСЁ, что бот видел в
-каждый такт, и здесь эта история прогоняется заново с ЛЮБЫМИ порогами —
-столько раз, сколько нужно, без риска и без ожидания.
+сделок. Так нельзя: на девяти наблюдениях любой вывод переворачивается парой
+случаев. Запись (`trader.py --record FILE`) хранит всё, что бот видел в
+каждый такт, и здесь эта история прогоняется заново — столько раз, сколько
+нужно, без риска и без ожидания.
 
 Что честно, а что нет:
-  * решения принимает та же самая `JumpStrategy`, что и в бою — не копия;
+  * решения принимает ТА ЖЕ САМАЯ `Strategy`, что и в бою — не копия;
   * покупка исполняется по записанному ask, продажа по записанному bid,
     то есть по ценам, которые реально стояли в книге в тот момент;
   * заглядывания вперёд нет: стратегия на каждом такте видит ровно тот
     снимок, что был записан;
   * НЕ моделируется влияние наших заявок на книгу и проскальзывание глубже
-    первого уровня. На ставках в единицы долларов это мелочь, но на крупных
+    первого уровня. На ставках в единицы долларов это мелочь, на крупных
     результат окажется оптимистичнее реального.
 
-Примеры:
+Сейчас стратегия пустая, поэтому прогон честно покажет ноль сделок. Это и
+есть проверка, что харнесс работает: как только в `flowbot/strategy.py`
+появится логика, здесь сразу станет видно, что она делала бы на истории.
+
     python replay.py market.jsonl
-    python replay.py market.jsonl --max-legs 2
-    python replay.py market.jsonl --sweep max-legs 0 1 2 3 4
-    python replay.py market.jsonl --sweep min-shift 0 1 2 3 5
+    python replay.py market.jsonl --sweep stake 1 2 5
 """
 from __future__ import annotations
 
@@ -32,10 +33,8 @@ from collections import defaultdict
 from typing import Dict, Iterator, List, Optional
 
 from btc_bot.util import whole_shares
-from flowbot.config import JUMP_ENTRY_MODES, FlowConfig
-from flowbot.impulse import ImpulseTracker
-from flowbot.jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
-                          ladder_shares)
+from flowbot.config import FlowConfig
+from flowbot.strategy import BUY, SELL, Snapshot, Strategy
 
 
 def read_records(path: str) -> Iterator[dict]:
@@ -50,15 +49,12 @@ def read_records(path: str) -> Iterator[dict]:
                 continue          # битая строка (обрыв записи) — пропускаем
 
 
-def to_snapshot(r: dict) -> JumpSnapshot:
-    return JumpSnapshot(
+def to_snapshot(r: dict) -> Snapshot:
+    return Snapshot(
         t=r["t"], seconds_left=r.get("left", 0.0), coin_price=r.get("price"),
-        target=r.get("target"), jump_usd=r.get("jump", 0.0),
-        sigma_1s=r.get("sigma"),
+        target=r.get("target"),
         up_bid=r.get("ub"), up_ask=r.get("ua"),
         down_bid=r.get("db"), down_ask=r.get("da"),
-        up_flow=r.get("uf", 0.0), down_flow=r.get("df", 0.0),
-        # Якорь Polymarket — без него режим входа "lag" на записи не проиграть.
         pm_price=r.get("pm"), pm_age_ms=r.get("pm_age"),
     )
 
@@ -69,10 +65,9 @@ class Result:
         self.spent = 0.0
         self.rounds = 0
         self.entries = 0
-        self.ladders = 0
         self.sells = 0
         self.round_pnls: List[float] = []
-        self.by_depth: Dict[int, List[float]] = defaultdict(list)
+        self.by_idx: Dict[int, List[float]] = defaultdict(list)
         self.unresolved = 0
 
     def summary(self) -> str:
@@ -81,18 +76,17 @@ class Result:
         worst = min(self.round_pnls) if self.round_pnls else 0.0
         best = max(self.round_pnls) if self.round_pnls else 0.0
         return (f"P&L ${self.pnl:+8.2f} | раундов {n:4} "
-                f"(в плюс {wins:4}, {wins/n*100 if n else 0:3.0f}%) | "
+                f"(в плюс {wins:4}, {wins / n * 100 if n else 0:3.0f}%) | "
                 f"вложено ${self.spent:8.2f} | "
-                f"входов {self.entries:4} доборов {self.ladders:3} "
-                f"фиксаций {self.sells:3} | "
+                f"входов {self.entries:4} выходов {self.sells:3} | "
                 f"лучший ${best:+6.2f} худший ${worst:+7.2f}")
 
 
 def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
     """Прогнать запись через стратегию и посчитать, что бы вышло."""
     res = Result()
-    strat = JumpStrategy(cfg)
-    legs: List[dict] = []          # открытые ноги: {idx, side, shares, cost}
+    strat = Strategy(cfg)
+    legs: List[dict] = []          # открытые позиции: {idx, side, shares, cost}
     round_pnl = 0.0
     cur_slug: Optional[str] = None
 
@@ -110,22 +104,17 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             pnl = round(payout - lg["cost"], 4)
             res.pnl += pnl
             round_pnl += pnl
-            res.by_depth[lg["idx"]].append(pnl)
+            res.by_idx[lg["idx"]].append(pnl)
         legs = []
         res.round_pnls.append(round(round_pnl, 4))
         res.rounds += 1
         round_pnl = 0.0
         strat.reset_round()
 
-    # Качество импульса восстанавливаем ИЗ ЦЕН записи тем же кодом, что и
-    # вживую: записи ничего не должны знать о новых признаках.
-    imp = ImpulseTracker(lookback_s=getattr(cfg, "jump_imp_lookback_s", 15.0))
-
     for r in read_records(path):
         if r.get("type") == "settle":
             settle(r.get("winner"), bool(r.get("resolved", True)))
             cur_slug = None
-            imp.reset(0.0, None)
             continue
 
         slug = r.get("slug")
@@ -138,23 +127,13 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
         cur_slug = slug
 
         snap = to_snapshot(r)
-        if snap.coin_price is not None:
-            imp.feed(snap.t, snap.coin_price)
-            st = imp.state()
-            if st is not None:
-                snap.speed = st.speed
-                snap.accel = st.accel
-                snap.imp_age_s = st.age_s
-                snap.imp_hold = st.hold
-                if getattr(cfg, "jump_entry_mode", "jump") == "impulse":
-                    snap.jump_usd = st.jump_usd
         for lg in legs:
             b = snap.bid(lg["side"])
             if b is not None:
                 lg["last_bid"] = b
 
         act = strat.on_tick(snap)
-        if act.kind in (ENTER, LADDER):
+        if act.kind == BUY:
             ask = snap.ask(act.outcome)
             if ask is None or (act.limit_price is not None
                                and ask > act.limit_price + 1e-9):
@@ -164,157 +143,79 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             # в целых центах это гарантирует только целое число шэров.
             # Разойдись здесь с движком — и подбор порогов по записи будет
             # мерить не ту стратегию, что торгует.
-            if act.shares is not None:
-                want = ladder_shares(strat.debt,
-                                     cfg.jump_ladder_profit_usdc, ask)
-            else:
-                want = (act.size_usdc or 0.0) / ask
-            shares = whole_shares(want * ask, ask,
-                                  getattr(cfg, "jump_min_order_usdc", 0.0))
+            want = (act.size_usdc or cfg.stake_usdc) / ask
+            shares = whole_shares(want * ask, ask, cfg.min_order_usdc)
             if shares <= 0:
                 continue
             cost = round(ask * shares, 4)
-            if strat.net_out + cost > cfg.jump_max_round_usdc + 1e-9:
+            if strat.net_out + cost > cfg.max_round_usdc + 1e-9:
                 continue
-            # Бид на входе обязателен: разворот считается от него, а не от
-            # уплаченного ask. Без него проигрывание разворачивало бы позицию
-            # в тот же тик на каждой сделке — спред выглядел бы просадкой.
+            # Бид на входе обязателен: любой расчёт «пошло против» считается
+            # от него, а не от уплаченного ask, иначе спред выглядел бы как
+            # мгновенная просадка.
             eb = snap.bid(act.outcome)
-            leg = strat.record_entry(act.outcome, ask, shares, cost,
-                                     act.track, snap.t,
-                                     entry_bid=eb if eb is not None else ask)
+            leg = strat.record_entry(act.outcome, ask, shares, cost, snap.t,
+                                     entry_bid=eb if eb is not None else ask,
+                                     feat=act.feat)
             legs.append({"idx": leg.idx, "side": act.outcome,
-                         "shares": shares, "cost": cost, "last_bid": ask})
+                         "shares": shares, "cost": cost, "last_bid": eb})
+            res.entries += 1
             res.spent += cost
-            # Как в бою: движение отработано сделкой — экстремум и трекер
-            # импульса переставляются, чтобы то же дно не купило второй раз.
-            imp.reset(snap.t, snap.coin_price)
-            if act.kind == ENTER:
-                res.entries += 1
-            else:
-                res.ladders += 1
             if verbose:
-                print(f"    {act.kind:6} {act.outcome:4} {shares:6.2f}шэр "
-                      f"@{ask:.2f} = ${cost:5.2f}")
-        elif act.kind == SELL:
-            lg = next((x for x in legs if x["idx"] == act.sell_idx), None)
-            if lg is None:
-                continue
-            bid = snap.bid(lg["side"]) or 0.0
-            proceeds = round(bid * lg["shares"], 4)
-            pnl = round(proceeds - lg["cost"], 4)
-            res.pnl += pnl
-            round_pnl += pnl
-            res.by_depth[lg["idx"]].append(pnl)
-            legs = [x for x in legs if x["idx"] != act.sell_idx]
-            strat.record_sell(act.sell_idx, proceeds, snap.t)
-            res.sells += 1
-            if verbose:
-                print(f"    sell   {lg['side']:4} @{bid:.2f} -> {pnl:+.2f}")
+                print(f"  ВХОД  {act.outcome} {shares:.0f} @ {ask:.2f} — "
+                      f"{act.reason}")
 
-    settle(None, False)            # хвост записи
+        elif act.kind == SELL and act.sell_idx is not None:
+            for lg in list(legs):
+                if lg["idx"] != act.sell_idx:
+                    continue
+                bid = snap.bid(lg["side"])
+                if bid is None:
+                    break
+                proceeds = round(bid * lg["shares"], 4)
+                pnl = round(proceeds - lg["cost"], 4)
+                res.pnl += pnl
+                round_pnl += pnl
+                res.by_idx[lg["idx"]].append(pnl)
+                res.sells += 1
+                legs.remove(lg)
+                strat.record_sell(lg["idx"], proceeds, snap.t)
+                if verbose:
+                    print(f"  ВЫХОД {lg['side']} @ {bid:.2f} — P&L {pnl:+.2f}")
+                break
+
+    settle(None, False)
     return res
 
 
-def _flag(v: str) -> bool:
-    """bool('false') это True — поэтому разбираем сами, а не через bool."""
-    return str(v).strip().lower() in ("1", "true", "yes", "on", "да")
-
-
+# Ключи перебора. Здесь остались только ИНФРАСТРУКТУРНЫЕ величины: пороги
+# прежней стратегии удалены вместе с ней. Когда у новой появятся свои —
+# добавлять их сюда, иначе подобрать их будет нечем.
 SWEEPS = {
-    # Сравнение трёх режимов входа на ОДНОЙ записи — самый честный способ
-    # их сопоставить: рынок буквально один и тот же, отличается только повод
-    # войти. Живые запуски такого не дают, там у каждого свой поток тиков.
-    "entry-mode": ("jump_entry_mode", str),
-    "lag-cents": ("jump_lag_min_cents", float),
-    "trail": ("jump_tp_trail", float),
-    "trail-arm": ("jump_tp_trail_arm", float),
-    "stop-loss": ("jump_stop_loss", float),
-    # ЧТО ГЛАВНЕЕ — РАЗВОРОТ ИЛИ ВЫХОД. Единственный способ решить это
-    # честно: --sweep ladder-first true false на одной записи.
-    "ladder-first": ("jump_ladder_before_stop", _flag),
-    # --- режим impulse: КАЖДЫЙ порог обязан пройти перебор ------------------
-    # Все они выбраны руками и держатся только на здравом смысле. Пока по
-    # ним не прогнали запись, «2σ» ничем не лучше «1.8σ» — просто число,
-    # которое кто-то назвал первым.
-    "imp-jump": ("jump_imp_jump_sigmas", float),
-    "imp-speed": ("jump_imp_speed_sigmas", float),
-    "imp-hold": ("jump_imp_min_hold", float),
-    "imp-accel": ("jump_imp_min_accel", float),
-    "imp-score": ("jump_imp_min_score", float),
-    "score-min": ("jump_imp_min_score", float),      # то же, понятнее имя
-    "veto-zero": ("jump_score_veto_zero", _flag),
-    "w-hold": ("jump_w_hold", float),
-    "w-age": ("jump_w_age", float),
-    "w-accel": ("jump_w_accel", float),
-    "imp-lookback": ("jump_imp_lookback_s", float),
-    "imp-max-age": ("jump_imp_max_age_s", float),
-    "edge-mult": ("jump_edge_spread_mult", float),
-    # веса компонентов Q
-    "w-speed": ("jump_w_speed", float),
-    "w-edge": ("jump_w_edge", float),
-    "w-jump": ("jump_w_jump", float),
-    "w-shift": ("jump_w_shift", float),
-    "w-book": ("jump_w_book", float),
-    # разворот: повторный вход против автоматического переворота
-    "ladder-reenters": ("jump_ladder_reenters", _flag),
-    "ladder-min-q": ("jump_ladder_min_q", float),
-    "ladder-strict-s": ("jump_ladder_strict_s", float),
-    "stake-by-quality": ("jump_stake_by_quality", _flag),
-    # ворота по книге (по умолчанию выключены — 0)
-    "book-imbalance": ("jump_book_min_imbalance", float),
-    "book-wall": ("jump_book_max_wall", float),
-    "edge-cents": ("jump_min_edge_cents", float),
-    "max-legs": ("jump_max_ladder_legs", int),
-    "min-shift": ("jump_min_shift_cents", float),
-    "small": ("jump_small_usd", float),
-    "big": ("jump_big_usd", float),
-    "stake": ("jump_stake_usdc", float),
-    "profit": ("jump_ladder_profit_usdc", float),
-    "max-round": ("jump_max_round_usdc", float),
-    "sigma-ref": ("jump_sigma_ref", float),
-    "target-sigmas": ("jump_max_target_sigmas", float),
-    "swing-lookback": ("jump_swing_lookback_s", float),
+    "stake": ("stake_usdc", float),
+    "max-round": ("max_round_usdc", float),
+    "min-order": ("min_order_usdc", float),
 }
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Прогнать запись рынка через скачковую стратегию")
-    ap.add_argument("recording", help="файл JSONL от --record")
-    ap.add_argument("--env-file", help="пресет с порогами")
-    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag", "impulse"],
-                    help="повод войти: jump (скачок), edge (запас), "
-                         "lag (отставание якоря Polymarket)")
-    ap.add_argument("--max-legs", type=int)
-    ap.add_argument("--min-shift", type=float)
-    ap.add_argument("--stake", type=float)
-    ap.add_argument("--no-adaptive", action="store_true")
+        description="проиграть запись рынка через стратегию")
+    ap.add_argument("recording", help="файл записи (JSONL)")
+    ap.add_argument("--stake", type=float, help="ставка, USDC")
+    ap.add_argument("--max-round", type=float, help="потолок вложений в раунд")
     ap.add_argument("--sweep", nargs="+", metavar=("ПАРАМЕТР", "ЗНАЧЕНИЕ"),
-                    help="перебрать значения: --sweep max-legs 0 1 2 3")
-    ap.add_argument("--verbose", action="store_true", help="печатать сделки")
+                    help="перебрать значения: --sweep stake 1 2 5")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="печатать каждую сделку")
     args = ap.parse_args(argv)
-
-    if args.env_file:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(args.env_file, override=True)
-        except Exception:  # pragma: no cover
-            print("--env-file требует python-dotenv", file=sys.stderr)
-            return 2
 
     def build() -> FlowConfig:
         c = FlowConfig.from_env()
-        if args.entry_mode:
-            c.jump_entry_mode = args.entry_mode
-        if args.max_legs is not None:
-            c.jump_max_ladder_legs = args.max_legs
-        if args.min_shift is not None:
-            c.jump_min_shift_cents = args.min_shift
         if args.stake is not None:
-            c.jump_stake_usdc = args.stake
-        if args.no_adaptive:
-            c.jump_adaptive = False
+            c.stake_usdc = args.stake
+        if args.max_round is not None:
+            c.max_round_usdc = args.max_round
         return c
 
     if args.sweep:
@@ -338,18 +239,15 @@ def main(argv=None) -> int:
               "выборке, прежде чем менять настройки.")
         return 0
 
-    cfg = build()
-    res = replay(args.recording, cfg, verbose=args.verbose)
+    res = replay(args.recording, build(), verbose=args.verbose)
     print(res.summary())
-    if res.by_depth:
-        print("\nпо ступеням лестницы:")
-        for d in sorted(res.by_depth):
-            v = res.by_depth[d]
-            w = sum(1 for x in v if x > 0)
-            print(f"  ступень {d}: ног {len(v):4}  выигр {w:4}  "
-                  f"P&L ${sum(v):+8.2f}")
+    if res.entries == 0:
+        print("\nСделок нет — стратегия пустая (flowbot/strategy.py: "
+              "should_enter возвращает None).\nЭто ожидаемо до тех пор, пока "
+              "новая логика не написана.")
     if res.unresolved:
-        print(f"\nног закрыто по рынку (раунд не определился): {res.unresolved}")
+        print(f"\nпозиций закрыто по рынку (раунд не определился): "
+              f"{res.unresolved}")
     return 0
 
 

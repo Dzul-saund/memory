@@ -1,6 +1,6 @@
 """Тесты замка «один бот на рынок».
 
-Три копии бота на одном рынке ведут три независимые лестницы: риск
+Три копии бота на одном рынке ведут три независимых учёта: риск
 складывается, а CSV перемешивается. Замок должен это ловить.
 """
 import os
@@ -34,16 +34,16 @@ def test_release_lets_next_in(tmp_path):
 
 def test_different_names_do_not_collide(tmp_path):
     """btc и eth — разные рынки, обе копии имеют право работать."""
-    a = InstanceLock("jumpbot-btc-dry", str(tmp_path))
-    b = InstanceLock("jumpbot-eth-dry", str(tmp_path))
+    a = InstanceLock("flowbot-btc-dry", str(tmp_path))
+    b = InstanceLock("flowbot-eth-dry", str(tmp_path))
     assert a.acquire() and b.acquire()
     a.release()
     b.release()
 
 
 def test_dry_and_live_are_separate_locks(tmp_path):
-    a = InstanceLock("jumpbot-btc-dry", str(tmp_path))
-    b = InstanceLock("jumpbot-btc-live", str(tmp_path))
+    a = InstanceLock("flowbot-btc-dry", str(tmp_path))
+    b = InstanceLock("flowbot-btc-live", str(tmp_path))
     assert a.acquire() and b.acquire()
     a.release()
     b.release()
