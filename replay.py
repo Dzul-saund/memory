@@ -33,6 +33,7 @@ from typing import Dict, Iterator, List, Optional
 
 from btc_bot.util import whole_shares
 from flowbot.config import FlowConfig
+from flowbot.impulse import ImpulseTracker
 from flowbot.jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                           ladder_shares)
 
@@ -116,10 +117,15 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
         round_pnl = 0.0
         strat.reset_round()
 
+    # Качество импульса восстанавливаем ИЗ ЦЕН записи тем же кодом, что и
+    # вживую: записи ничего не должны знать о новых признаках.
+    imp = ImpulseTracker(lookback_s=getattr(cfg, "jump_imp_lookback_s", 15.0))
+
     for r in read_records(path):
         if r.get("type") == "settle":
             settle(r.get("winner"), bool(r.get("resolved", True)))
             cur_slug = None
+            imp.reset(0.0, None)
             continue
 
         slug = r.get("slug")
@@ -132,6 +138,16 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
         cur_slug = slug
 
         snap = to_snapshot(r)
+        if snap.coin_price is not None:
+            imp.feed(snap.t, snap.coin_price)
+            st = imp.state()
+            if st is not None:
+                snap.speed = st.speed
+                snap.accel = st.accel
+                snap.imp_age_s = st.age_s
+                snap.imp_hold = st.hold
+                if getattr(cfg, "jump_entry_mode", "jump") == "impulse":
+                    snap.jump_usd = st.jump_usd
         for lg in legs:
             b = snap.bid(lg["side"])
             if b is not None:
@@ -170,6 +186,9 @@ def replay(path: str, cfg: FlowConfig, verbose: bool = False) -> Result:
             legs.append({"idx": leg.idx, "side": act.outcome,
                          "shares": shares, "cost": cost, "last_bid": ask})
             res.spent += cost
+            # Как в бою: движение отработано сделкой — экстремум и трекер
+            # импульса переставляются, чтобы то же дно не купило второй раз.
+            imp.reset(snap.t, snap.coin_price)
             if act.kind == ENTER:
                 res.entries += 1
             else:
@@ -225,7 +244,7 @@ def main(argv=None) -> int:
         description="Прогнать запись рынка через скачковую стратегию")
     ap.add_argument("recording", help="файл JSONL от --record")
     ap.add_argument("--env-file", help="пресет с порогами")
-    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
+    ap.add_argument("--entry-mode", choices=["jump", "edge", "lag", "impulse"],
                     help="повод войти: jump (скачок), edge (запас), "
                          "lag (отставание якоря Polymarket)")
     ap.add_argument("--max-legs", type=int)

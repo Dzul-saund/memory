@@ -186,10 +186,59 @@ class FlowConfig:
     # процент. Порог должен покрывать половину спреда (при спреде 5¢ это
     # 2.5¢) плюс запас на пинг. 0 — выключить.
     jump_min_edge_cents: float = 3.0
-    # Пауза после сделки, чтобы одно и то же движение не открыло вторую
-    # позицию. В режиме swing экстремум и так переставляется после филла,
-    # поэтому паузе хватает секунды.
-    jump_reentry_cooldown_s: float = 1.0
+    # Пауза после сделки. ВЫКЛЮЧЕНА (0) по прямому требованию юзера: рынок
+    # быстрый, а от повторного входа в то же движение защищает перестановка
+    # экстремума после филла (reset_swing), а не таймер.
+    jump_reentry_cooldown_s: float = 0.0
+    # Поздний вход: в последние settle_hold_s секунд окна вход разрешён,
+    # если процент покупаемой стороны уже >= jump_price_split (сторона
+    # выигрывает). Дешёвую сторону в конце окна не берём по-прежнему.
+    jump_late_entry: bool = True
+
+    # =========================================================================
+    #  Режим "impulse": качество импульса вместо голого размера скачка
+    # =========================================================================
+    # Вопрос меняется с «прошёл ли рынок достаточное расстояние?» на
+    # «насколько КАЧЕСТВЕННЫМ является текущий импульс?». Величины считает
+    # flowbot/impulse.py, решает _trigger_impulse. Жёсткие ворота: скачок,
+    # скорость, удержание, затухание, свежесть экстремума, динамический
+    # запас. Остальное (чувствительность) входит в оценку качества, от
+    # которой зависят размер ставки и потолок цены ноги.
+    #
+    # Окно поиска экстремума. 60с — слишком много: дно почти минутной
+    # давности не имеет отношения к текущему движению.
+    jump_imp_lookback_s: float = 15.0
+    # Порог скачка В СИГМАХ, а не в долларах (вариант 1 юзера):
+    # нужен скачок >= jump_imp_jump_sigmas * sigma. sigma=0.8 -> $1.6,
+    # sigma=2 -> $4, sigma=5 -> $10. Никаких фиксированных $5/$15.
+    jump_imp_jump_sigmas: float = 2.0
+    # Порог скорости в сигмах: скорость ($/с) >= это * sigma ($/√с).
+    jump_imp_speed_sigmas: float = 1.0
+    # Минимальная доля удержанного хода. Ниже — цена отдала часть движения
+    # назад, это вынос ликвидности, а не импульс.
+    # ВАЖНО: сама величина лежит в [0.5, 1.0] по построению (см. impulse.py),
+    # поэтому порог 0.5 не фильтрует НИЧЕГО. Осмысленный диапазон 0.6-0.85.
+    jump_imp_min_hold: float = 0.7
+    # Минимальное ускорение: скорость свежего участка к предыдущему.
+    # Ниже — импульс затухает, вход отменяется даже при хорошем скачке.
+    jump_imp_min_accel: float = 0.5
+    # Минимальная итоговая оценка качества (1.0 = все компоненты на порогах).
+    jump_imp_min_score: float = 1.0
+    # Размер ставки от качества сигнала: база jump_stake_usdc ($1), дальше
+    # хороший/сильный/исключительный. Пороги — по оценке качества Q.
+    jump_stake_good: float = 2.0
+    jump_stake_strong: float = 4.0
+    jump_stake_best: float = 8.0
+    jump_q_good: float = 1.5
+    jump_q_strong: float = 2.0
+    jump_q_best: float = 3.0
+    # Динамический запас: edge_min = max(jump_min_edge_cents, это * спред).
+    # При спреде 5¢ порог 10¢ — широкий спред сам ужесточает требования.
+    jump_edge_spread_mult: float = 2.0
+    # Потолок цены ноги от качества сигнала (в режиме impulse):
+    # слабый — не дороже weak, сильный (Q>=q_strong) — до strong.
+    jump_max_leg_price_weak: float = 0.92
+    jump_max_leg_price_strong: float = 0.97
 
     # --- лестница добора (докупаем противоположную сторону) ------------------
     # Когда наш процент проваливается ниже jump_price_split, берём другую
@@ -260,6 +309,18 @@ class FlowConfig:
     # закрывал бы КАЖДУЮ сделку в тот же тик с гарантированным убытком.
     # 0 = выключить.
     jump_stop_loss: float = 0.01
+    # АДАПТИВНЫЙ стоп: порог растёт с волатильностью, чтобы случайный тик
+    # на разогнанном рынке не выбивал позицию при верном направлении.
+    #   стоп = clamp(jump_stop_loss * sigma/sigma_ref, jump_stop_loss, max)
+    # sigma=0.9 -> 1¢ (как было), sigma=2.7 -> 3¢, дальше упирается в потолок.
+    jump_stop_adaptive: bool = True
+    jump_stop_max: float = 0.05
+    # Выход по смерти импульса: мы в плюсе, а скорость монеты упала на эту
+    # долю от пиковой за время позиции — забираем, не дожидаясь отката
+    # процента (трейлинг реагирует только ПОСЛЕ отката). 0 = выключить.
+    jump_exit_speed_drop: float = 0.7
+    # Взводится, только если пик скорости был осмысленным (не шум), $/с.
+    jump_exit_speed_floor: float = 2.0
     # Пол цены продажи: на сколько ниже цены решения согласны отдать ногу.
     #
     # ВЫКЛЮЧЕН (0), и это осознанно. Идея была защитить от обвала книги, но
@@ -357,7 +418,23 @@ class FlowConfig:
             jump_trigger_mode=(_s("JUMP_TRIGGER_MODE", "swing") or "swing").lower(),
             jump_swing_lookback_s=_f("JUMP_SWING_LOOKBACK_S", 60.0),
             jump_window_s=_f("JUMP_WINDOW_S", 3.0),
-            jump_reentry_cooldown_s=_f("JUMP_REENTRY_COOLDOWN_S", 1.0),
+            jump_reentry_cooldown_s=_f("JUMP_REENTRY_COOLDOWN_S", 0.0),
+            jump_late_entry=_b("JUMP_LATE_ENTRY", True),
+            jump_imp_lookback_s=_f("JUMP_IMP_LOOKBACK_S", 15.0),
+            jump_imp_jump_sigmas=_f("JUMP_IMP_JUMP_SIGMAS", 2.0),
+            jump_imp_speed_sigmas=_f("JUMP_IMP_SPEED_SIGMAS", 1.0),
+            jump_imp_min_hold=_f("JUMP_IMP_MIN_HOLD", 0.7),
+            jump_imp_min_accel=_f("JUMP_IMP_MIN_ACCEL", 0.5),
+            jump_imp_min_score=_f("JUMP_IMP_MIN_SCORE", 1.0),
+            jump_stake_good=_f("JUMP_STAKE_GOOD", 2.0),
+            jump_stake_strong=_f("JUMP_STAKE_STRONG", 4.0),
+            jump_stake_best=_f("JUMP_STAKE_BEST", 8.0),
+            jump_q_good=_f("JUMP_Q_GOOD", 1.5),
+            jump_q_strong=_f("JUMP_Q_STRONG", 2.0),
+            jump_q_best=_f("JUMP_Q_BEST", 3.0),
+            jump_edge_spread_mult=_f("JUMP_EDGE_SPREAD_MULT", 2.0),
+            jump_max_leg_price_weak=_f("JUMP_MAX_LEG_PRICE_WEAK", 0.92),
+            jump_max_leg_price_strong=_f("JUMP_MAX_LEG_PRICE_STRONG", 0.97),
             jump_small_usd=_f("JUMP_SMALL_USD", 5.0),
             jump_big_usd=_f("JUMP_BIG_USD", 15.0),
             jump_price_split=_f("JUMP_PRICE_SPLIT", 0.51),
@@ -384,6 +461,10 @@ class FlowConfig:
             jump_tp_trail=_f("JUMP_TP_TRAIL", 0.02),
             jump_tp_trail_arm=_f("JUMP_TP_TRAIL_ARM", 0.02),
             jump_stop_loss=_f("JUMP_STOP_LOSS", 0.01),
+            jump_stop_adaptive=_b("JUMP_STOP_ADAPTIVE", True),
+            jump_stop_max=_f("JUMP_STOP_MAX", 0.05),
+            jump_exit_speed_drop=_f("JUMP_EXIT_SPEED_DROP", 0.7),
+            jump_exit_speed_floor=_f("JUMP_EXIT_SPEED_FLOOR", 2.0),
             jump_max_sell_slip=_f("JUMP_MAX_SELL_SLIP", 0.0),
             jump_error_cooldown_s=_f("JUMP_ERROR_COOLDOWN_S", 5.0),
             jump_reconcile_s=_f("JUMP_RECONCILE_S", 20.0),

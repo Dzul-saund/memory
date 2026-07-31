@@ -122,7 +122,27 @@ class TestEntry:
         a = s.on_tick(snap(jump=2.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
 
-    def test_no_entry_at_end_of_window(self, cfg):
+    def test_no_entry_at_end_of_window_on_the_losing_side(self, cfg):
+        """В конце окна дешёвую сторону не берём: её не спасёт никакой скачок."""
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=-16.0, left=3.0, up_ask=0.70, down_ask=0.31))
+        assert a.kind == NONE
+        assert "конец окна" in a.reason
+
+    def test_late_entry_allowed_on_the_winning_side(self, cfg):
+        """Поздний вход (JUMP_LATE_ENTRY): сторона уже >= сплита — можно.
+
+        Требование юзера: «до конца окна больше 6 секунд, но может ещё
+        покупать, если у покупаемой стороны больше 51 процента».
+        """
+        cfg.jump_late_entry = True
+        s = JumpStrategy(cfg)
+        a = s.on_tick(snap(jump=9.0, left=3.0, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
+        assert a.outcome == "Up"
+
+    def test_late_entry_can_be_switched_off(self, cfg):
+        cfg.jump_late_entry = False
         s = JumpStrategy(cfg)
         a = s.on_tick(snap(jump=9.0, left=3.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
@@ -140,14 +160,26 @@ class TestEntry:
         assert a.kind == ENTER
         assert a.track == TRACK_A
 
-    def test_cooldown_blocks_immediate_reentry(self, cfg):
-        """Скользящее окно скачка ещё «горит» — второй вход не открываем."""
+    def test_cooldown_blocks_immediate_reentry_when_enabled(self, cfg):
+        """Механизм паузы жив — но по умолчанию выключен (см. тест ниже)."""
+        cfg.jump_reentry_cooldown_s = 1.0
         s = JumpStrategy(cfg)
         s.record_entry("Up", 0.60, 1.66, 1.0, TRACK_A, t=100.0)
         s.record_sell(0, 1.20, t=100.5)
         a = s.on_tick(snap(t=101.0, jump=6.0, up_ask=0.60, down_ask=0.41))
         assert a.kind == NONE
         assert "пауза" in a.reason
+
+    def test_no_cooldown_by_default(self, cfg):
+        """Пауза после сделки ВЫКЛЮЧЕНА: рынок быстрый, лестница не может
+        стоять секунду. От повторного входа в то же движение защищает
+        перестановка экстремума после филла, а не таймер."""
+        assert cfg.jump_reentry_cooldown_s == 0.0
+        s = JumpStrategy(cfg)
+        s.record_entry("Up", 0.60, 1.66, 1.0, TRACK_A, t=100.0)
+        s.record_sell(0, 1.20, t=100.5)
+        a = s.on_tick(snap(t=100.6, jump=6.0, up_ask=0.60, down_ask=0.41))
+        assert a.kind == ENTER
 
 
 # ---------------------------------------------------------------------------

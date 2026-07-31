@@ -78,6 +78,11 @@ class JumpSnapshot:
     # постоянного базиса между площадками.
     pm_price: Optional[float] = None
     pm_age_ms: Optional[float] = None
+    # --- качество импульса (режим "impulse"; считает flowbot/impulse.py) ---
+    speed: Optional[float] = None     # $/с за последнюю секунду, знаковая
+    accel: Optional[float] = None     # >1 разгон, <1 затухание, <=0 разворот
+    imp_age_s: Optional[float] = None # возраст локального экстремума, с
+    imp_hold: Optional[float] = None  # доля удержанного хода [0..1]
 
     def bid(self, outcome: str) -> Optional[float]:
         return self.up_bid if outcome == "Up" else self.down_bid
@@ -105,6 +110,10 @@ class Leg:
     entry_bid: float = 0.0
     peak_t: float = 0.0               # когда пик обновлялся в последний раз
     against_since: Optional[float] = None
+    # Пик скорости монеты В НАШУ сторону за время позиции. По нему выход
+    # «импульс умер»: трейлинг реагирует только после отката процента, а
+    # скорость умирает раньше отката.
+    peak_speed: float = 0.0
 
 
 @dataclass
@@ -245,6 +254,10 @@ class JumpStrategy:
             if b is not None and b > leg.peak_bid:
                 leg.peak_bid = b
                 leg.peak_t = s.t      # рост продолжается — засекаем заново
+            if s.speed is not None:
+                spd = s.speed * favour(leg.outcome)
+                if spd > leg.peak_speed:
+                    leg.peak_speed = spd
 
     # ======================================================================
     #  Вход
@@ -335,11 +348,12 @@ class JumpStrategy:
         c = self.cfg
         if s.coin_price is None:
             return Action(NONE, "нет цены монеты")
-        if s.seconds_left <= c.settle_hold_s:
+        late_ok = getattr(c, "jump_late_entry", False)
+        if s.seconds_left <= c.settle_hold_s and not late_ok:
             return Action(NONE, f"конец окна ({s.seconds_left:.0f}с) — "
                                 f"новых входов не открываю")
         cooldown = c.jump_reentry_cooldown_s
-        if (self._last_fill_t is not None
+        if (cooldown > 0 and self._last_fill_t is not None
                 and s.t - self._last_fill_t < cooldown):
             return Action(NONE, f"пауза после сделки "
                                 f"({s.t - self._last_fill_t:.1f}<"
@@ -350,14 +364,29 @@ class JumpStrategy:
             picked = self._trigger_edge(s)
         elif mode == "lag":
             picked = self._trigger_lag(s)
+        elif mode == "impulse":
+            picked = self._trigger_impulse(s)
         else:
             picked = self._trigger_jump(s)
         if isinstance(picked, Action):
             return picked                      # отказ с объяснением
-        side, track, why = picked
+        # Триггер отдаёт (сторона, дорожка, причина) и, опционально,
+        # четвёртым элементом — ставку от качества сигнала (режим impulse).
+        side, track, why = picked[0], picked[1], picked[2]
+        stake_want = picked[3] if len(picked) > 3 else c.jump_stake_usdc
 
-        stake = min(c.jump_stake_usdc, c.jump_max_round_usdc)
         ask = s.ask(side)
+        # Поздний вход: в последние секунды окна берём ТОЛЬКО сторону,
+        # которая уже выигрывает (процент >= сплита). Дешёвую сторону в
+        # конце раунда не спасёт никакой скачок.
+        if s.seconds_left <= c.settle_hold_s:
+            if ask is None or ask < c.jump_price_split:
+                return Action(NONE, (
+                    f"конец окна ({s.seconds_left:.0f}с): поздний вход "
+                    f"разрешён только от {c.jump_price_split:.2f}, а "
+                    f"{side} стоит {ask if ask is not None else 0:.2f}"))
+
+        stake = min(stake_want, c.jump_max_round_usdc)
         return Action(
             ENTER, outcome=side, limit_price=round(ask, 2), size_usdc=stake,
             track=track, reason=f"{why}, ставка ${stake:.2f}",
@@ -468,6 +497,136 @@ class JumpStrategy:
             f"{s.pm_price:,.0f} (${gap:+.2f}{age}) → книге переоцениться на "
             f"{abs(lag)*100:.1f}¢ → {side} @ {ask:.2f}, запас "
             f"+{edge*100:.1f}¢ [дорожка {track}]")
+
+    # ---- режим "impulse": качество импульса, а не голая дистанция -----------
+    def stake_for_quality(self, q: float) -> float:
+        """Размер ставки от качества сигнала: лучшие входы получают больше."""
+        c = self.cfg
+        if q >= c.jump_q_best:
+            return c.jump_stake_best
+        if q >= c.jump_q_strong:
+            return c.jump_stake_strong
+        if q >= c.jump_q_good:
+            return c.jump_stake_good
+        return c.jump_stake_usdc
+
+    def max_leg_price_for_quality(self, q: float) -> float:
+        """Потолок цены ноги от качества: сильному сигналу можно дороже."""
+        c = self.cfg
+        if q >= c.jump_q_strong:
+            return c.jump_max_leg_price_strong
+        if q >= c.jump_q_good:
+            return c.jump_max_leg_price
+        return c.jump_max_leg_price_weak
+
+    def _trigger_impulse(self, s: JumpSnapshot):
+        """Вход по КАЧЕСТВУ импульса, а не по пройденному расстоянию.
+
+        Жёсткие ворота (провал любых — сделки нет):
+          1. скачок >= jump_imp_jump_sigmas * σ   (пороги в σ, не в долларах);
+          2. скорость в сторону импульса >= jump_imp_speed_sigmas * σ;
+          3. удержание хода >= jump_imp_min_hold  (иначе это вынос ликвидности);
+          4. ускорение >= jump_imp_min_accel      (затухший импульс не берём);
+          5. экстремум свежий (сам трекер ищет только в коротком окне);
+          6. расстояние до таргета <= 3σ√t        (обе стороны, не только дешёвая);
+          7. запас >= max(база, jump_edge_spread_mult * спред) — широкий
+             спред сам ужесточает требования;
+          8. ask <= потолок, зависящий от качества сигнала.
+
+        Чувствительность — компонент оценки, а не ворота: она поднимает
+        качество Q, от которого зависят ставка ($1/$2/$4/$8) и потолок цены.
+        Дорожек A/B нет: одинаковый импульс оценивается одинаково при любой
+        цене контракта, цена входит только как риск (потолок и запас).
+        """
+        c = self.cfg
+        if s.speed is None or s.imp_hold is None or s.imp_age_s is None:
+            return Action(NONE, "нет данных импульса (трекер прогревается)")
+        if not s.sigma_1s or s.sigma_1s <= 0:
+            return Action(NONE, "σ ещё не измерена — качество не посчитать")
+        sigma = s.sigma_1s
+
+        jump = s.jump_usd
+        need_jump = c.jump_imp_jump_sigmas * sigma
+        if abs(jump) < need_jump:
+            return Action(NONE, (
+                f"движение ${jump:+.2f} < {c.jump_imp_jump_sigmas:.1f}σ "
+                f"(${need_jump:.2f}) — жду"))
+        side = "Up" if jump > 0 else "Down"
+        direction = favour(side)
+
+        spd = s.speed * direction             # скорость В СТОРОНУ импульса
+        need_speed = c.jump_imp_speed_sigmas * sigma
+        if spd < need_speed:
+            return Action(NONE, (
+                f"{side}: скачок ${jump:+.2f} есть, но скорость "
+                f"{spd:+.2f}$/с < {need_speed:.2f} — движение уже выдохлось"))
+
+        if s.imp_hold < c.jump_imp_min_hold:
+            return Action(NONE, (
+                f"{side}: цена удержала лишь {s.imp_hold:.0%} хода "
+                f"(< {c.jump_imp_min_hold:.0%}) — похоже на вынос ликвидности"))
+
+        accel = s.accel if s.accel is not None else 1.0
+        if accel < c.jump_imp_min_accel:
+            return Action(NONE, (
+                f"{side}: импульс затухает (ускорение {accel:.2f} < "
+                f"{c.jump_imp_min_accel:.2f}) — вход отменён"))
+
+        # Близость к таргету — для ОБЕИХ сторон: далеко от таргета исход
+        # решён, и проценты не сдвинет даже идеальный импульс.
+        if s.target is not None:
+            dist = abs(s.coin_price - s.target)
+            limit = self.max_target_distance(s)
+            if dist > limit:
+                return Action(NONE, (
+                    f"{side}: до таргета ${dist:,.0f} > ${limit:,.0f} "
+                    f"({c.jump_max_target_sigmas:.0f}σ) — исход уже решён"))
+
+        bid, ask = s.bid(side), s.ask(side)
+        if ask is None:
+            return Action(NONE, f"{side}: нет ask в книге")
+
+        # Динамический запас: широкий спред сам поднимает планку.
+        spread = (ask - bid) if bid is not None else 0.05
+        edge_min = max(c.jump_min_edge_cents,
+                       c.jump_edge_spread_mult * spread * 100)
+        edge = self._edge(s, side, ask)
+        if edge is None:
+            return Action(NONE, "нет таргета или σ — запас не посчитать")
+        if edge * 100 < edge_min:
+            fair = ask + edge
+            return Action(NONE, (
+                f"{side}: справедливо {fair*100:.0f}¢, просят {ask*100:.0f}¢ "
+                f"-> запас {edge*100:+.1f}¢ < {edge_min:.1f}¢ "
+                f"(спред {spread*100:.0f}¢) — переплачиваем"))
+
+        # --- оценка качества: среднее компонентов, каждый нормирован на свой
+        # порог (1.0 = ровно на пороге) и ограничен тройкой, чтобы один
+        # аномальный компонент не покупал сделку в одиночку.
+        comps = [min(abs(jump) / need_jump, 3.0),
+                 min(spd / need_speed, 3.0),
+                 min(edge * 100 / edge_min, 3.0)]
+        shift = self._expected_shift(s, jump)
+        if shift is not None and c.jump_min_shift_cents > 0:
+            comps.append(min(abs(shift) * 100 / c.jump_min_shift_cents, 3.0))
+        quality = sum(comps) / len(comps)
+        if quality < c.jump_imp_min_score:
+            return Action(NONE, (
+                f"{side}: качество {quality:.2f} < {c.jump_imp_min_score:.2f} "
+                f"— импульс есть, но слабый"))
+
+        cap = self.max_leg_price_for_quality(quality)
+        if ask > cap:
+            return Action(NONE, (
+                f"{side} ask {ask:.2f} > потолка {cap:.2f} для качества "
+                f"{quality:.2f} — риск не по сигналу"))
+
+        stake = self.stake_for_quality(quality)
+        return (side, "Q", (
+            f"ИМПУЛЬС {side}: Q={quality:.2f} (скачок ${jump:+.2f}"
+            f"={abs(jump)/sigma:.1f}σ, скорость {spd:.1f}$/с, "
+            f"удержание {s.imp_hold:.0%}, ускорение {accel:.2f}, "
+            f"запас +{edge*100:.1f}¢ при пороге {edge_min:.1f}¢)"), stake)
 
     # ---- режим "jump": исходный триггер по скачку цены ----------------------
     def _trigger_jump(self, s: JumpSnapshot):
@@ -594,6 +753,27 @@ class JumpStrategy:
                 )
 
             gain = bid - leg.entry_price      # честный плюс: bid против ask
+
+            # ── ИМПУЛЬС УМЕР: скорость упала, прибыль есть — забираем ──
+            # Трейлинг реагирует только ПОСЛЕ отката процента, а скорость
+            # монеты умирает раньше отката. Взводится, только если пик
+            # скорости был осмысленным, а не шумом.
+            drop = getattr(c, "jump_exit_speed_drop", 0.0)
+            if (drop > 0 and s.speed is not None and gain > 0
+                    and leg.peak_speed >= getattr(c, "jump_exit_speed_floor",
+                                                  2.0)
+                    and s.speed * favour(leg.outcome)
+                        <= leg.peak_speed * (1.0 - drop)):
+                return Action(
+                    SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
+                    limit_price=round(bid, 2),
+                    reason=(
+                        f"ИМПУЛЬС УМЕР {leg.outcome}: скорость "
+                        f"{s.speed * favour(leg.outcome):+.1f}$/с после пика "
+                        f"{leg.peak_speed:.1f}$/с (падение >{drop:.0%}) — "
+                        f"забираю {gain:+.2f}, не жду отката"),
+                )
+
             if gain < c.jump_tp_min_gain:
                 continue                      # ещё не в плюсе — не о чем говорить
 
@@ -659,11 +839,12 @@ class JumpStrategy:
         c = self.cfg
         if c.jump_stop_loss <= 0:
             return None
+        stop = self.stop_threshold(s)
         for leg in self.legs:
             bid = s.bid(leg.outcome)
             if bid is None:
                 continue
-            if bid > leg.entry_bid - c.jump_stop_loss + 1e-9:
+            if bid > leg.entry_bid - stop + 1e-9:
                 continue
             return Action(
                 SELL, sell_idx=leg.idx, sell_outcome=leg.outcome,
@@ -671,10 +852,28 @@ class JumpStrategy:
                 reason=(f"СТОП {leg.outcome}: {bid:.2f} ниже бида на входе "
                         f"{leg.entry_bid:.2f} на "
                         f"{(leg.entry_bid - bid) * 100:.0f}¢ "
-                        f"(вошли по {leg.entry_price:.2f}, итог "
+                        f"(порог {stop*100:.1f}¢, вошли по "
+                        f"{leg.entry_price:.2f}, итог "
                         f"{bid - leg.entry_price:+.2f})"),
             )
         return None
+
+    def stop_threshold(self, s: JumpSnapshot) -> float:
+        """Порог жёсткого стопа, адаптированный к волатильности.
+
+        На тихом рынке (σ около опорной) это прежний 1¢. На разогнанном
+        случайный тик двигает процент на цент и выбивал бы позицию при
+        верном направлении — порог растёт пропорционально σ, но не выше
+        потолка jump_stop_max.
+        """
+        c = self.cfg
+        stop = c.jump_stop_loss
+        if (getattr(c, "jump_stop_adaptive", False) and s.sigma_1s
+                and s.sigma_1s > 0 and c.jump_sigma_ref > 0):
+            mult = max(1.0, s.sigma_1s / c.jump_sigma_ref)
+            stop = min(stop * mult, getattr(c, "jump_stop_max", 0.05))
+            stop = max(stop, c.jump_stop_loss)
+        return stop
 
     # ======================================================================
     #  Лестница-переворот: продаём провалившуюся ногу и берём другую сторону

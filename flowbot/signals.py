@@ -24,6 +24,8 @@ from typing import Deque, Dict, Optional, Tuple
 import fast_monitor
 from book_monitor import Book
 
+from .impulse import ImpulseTracker
+
 
 # ---------------------------------------------------------------------------
 #  Цена: скорость / всплеск (Бот 1)
@@ -51,6 +53,11 @@ class PriceEngine:
         # можно звать на КАЖДОМ обновлении книги, а не по таймеру.
         self._lo: Deque[Tuple[float, float]] = deque()
         self._hi: Deque[Tuple[float, float]] = deque()
+        # Качество импульса (режим "impulse"): скорость, ускорение,
+        # удержание хода, возраст экстремума. Отдельный трекер с коротким
+        # окном — 60-секундный swing для него слишком стар.
+        self.imp = ImpulseTracker(
+            lookback_s=getattr(cfg, "jump_imp_lookback_s", 15.0))
 
     def update(self, t_ms: float) -> Optional[float]:
         price, _accepted, _rejected = self.cons.compute(t_ms)
@@ -73,6 +80,7 @@ class PriceEngine:
         while self.hist and t_s - self.hist[0][0] > keep:
             self.hist.popleft()
         self._update_swing(t_s, price)
+        self.imp.feed(t_s, price)
         return price
 
     def _update_swing(self, t_s: float, price: float) -> None:
@@ -130,6 +138,7 @@ class PriceEngine:
         self._lo.clear()
         self._hi.clear()
         self._sm3.clear()
+        self.imp.reset(time.time(), self._price)
         if self._price is not None:
             self._smooth = self._raw = self._price
             now = time.time()

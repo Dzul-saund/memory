@@ -50,11 +50,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="скачок для дешёвой стороны, $ (деф. 15)")
     p.add_argument("--split", type=float,
                    help="граница дорого/дёшево по проценту (деф. 0.51)")
-    p.add_argument("--entry-mode", choices=["jump", "edge", "lag"],
+    p.add_argument("--entry-mode", choices=["jump", "edge", "lag", "impulse"],
                    help="ЧТО считать поводом войти: jump — скачок цены "
                         "(деф.); edge — запас Phi(z)−ask; lag — отставание "
-                        "якоря Polymarket. Всё остальное у режимов общее, "
-                        "поэтому их запуски можно сравнивать напрямую")
+                        "якоря Polymarket; impulse — КАЧЕСТВО импульса "
+                        "(скорость+ускорение+удержание, ставка от качества)")
     p.add_argument("--trigger", choices=["swing", "window"],
                    help="swing (деф.) — ловим движение от локального дна/пика "
                         "сразу; window — сравниваем с ценой N секунд назад")

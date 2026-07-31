@@ -145,8 +145,33 @@ class TestLagMode:
 # ---------------------------------------------------------------------------
 class TestSharedGates:
     @pytest.mark.parametrize("mode", ["jump", "edge", "lag"])
-    def test_no_entries_at_the_very_end(self, mode):
+    def test_no_late_entry_on_the_cheap_side(self, mode):
+        """В конце окна берём только сторону, которая уже выигрывает.
+
+        Сторона дешевле сплита в последние секунды безнадёжна: её не
+        вытянет никакой импульс, времени на переоценку не осталось.
+        """
         c = base_cfg(mode)
+        c.jump_late_entry = True
+        act = JumpStrategy(c).on_tick(snap(
+            left=3.0, jump=50.0, price=65_005.0,
+            up_bid=0.29, up_ask=0.30, down_bid=0.70, down_ask=0.71))
+        assert act.kind == NONE
+
+    def test_late_entry_refusal_names_the_reason(self):
+        """Отказ должен объяснять, что дело в позднем входе, а не в чём-то ещё."""
+        c = base_cfg("edge")
+        c.jump_late_entry = True
+        act = JumpStrategy(c).on_tick(snap(
+            left=3.0, price=65_005.0,
+            up_bid=0.29, up_ask=0.30, down_bid=0.70, down_ask=0.71))
+        assert act.kind == NONE
+        assert "поздний вход" in act.reason
+
+    @pytest.mark.parametrize("mode", ["jump", "edge", "lag"])
+    def test_late_entry_switched_off_blocks_everything(self, mode):
+        c = base_cfg(mode)
+        c.jump_late_entry = False
         act = JumpStrategy(c).on_tick(snap(left=3.0, jump=50.0, up_ask=0.55))
         assert act.kind == NONE
         assert "конец окна" in act.reason

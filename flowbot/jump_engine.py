@@ -130,6 +130,10 @@ class JumpEngine(FlowEngine):
         pm_age = (now_ms() - fast_monitor.last_update.get("polymarket", 0)
                   if pm is not None else None)
 
+        # Качество импульса: скорость/ускорение/удержание/возраст экстремума.
+        # None до прогрева трекера — режим impulse честно ждёт данных.
+        imp = self.price.imp.state()
+
         snap = JumpSnapshot(
             t=time.time(),
             seconds_left=max(0.0, self.market["end_ts"] - time.time()),
@@ -140,7 +144,15 @@ class JumpEngine(FlowEngine):
             up_flow=self.book.flow(up, cfg.flow_window_s),
             down_flow=self.book.flow(dn, cfg.flow_window_s),
             pm_price=pm, pm_age_ms=pm_age,
+            speed=imp.speed if imp else None,
+            accel=imp.accel if imp else None,
+            imp_age_s=imp.age_s if imp else None,
+            imp_hold=imp.hold if imp else None,
         )
+        # В режиме impulse скачок меряется коротким окном трекера, а не
+        # 60-секундным swing: старое дно не имеет отношения к движению.
+        if cfg.jump_entry_mode == "impulse" and imp is not None:
+            snap.jump_usd = imp.jump_usd
 
         # Запоминаем последний bid каждой ноги — по нему считаем расчёт, если
         # книга к моменту сеттла уже закрылась.
@@ -948,6 +960,22 @@ class JumpEngine(FlowEngine):
             self.log.info(
                 "потолок цены ноги %.2f — у краёв модель занижает хвост, "
                 "и «запас» там ненастоящий", c.jump_max_leg_price)
+        elif c.jump_entry_mode == "impulse":
+            self.log.info(
+                "ВХОД ПО КАЧЕСТВУ ИМПУЛЬСА: скачок >=%.1fσ И скорость "
+                ">=%.1fσ $/с И удержание >=%.0f%% И без затухания "
+                "(ускорение >=%.2f); запас >= max(%.1f¢, %.1f×спред); "
+                "ставка от качества: $%.0f/$%.0f/$%.0f/$%.0f",
+                c.jump_imp_jump_sigmas, c.jump_imp_speed_sigmas,
+                c.jump_imp_min_hold * 100, c.jump_imp_min_accel,
+                c.jump_min_edge_cents, c.jump_edge_spread_mult,
+                c.jump_stake_usdc, c.jump_stake_good, c.jump_stake_strong,
+                c.jump_stake_best)
+            self.log.info(
+                "окно экстремума %.0fс; потолок цены ноги по качеству: "
+                "%.2f/%.2f/%.2f", c.jump_imp_lookback_s,
+                c.jump_max_leg_price_weak, c.jump_max_leg_price,
+                c.jump_max_leg_price_strong)
         elif c.jump_entry_mode == "lag":
             self.log.info(
                 "ВХОД ПО ОТСТАВАНИЮ ЯКОРЯ: Phi(z по нашей цене) − Phi(z по "
