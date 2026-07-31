@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import pytest
 
-from flowbot.config import FlowConfig
+from flowbot.config import JUMP_ENTRY_MODES, FlowConfig
 from flowbot.jump import ENTER, NONE, JumpSnapshot, JumpStrategy, TRACK_A
-from flowbot.jump_run import tag_path
+from flowbot.jump_run import parse_args, tag_path
 
 
 def base_cfg(mode: str) -> FlowConfig:
@@ -203,6 +203,24 @@ class TestIsolation:
         c = base_cfg("нечто")
         with pytest.raises(ValueError, match="JUMP_ENTRY_MODE"):
             c.validate_jump()
+
+    def test_every_declared_mode_actually_starts(self):
+        """Каждый режим из списка обязан ПРОХОДИТЬ проверку настроек.
+
+        Дефект, ради которого этот тест написан: режим `impulse` был
+        реализован, покрыт тестами и принимался в --entry-mode, но список
+        допустимых значений в validate_jump() остался прежним. Все 379
+        тестов проходили, а бот на сервере отвечал «JUMP_ENTRY_MODE должен
+        быть jump, edge или lag» и не стартовал. Перечисление было
+        продублировано — теперь оно одно, и этот тест ходит по нему.
+        """
+        for mode in JUMP_ENTRY_MODES:
+            base_cfg(mode).validate_jump()      # не должно бросать
+
+    def test_cli_accepts_every_declared_mode(self):
+        """argparse и валидация обязаны знать один и тот же список."""
+        for mode in JUMP_ENTRY_MODES:
+            assert parse_args(["--entry-mode", mode]).entry_mode == mode
 
     def test_edge_mode_needs_edge_threshold(self):
         c = base_cfg("edge")

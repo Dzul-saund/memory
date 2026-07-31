@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 
-from .config import FlowConfig
+from .config import JUMP_ENTRY_MODES, FlowConfig
 from .jump_engine import JumpEngine
 from .singleton import InstanceLock
 
@@ -50,7 +50,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="скачок для дешёвой стороны, $ (деф. 15)")
     p.add_argument("--split", type=float,
                    help="граница дорого/дёшево по проценту (деф. 0.51)")
-    p.add_argument("--entry-mode", choices=["jump", "edge", "lag", "impulse"],
+    p.add_argument("--entry-mode", choices=list(JUMP_ENTRY_MODES),
                    help="ЧТО считать поводом войти: jump — скачок цены "
                         "(деф.); edge — запас Phi(z)−ask; lag — отставание "
                         "якоря Polymarket; impulse — КАЧЕСТВО импульса "

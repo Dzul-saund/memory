@@ -32,7 +32,7 @@ from collections import defaultdict
 from typing import Dict, Iterator, List, Optional
 
 from btc_bot.util import whole_shares
-from flowbot.config import FlowConfig
+from flowbot.config import JUMP_ENTRY_MODES, FlowConfig
 from flowbot.impulse import ImpulseTracker
 from flowbot.jump import (ENTER, LADDER, SELL, JumpSnapshot, JumpStrategy,
                           ladder_shares)

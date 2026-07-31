@@ -46,6 +46,13 @@ def _b(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on", "y")
 
 
+# Режимы входа. ОДИН список на весь проект, и это не педантизм: раньше
+# перечисление было продублировано в validate_jump() и в argparse, поэтому
+# новый режим `impulse` прошёл все тесты, но бот отказался стартовать —
+# валидация о нём не знала. Любой новый режим добавляется ЗДЕСЬ.
+JUMP_ENTRY_MODES = ("jump", "edge", "lag", "impulse")
+
+
 @dataclass
 class FlowConfig:
     # --- монета / рынок ------------------------------------------------------
@@ -542,8 +549,9 @@ class FlowConfig:
         errs = []
         if self.jump_stake_usdc <= 0:
             errs.append("JUMP_STAKE_USDC должен быть > 0")
-        if self.jump_entry_mode not in ("jump", "edge", "lag"):
-            errs.append(f"JUMP_ENTRY_MODE должен быть jump, edge или lag, "
+        if self.jump_entry_mode not in JUMP_ENTRY_MODES:
+            errs.append(f"JUMP_ENTRY_MODE должен быть один из "
+                        f"{', '.join(JUMP_ENTRY_MODES)}, "
                         f"а не {self.jump_entry_mode!r}")
         if self.jump_entry_mode == "edge" and self.jump_min_edge_cents <= 0:
             errs.append("режим edge требует JUMP_MIN_EDGE_CENTS > 0 — "
