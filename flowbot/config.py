@@ -229,8 +229,22 @@ class FlowConfig:
     # Минимальное ускорение: скорость свежего участка к предыдущему.
     # Ниже — импульс затухает, вход отменяется даже при хорошем скачке.
     jump_imp_min_accel: float = 0.5
-    # Минимальная итоговая оценка качества (1.0 = все компоненты на порогах).
-    jump_imp_min_score: float = 1.0
+    # МИНИМАЛЬНАЯ ИТОГОВАЯ ОЦЕНКА — единственный порог, по которому теперь
+    # принимается решение о входе. Score в [0..1] (см. flowbot/score.py).
+    #
+    # Прежние восемь обязательных ворот отменяли сделку целиком из-за одного
+    # признака, промахнувшегося на пару процентов: возраст импульса 8.2с
+    # вместо 8.0 — и сильный сигнал пропадал. Теперь каждый признак даёт
+    # оценку 0..1, они складываются с весами, и решение принимается один раз.
+    jump_imp_min_score: float = 0.70
+    # НОЛЬ ПО ЛЮБОМУ ПРИЗНАКУ ОТМЕНЯЕТ ВХОД.
+    # В шкалах score.py ноль означает не «слабо», а «у нужного нам сигнала
+    # так не бывает»: удержание ниже 60% — вынос ликвидности, ход меньше
+    # 1.5σ — шум, скорость ниже 0.7σ — движение кончилось. Без этого правила
+    # средневзвешенное 0.89 покупало бы ровно тот вынос ликвидности, ради
+    # отсева которого вся конструкция и строилась. Всё, что больше нуля,
+    # не блокирует ничего и работает только через вес.
+    jump_score_veto_zero: bool = True
     # Размер ставки от качества сигнала: база jump_stake_usdc ($1), дальше
     # хороший/сильный/исключительный. Пороги — по оценке качества Q.
     # СТАВКА ОТ КАЧЕСТВА — ВЫКЛЮЧЕНА по умолчанию.
@@ -243,9 +257,14 @@ class FlowConfig:
     jump_stake_good: float = 2.0
     jump_stake_strong: float = 4.0
     jump_stake_best: float = 8.0
-    jump_q_good: float = 1.5
-    jump_q_strong: float = 2.0
-    jump_q_best: float = 3.0
+    # ШКАЛА ОЦЕНКИ ИЗМЕНИЛАСЬ: Score теперь в [0..1], а не «1.0 = на пороге,
+    # дальше сколько получится». Поэтому все пороги, зависящие от неё,
+    # переставлены. Старые значения (1.5/2.0/3.0) на новой шкале недостижимы
+    # и означали бы «не торговать никогда» — validate_jump ловит это и
+    # говорит прямо, а не оставляет бота молча стоять.
+    jump_q_good: float = 0.80
+    jump_q_strong: float = 0.88
+    jump_q_best: float = 0.95
     # ВЕСА КОМПОНЕНТОВ Q. Простое среднее объявляло все четыре признака
     # одинаково важными, а это заведомо неверно: скорость и запас объясняют
     # исход сделки не так, как размер хода. Веса нормируются сами, поэтому
@@ -257,6 +276,14 @@ class FlowConfig:
     jump_w_edge: float = 0.30
     jump_w_jump: float = 0.20
     jump_w_shift: float = 0.10
+    # Удержание, возраст и ускорение раньше были жёсткими воротами и веса не
+    # имели. Теперь они такие же слагаемые оценки, как остальные, и вес им
+    # нужен. Эти три числа выбраны так, чтобы прежняя четвёрка осталась
+    # главной, но «почти прошёл» перестало значить «не прошёл». Как и все
+    # прочие веса — догадка, подтверждать перебором.
+    jump_w_hold: float = 0.20
+    jump_w_age: float = 0.10
+    jump_w_accel: float = 0.10
     jump_w_book: float = 0.0        # перекос книги: считается, но пока не весит
     # ВОЗРАСТ ИМПУЛЬСА. Экстремум может быть свежим по меркам окна поиска и
     # при этом движение уже идёт 20 секунд — все фильтры пройдут, а покупать
@@ -366,7 +393,7 @@ class FlowConfig:
     # И планка для такого повторного входа ВЫШЕ обычной: переворот рискованнее
     # первого входа, значит сигнал должен быть сильнее среднего. Действует
     # jump_ladder_strict_s секунд после выхода в минус.
-    jump_ladder_min_q: float = 1.5
+    jump_ladder_min_q: float = 0.80
     jump_ladder_strict_s: float = 30.0
     # --- структура книги заявок (flowbot/bookfeat.py) ------------------------
     # Сколько уровней считать глубиной и за какое окно мерить её изменение.
@@ -494,22 +521,26 @@ class FlowConfig:
             jump_imp_speed_sigmas=_f("JUMP_IMP_SPEED_SIGMAS", 1.0),
             jump_imp_min_hold=_f("JUMP_IMP_MIN_HOLD", 0.7),
             jump_imp_min_accel=_f("JUMP_IMP_MIN_ACCEL", 0.5),
-            jump_imp_min_score=_f("JUMP_IMP_MIN_SCORE", 1.0),
+            jump_imp_min_score=_f("JUMP_IMP_MIN_SCORE", 0.70),
+            jump_score_veto_zero=_b("JUMP_SCORE_VETO_ZERO", True),
             jump_stake_by_quality=_b("JUMP_STAKE_BY_QUALITY", False),
             jump_stake_good=_f("JUMP_STAKE_GOOD", 2.0),
             jump_stake_strong=_f("JUMP_STAKE_STRONG", 4.0),
             jump_stake_best=_f("JUMP_STAKE_BEST", 8.0),
-            jump_q_good=_f("JUMP_Q_GOOD", 1.5),
-            jump_q_strong=_f("JUMP_Q_STRONG", 2.0),
-            jump_q_best=_f("JUMP_Q_BEST", 3.0),
+            jump_q_good=_f("JUMP_Q_GOOD", 0.80),
+            jump_q_strong=_f("JUMP_Q_STRONG", 0.88),
+            jump_q_best=_f("JUMP_Q_BEST", 0.95),
             jump_w_speed=_f("JUMP_W_SPEED", 0.40),
             jump_w_edge=_f("JUMP_W_EDGE", 0.30),
             jump_w_jump=_f("JUMP_W_JUMP", 0.20),
             jump_w_shift=_f("JUMP_W_SHIFT", 0.10),
+            jump_w_hold=_f("JUMP_W_HOLD", 0.20),
+            jump_w_age=_f("JUMP_W_AGE", 0.10),
+            jump_w_accel=_f("JUMP_W_ACCEL", 0.10),
             jump_w_book=_f("JUMP_W_BOOK", 0.0),
             jump_imp_max_age_s=_f("JUMP_IMP_MAX_AGE_S", 8.0),
             jump_ladder_reenters=_b("JUMP_LADDER_REENTERS", True),
-            jump_ladder_min_q=_f("JUMP_LADDER_MIN_Q", 1.5),
+            jump_ladder_min_q=_f("JUMP_LADDER_MIN_Q", 0.80),
             jump_ladder_strict_s=_f("JUMP_LADDER_STRICT_S", 30.0),
             jump_book_levels=_i("JUMP_BOOK_LEVELS", 5),
             jump_book_window_s=_f("JUMP_BOOK_WINDOW_S", 3.0),
@@ -622,6 +653,33 @@ class FlowConfig:
             errs.append(f"JUMP_ENTRY_MODE должен быть один из "
                         f"{', '.join(JUMP_ENTRY_MODES)}, "
                         f"а не {self.jump_entry_mode!r}")
+        # ШКАЛА ОЦЕНКИ СМЕНИЛАСЬ, И МОЛЧА ЭТО ПРОПУСКАТЬ НЕЛЬЗЯ.
+        # Раньше Q считалась как «1.0 = все компоненты ровно на порогах» и
+        # могла быть сколь угодно больше единицы. Теперь Score лежит в [0..1].
+        # Старое значение вроде 1.0 или 1.5 на новой шкале недостижимо, и бот
+        # с ним просто НИКОГДА не откроет сделку — молча, без единой ошибки в
+        # логе. Это худший вид поломки, поэтому ловим её на старте.
+        # Для порога входа граница СТРОГАЯ (>=1.0), а не «больше единицы»:
+        # 1.0 — это ровно прежнее значение по умолчанию, и на новой шкале оно
+        # означает «покупать только при идеальной оценке по всем признакам».
+        # Такой бот тоже молчит, просто чуть менее очевидно.
+        for name, val, limit in (
+                ("JUMP_IMP_MIN_SCORE", self.jump_imp_min_score, 1.0),
+                ("JUMP_Q_GOOD", self.jump_q_good, 1.0 + 1e-9),
+                ("JUMP_Q_STRONG", self.jump_q_strong, 1.0 + 1e-9),
+                ("JUMP_Q_BEST", self.jump_q_best, 1.0 + 1e-9),
+                ("JUMP_LADDER_MIN_Q", self.jump_ladder_min_q, 1.0 + 1e-9)):
+            if val >= limit:
+                errs.append(
+                    f"{name}={val:g} — это СТАРАЯ шкала оценки. Теперь Score "
+                    f"лежит в [0..1], и с таким порогом бот не открыл бы ни "
+                    f"одной сделки. Убери строку из .env (возьмутся новые "
+                    f"значения по умолчанию) или поставь: "
+                    f"JUMP_IMP_MIN_SCORE=0.70, JUMP_Q_GOOD=0.80, "
+                    f"JUMP_Q_STRONG=0.88, JUMP_Q_BEST=0.95, "
+                    f"JUMP_LADDER_MIN_Q=0.80")
+                break
+
         if self.jump_entry_mode == "edge" and self.jump_min_edge_cents <= 0:
             errs.append("режим edge требует JUMP_MIN_EDGE_CENTS > 0 — "
                         "запас и есть его единственный триггер")

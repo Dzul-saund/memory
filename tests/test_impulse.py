@@ -135,28 +135,46 @@ class TestImpulseGates:
         assert act.outcome == "Up"
         assert "ИМПУЛЬС" in act.reason
 
-    def test_jump_threshold_is_in_sigmas_not_dollars(self):
-        """σ=5 -> нужно $10; те же $6 уже не проходят."""
+    def test_jump_is_measured_in_sigmas_not_dollars(self):
+        """σ=5 -> $6 это чуть больше сигмы, оценка хода падает в ноль."""
         s = JumpStrategy(cfg_imp())
         assert s.on_tick(isnap(jump=6.0, sigma=1.0)).kind == ENTER
         act = s.on_tick(isnap(jump=6.0, sigma=5.0, speed=20.0))
         assert act.kind == NONE
-        assert "σ" in act.reason
+        assert "jump 0.00" in act.reason
 
     def test_slow_move_is_refused_even_with_a_big_jump(self):
+        """Скорость 0.3σ ниже дна шкалы (0.7σ) — это ноль, а ноль запрещает."""
         act = JumpStrategy(cfg_imp()).on_tick(isnap(jump=20.0, speed=0.3))
         assert act.kind == NONE
-        assert "выдохлось" in act.reason
+        assert "speed" in act.reason
 
     def test_liquidity_sweep_is_refused(self):
+        """Удержание 55% ниже дна шкалы (60%) — ноль, вход отменён."""
         act = JumpStrategy(cfg_imp()).on_tick(isnap(hold=0.55))
         assert act.kind == NONE
-        assert "вынос ликвидности" in act.reason
+        assert "hold" in act.reason and "запрещающий" in act.reason
 
-    def test_fading_impulse_is_refused(self):
-        act = JumpStrategy(cfg_imp()).on_tick(isnap(accel=0.2))
-        assert act.kind == NONE
-        assert "затухает" in act.reason
+    def test_fading_impulse_only_lowers_the_score(self):
+        """А вот ускорение 0.2 — уже НЕ запрет, а штраф.
+
+        Ровно то, ради чего вводился скоринг: признак, просевший ниже
+        прежнего жёсткого порога (0.5), больше не отменяет сделку в
+        одиночку — он лишь снижает её оценку.
+        """
+        s = JumpStrategy(cfg_imp())
+        good = s.on_tick(isnap(accel=1.5))
+        weak = s.on_tick(isnap(accel=0.45))
+        assert good.kind == ENTER and weak.kind == ENTER
+        assert weak.feat["q"] < good.feat["q"]
+        assert weak.feat["s_accel"] < good.feat["s_accel"]
+
+    def test_one_slightly_missed_threshold_no_longer_kills_the_trade(self):
+        """Возраст 8.2с вместо 8.0 — прежде это был полный отказ."""
+        act = JumpStrategy(cfg_imp()).on_tick(
+            isnap(jump=12.0, speed=6.0, hold=1.0, accel=1.5, age=8.2))
+        assert act.kind == ENTER, "сильный сигнал не должен пропадать"
+        assert act.feat["s_age"] < 1.0, "но возраст обязан снизить оценку"
 
     def test_waits_for_the_tracker_to_warm_up(self):
         act = JumpStrategy(cfg_imp()).on_tick(isnap(speed=None))
@@ -174,14 +192,19 @@ class TestImpulseGates:
 
 
 class TestDynamicEdge:
-    def test_wide_spread_raises_the_bar(self):
-        """Спред 10¢ -> порог запаса 20¢, а не фиксированные 3¢."""
+    def test_wide_spread_lowers_the_edge_score(self):
+        """Спред остался в расчёте — он растягивает шкалу запаса.
+
+        Абсолютная шкала «6¢ = отлично» неверна там, где спред 10¢: после
+        круга от такого запаса не остаётся ничего. Опорный порог считается
+        как max(база, множитель × спред), и вся шкала едет вместе с ним.
+        """
         c = cfg_imp(jump_edge_spread_mult=2.0)
-        # Phi(z) при d=$5, sigma=1, t=150 => 0.6588. Ask 0.60 => запас 5.9¢.
-        # При спреде 10¢ порог 20¢ — вход обязан быть отклонён.
-        act = JumpStrategy(c).on_tick(isnap(up_bid=0.50, up_ask=0.60))
-        assert act.kind == NONE
-        assert "спред" in act.reason
+        s = JumpStrategy(c)
+        tight = s.on_tick(isnap(up_bid=0.59, up_ask=0.60))
+        wide = s.on_tick(isnap(up_bid=0.50, up_ask=0.60))
+        assert tight.feat["s_edge"] > wide.feat["s_edge"]
+        assert wide.kind == NONE, "20¢ порога против 5.9¢ запаса"
 
     def test_tight_spread_keeps_the_base_threshold(self):
         act = JumpStrategy(cfg_imp()).on_tick(isnap(up_bid=0.59, up_ask=0.60))
@@ -198,21 +221,21 @@ class TestQualitySizing:
         разный размер позиции смешивает «сигнал был лучше» с «мы поставили
         больше»."""
         s = JumpStrategy(cfg_imp())
-        for q in (0.5, 1.6, 2.1, 3.5, 99.0):
+        for q in (0.0, 0.5, 0.75, 0.9, 1.0):
             assert s.stake_for_quality(q) == 1.0
 
     def test_stake_grows_with_quality(self):
         s = JumpStrategy(cfg_imp(jump_stake_by_quality=True))
-        assert s.stake_for_quality(0.5) == 1.0
-        assert s.stake_for_quality(1.6) == 2.0
-        assert s.stake_for_quality(2.1) == 4.0
-        assert s.stake_for_quality(3.5) == 8.0
+        assert s.stake_for_quality(0.70) == 1.0
+        assert s.stake_for_quality(0.82) == 2.0
+        assert s.stake_for_quality(0.90) == 4.0
+        assert s.stake_for_quality(0.97) == 8.0
 
     def test_price_cap_grows_with_quality(self):
         s = JumpStrategy(cfg_imp())
-        assert s.max_leg_price_for_quality(0.5) == pytest.approx(0.92)
-        assert s.max_leg_price_for_quality(1.6) == pytest.approx(0.95)
-        assert s.max_leg_price_for_quality(2.5) == pytest.approx(0.97)
+        assert s.max_leg_price_for_quality(0.72) == pytest.approx(0.92)
+        assert s.max_leg_price_for_quality(0.82) == pytest.approx(0.95)
+        assert s.max_leg_price_for_quality(0.95) == pytest.approx(0.97)
 
     def test_strong_signal_buys_more(self):
         """Сильный импульс получает ставку больше базовой — если включено."""
@@ -223,7 +246,7 @@ class TestQualitySizing:
 
     def test_weak_signal_gets_less_than_a_strong_one(self):
         s = JumpStrategy(cfg_imp(jump_stake_by_quality=True))
-        weak = s.on_tick(isnap(jump=2.1, speed=1.05, accel=0.9, hold=0.75,
+        weak = s.on_tick(isnap(jump=2.6, speed=1.6, accel=1.0, hold=0.85,
                                up_bid=0.61, up_ask=0.62))
         strong = s.on_tick(isnap(jump=12.0, speed=9.0, accel=2.5, hold=1.0))
         assert weak.kind == ENTER and strong.kind == ENTER
@@ -231,7 +254,7 @@ class TestQualitySizing:
 
     def test_same_stake_regardless_of_quality_by_default(self):
         s = JumpStrategy(cfg_imp())
-        weak = s.on_tick(isnap(jump=2.1, speed=1.05, accel=0.9, hold=0.75,
+        weak = s.on_tick(isnap(jump=2.6, speed=1.6, accel=1.0, hold=0.85,
                                up_bid=0.61, up_ask=0.62))
         strong = s.on_tick(isnap(jump=12.0, speed=9.0, accel=2.5, hold=1.0))
         assert weak.kind == ENTER and strong.kind == ENTER

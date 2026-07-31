@@ -83,20 +83,21 @@ class TestLadderReenters:
 
     def test_reentry_needs_a_higher_bar(self):
         """Планка повторного входа выше обычной."""
-        c = cfg_imp(jump_imp_min_score=1.0, jump_ladder_min_q=1.5,
+        c = cfg_imp(jump_imp_min_score=0.70, jump_ladder_min_q=0.90,
                     jump_ladder_strict_s=30.0)
         s = self._in_position(c)
         s.on_tick(isnap(t=1.0, up_bid=0.52, up_ask=0.53))
         s.on_tick(isnap(t=2.0, up_bid=0.52, up_ask=0.53))
         s.record_sell(0, 1.04, t=2.0)
 
-        # Сигнал, которого хватило бы для ОБЫЧНОГО входа (Q около 1.2),
-        # но мало для повторного.
-        weak = isnap(t=3.0, jump=2.2, speed=1.1, accel=0.8, hold=0.75,
-                     down_bid=0.44, down_ask=0.45)
+        # Сигнал, которого хватило бы для ОБЫЧНОГО входа, но мало для
+        # повторного: Score между 0.70 и 0.90.
+        weak = isnap(t=3.0, jump=-2.6, speed=-1.6, accel=1.0, hold=0.85,
+                     price=64_997.0, down_bid=0.55, down_ask=0.56)
         act = s.on_tick(weak)
         assert act.kind == NONE
         assert "планка поднята" in act.reason
+        assert 0.70 <= act.feat["q"] < 0.90
 
     def test_bar_returns_to_normal_after_the_window(self):
         c = cfg_imp(jump_ladder_strict_s=30.0)
@@ -159,54 +160,71 @@ class TestWeightedQuality:
         return act.feat["q"]
 
     def test_weights_change_the_score(self):
-        """Один и тот же рынок при разных весах даёт разное Q."""
-        snap = isnap(jump=8.0, speed=2.2, accel=1.5, hold=1.0)
+        """Один и тот же рынок при разных весах даёт разный Score."""
+        snap = isnap(jump=8.0, speed=1.1, accel=1.5, hold=1.0)
         fast = JumpStrategy(cfg_imp(jump_w_speed=1.0, jump_w_edge=0.0,
-                                    jump_w_jump=0.0, jump_w_shift=0.0))
+                                    jump_w_jump=0.0, jump_w_shift=0.0,
+                                    jump_w_hold=0.0, jump_w_age=0.0,
+                                    jump_w_accel=0.0))
         big = JumpStrategy(cfg_imp(jump_w_speed=0.0, jump_w_edge=0.0,
-                                   jump_w_jump=1.0, jump_w_shift=0.0))
+                                   jump_w_jump=1.0, jump_w_shift=0.0,
+                                   jump_w_hold=0.0, jump_w_age=0.0,
+                                   jump_w_accel=0.0))
         a, b = fast.on_tick(snap), big.on_tick(snap)
-        assert a.kind == ENTER and b.kind == ENTER
-        # Ход 8σ против скорости 2.2σ/с — вес решает, что важнее.
+        # Ход 8σ (оценка 1.0) против скорости 1.1σ/с (оценка 0.8):
+        # вес решает, что из этого важнее.
         assert self._q(b) > self._q(a)
 
-    def test_zero_weights_fall_back_to_plain_average(self):
-        snap = isnap(jump=8.0, speed=2.2, accel=1.5, hold=1.0)
-        zero = JumpStrategy(cfg_imp(jump_w_speed=0.0, jump_w_edge=0.0,
-                                    jump_w_jump=0.0, jump_w_shift=0.0,
-                                    jump_w_book=0.0))
-        act = zero.on_tick(snap)
-        assert act.kind == ENTER
-        parts = act.feat["q_parts"]
-        assert self._q(act) == pytest.approx(sum(parts.values()) / len(parts),
-                                             abs=1e-6)
+    def test_every_component_is_recorded_separately(self):
+        """В журнал идёт не только Score, но и оценка КАЖДОГО признака.
 
-    def test_components_are_recorded(self):
+        Без этого нельзя ответить, какой признак чаще всего тянет сделки
+        вниз, — а ради этого ответа скоринг и вводился.
+        """
         act = JumpStrategy(cfg_imp()).on_tick(isnap())
         assert act.kind == ENTER
-        assert set(act.feat["q_parts"]) >= {"speed", "edge", "jump"}
+        for name in ("s_speed", "s_edge", "s_jump", "s_hold", "s_age",
+                     "s_accel", "s_book"):
+            assert 0.0 <= act.feat[name] <= 1.0
+
+    def test_refusal_also_carries_the_scores(self):
+        """Отказ обязан объяснять себя цифрами, а не только словами."""
+        act = JumpStrategy(cfg_imp()).on_tick(isnap(hold=0.5))
+        assert act.kind == NONE
+        assert act.feat["s_hold"] == 0.0
+        assert act.feat["s_speed"] > 0.0
 
 
 # ---------------------------------------------------------------------------
 #  Возраст импульса
 # ---------------------------------------------------------------------------
 class TestImpulseAge:
-    def test_old_impulse_is_refused(self):
-        """Движение идёт 20с: все фильтры пройдут, а покупать нечего."""
-        act = JumpStrategy(cfg_imp(jump_imp_max_age_s=8.0)).on_tick(
-            isnap(age=20.0))
+    def test_very_old_impulse_scores_zero(self):
+        """Движение идёт 20с — вход пришёлся бы на самый конец хода."""
+        act = JumpStrategy(cfg_imp()).on_tick(isnap(age=20.0))
         assert act.kind == NONE
-        assert "идёт уже" in act.reason
+        assert act.feat["s_age"] == 0.0
 
-    def test_fresh_impulse_passes(self):
-        act = JumpStrategy(cfg_imp(jump_imp_max_age_s=8.0)).on_tick(
-            isnap(age=2.0))
+    def test_fresh_impulse_scores_full(self):
+        act = JumpStrategy(cfg_imp()).on_tick(isnap(age=2.0))
         assert act.kind == ENTER
+        assert act.feat["s_age"] == 1.0
 
-    def test_zero_disables_the_limit(self):
-        act = JumpStrategy(cfg_imp(jump_imp_max_age_s=0.0)).on_tick(
-            isnap(age=60.0))
-        assert act.kind == ENTER
+    def test_slightly_over_the_old_gate_is_only_a_penalty(self):
+        """9с вместо прежних 8 — штраф, а не отказ."""
+        s = JumpStrategy(cfg_imp())
+        fresh = s.on_tick(isnap(age=2.0))
+        older = s.on_tick(isnap(age=9.0))
+        assert older.kind == ENTER
+        assert older.feat["s_age"] < fresh.feat["s_age"]
+
+    def test_scale_stretches_with_the_setting(self):
+        """Ручка возраста осталась живой — она растягивает шкалу."""
+        strict = JumpStrategy(cfg_imp(jump_imp_max_age_s=4.0))
+        loose = JumpStrategy(cfg_imp(jump_imp_max_age_s=16.0))
+        snap = isnap(age=9.0)
+        assert (strict.on_tick(snap).feat["s_age"]
+                < loose.on_tick(snap).feat["s_age"])
 
 
 # ---------------------------------------------------------------------------

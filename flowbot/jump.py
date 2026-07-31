@@ -45,6 +45,8 @@ from typing import Dict, List, Optional, Tuple
 from btc_bot.prob import expected_shift, fair_up_probability
 from btc_bot.util import floor2
 
+from . import score
+
 # Виды действий
 ENTER = "enter"     # первый вход в раунде
 LADDER = "ladder"   # добор противоположной стороны, перекрывающий минус
@@ -608,70 +610,53 @@ class JumpStrategy:
         return c.jump_max_leg_price_weak
 
     def _trigger_impulse(self, s: JumpSnapshot):
-        """Вход по КАЧЕСТВУ импульса, а не по пройденному расстоянию.
+        """Вход по ОЦЕНКЕ качества, а не по восьми обязательным воротам.
 
-        Жёсткие ворота (провал любых — сделки нет):
-          1. скачок >= jump_imp_jump_sigmas * σ   (пороги в σ, не в долларах);
-          2. скорость в сторону импульса >= jump_imp_speed_sigmas * σ;
-          3. удержание хода >= jump_imp_min_hold  (иначе это вынос ликвидности);
-          4. ускорение >= jump_imp_min_accel      (затухший импульс не берём);
-          5. экстремум свежий (сам трекер ищет только в коротком окне);
-          6. расстояние до таргета <= 3σ√t        (обе стороны, не только дешёвая);
-          7. запас >= max(база, jump_edge_spread_mult * спред) — широкий
-             спред сам ужесточает требования;
-          8. ask <= потолок, зависящий от качества сигнала.
+        Что изменилось против v22 и почему. Раньше каждый признак имел право
+        отменить сделку в одиночку: провалил один из восьми порогов — `return`,
+        остальные признаки даже не считались. На практике это означало, что
+        сильный сигнал пропадал из-за возраста импульса 8.2 секунды вместо
+        8.0. Один промах на два процента перечёркивал пять хороших признаков.
 
-        Чувствительность — компонент оценки, а не ворота: она поднимает
-        качество Q, от которого зависят ставка ($1/$2/$4/$8) и потолок цены.
-        Дорожек A/B нет: одинаковый импульс оценивается одинаково при любой
-        цене контракта, цена входит только как риск (потолок и запас).
+        Теперь так:
+
+          * ЖЁСТКИМИ остались только те условия, при которых сделка невозможна
+            или бессмысленна по построению: нет цены, нет σ, нет ask, раунд уже
+            решён (далеко от таргета), закрытый конец окна. Их проверяет
+            вызывающий `_maybe_enter` и начало этого метода;
+          * ВСЕ ОСТАЛЬНЫЕ признаки считаются ВСЕГДА и дают оценку 0..1 —
+            ход, скорость, удержание, возраст импульса, ускорение, запас,
+            ожидаемый сдвиг процента, перекос книги;
+          * из оценок собирается один Score (веса — в настройках), и решение
+            принимается ровно один раз: `Score >= jump_score_min`.
+
+        Единственное исключение — НОЛЬ. В шкалах `flowbot/score.py` ноль
+        означает не «слабо», а «такого у нужного нам сигнала не бывает»:
+        удержание ниже 60% это вынос ликвидности, ход меньше 1.5σ это шум.
+        Средневзвешенное 0.89 иначе спокойно купило бы ровно тот вынос, ради
+        отсева которого всё и строилось. Выключается `jump_score_veto_zero`.
+
+        Возвращает (сторона, дорожка, причина, ставка, признаки) или Action
+        с объяснением отказа. В объяснении перечислены ВСЕ оценки — иначе по
+        логу нельзя понять, какой признак утянул сделку вниз.
         """
         c = self.cfg
+        # --- данных нет: это не фильтр, а невозможность посчитать -----------
         if s.speed is None or s.imp_hold is None or s.imp_age_s is None:
             return Action(NONE, "нет данных импульса (трекер прогревается)")
         if not s.sigma_1s or s.sigma_1s <= 0:
-            return Action(NONE, "σ ещё не измерена — качество не посчитать")
+            return Action(NONE, "σ ещё не измерена — оценку не посчитать")
         sigma = s.sigma_1s
 
         jump = s.jump_usd
-        need_jump = c.jump_imp_jump_sigmas * sigma
-        if abs(jump) < need_jump:
-            return Action(NONE, (
-                f"движение ${jump:+.2f} < {c.jump_imp_jump_sigmas:.1f}σ "
-                f"(${need_jump:.2f}) — жду"))
+        if abs(jump) < 1e-9:
+            return Action(NONE, "движения нет")
         side = "Up" if jump > 0 else "Down"
         direction = favour(side)
 
-        spd = s.speed * direction             # скорость В СТОРОНУ импульса
-        need_speed = c.jump_imp_speed_sigmas * sigma
-        if spd < need_speed:
-            return Action(NONE, (
-                f"{side}: скачок ${jump:+.2f} есть, но скорость "
-                f"{spd:+.2f}$/с < {need_speed:.2f} — движение уже выдохлось"))
-
-        if s.imp_hold < c.jump_imp_min_hold:
-            return Action(NONE, (
-                f"{side}: цена удержала лишь {s.imp_hold:.0%} хода "
-                f"(< {c.jump_imp_min_hold:.0%}) — похоже на вынос ликвидности"))
-
-        accel = s.accel if s.accel is not None else 1.0
-        if accel < c.jump_imp_min_accel:
-            return Action(NONE, (
-                f"{side}: импульс затухает (ускорение {accel:.2f} < "
-                f"{c.jump_imp_min_accel:.2f}) — вход отменён"))
-
-        # ВОЗРАСТ САМОГО ИМПУЛЬСА, а не только свежесть экстремума. Движение
-        # может идти двадцать секунд: все фильтры пройдут (ход большой, ход
-        # держится, скорость есть), а покупать уже нечего — вход придётся на
-        # самый конец хода. Ограничение отсекает ровно это.
-        max_age = getattr(c, "jump_imp_max_age_s", 0.0)
-        if max_age > 0 and s.imp_age_s > max_age:
-            return Action(NONE, (
-                f"{side}: импульс идёт уже {s.imp_age_s:.0f}с "
-                f"(> {max_age:.0f}с) — вход был бы в конце движения"))
-
-        # Близость к таргету — для ОБЕИХ сторон: далеко от таргета исход
-        # решён, и проценты не сдвинет даже идеальный импульс.
+        # --- ЖЁСТКО: раунд уже решён ----------------------------------------
+        # Далеко от таргета проценты не реагируют на движение цены вообще,
+        # поэтому здесь дело не в качестве сигнала: забирать нечего в принципе.
         if s.target is not None:
             dist = abs(s.coin_price - s.target)
             limit = self.max_target_distance(s)
@@ -680,95 +665,84 @@ class JumpStrategy:
                     f"{side}: до таргета ${dist:,.0f} > ${limit:,.0f} "
                     f"({c.jump_max_target_sigmas:.0f}σ) — исход уже решён"))
 
+        # --- ЖЁСТКО: нечего покупать ----------------------------------------
         bid, ask = s.bid(side), s.ask(side)
         if ask is None:
             return Action(NONE, f"{side}: нет ask в книге")
 
-        # Динамический запас: широкий спред сам поднимает планку.
+        # ====================================================================
+        #  МЯГКИЕ признаки: считаем ВСЕ, ни один не делает return
+        # ====================================================================
+        jump_sig = abs(jump) / sigma
+        speed_sig = (s.speed * direction) / sigma
         spread = (ask - bid) if bid is not None else 0.05
-        edge_min = max(c.jump_min_edge_cents,
-                       c.jump_edge_spread_mult * spread * 100)
         edge = self._edge(s, side, ask)
-        if edge is None:
-            return Action(NONE, "нет таргета или σ — запас не посчитать")
-        if edge * 100 < edge_min:
-            fair = ask + edge
-            return Action(NONE, (
-                f"{side}: справедливо {fair*100:.0f}¢, просят {ask*100:.0f}¢ "
-                f"-> запас {edge*100:+.1f}¢ < {edge_min:.1f}¢ "
-                f"(спред {spread*100:.0f}¢) — переплачиваем"))
-
-        # --- СТРУКТУРА КНИГИ ------------------------------------------------
-        # Жёсткие ворота по книге по умолчанию ВЫКЛЮЧЕНЫ (пороги 0). Признаки
-        # при этом считаются всегда и попадают в журнал каждой сделки — чтобы
-        # потом ответить, влияют ли они на исход, ДАННЫМИ, а не рассуждением.
+        edge_cents = edge * 100 if edge is not None else 0.0
+        shift = self._expected_shift(s, jump)
+        shift_cents = abs(shift) * 100 if shift is not None else None
+        accel = s.accel if s.accel is not None else 1.0
         imb = s.imbalance(side)
         wall = s.wall(side)
+
+        # Шкалы растягиваются под НАСТРОЕННЫЕ опорные пороги, а не прибиты к
+        # числам из score.py. Так все прежние ручки (`imp-jump`, `imp-speed`,
+        # `imp-hold`, `imp-accel`, `imp-max-age`, `edge-cents`, `edge-mult`)
+        # продолжают работать и переберутся через replay.
+        edge_ref = max(c.jump_min_edge_cents,
+                       c.jump_edge_spread_mult * spread * 100)
+        sc = {
+            "jump": score.higher_is_better(jump_sig, score.scaled(
+                score.JUMP_SIGMAS, c.jump_imp_jump_sigmas / 2.0)),
+            "speed": score.higher_is_better(speed_sig, score.scaled(
+                score.SPEED_SIGMAS, c.jump_imp_speed_sigmas / 1.0)),
+            "hold": score.higher_is_better(s.imp_hold, score.scaled(
+                score.HOLD, c.jump_imp_min_hold / 0.7)),
+            "age": score.lower_is_better(s.imp_age_s, score.scaled(
+                score.AGE_S, (c.jump_imp_max_age_s / 8.0
+                              if c.jump_imp_max_age_s > 0 else 1.0))),
+            "accel": score.higher_is_better(accel, score.scaled(
+                score.ACCEL, c.jump_imp_min_accel / 0.5)),
+            "edge": score.higher_is_better(edge_cents, score.scaled(
+                score.EDGE_CENTS, edge_ref / 3.0)),
+            "book": score.book_score(imb),
+        }
+        # Сдвиг процента: когда фильтр выключен (порог 0), признака просто нет,
+        # и подставлять вместо него ноль нельзя — это молча топило бы Score.
+        if shift_cents is not None:
+            sc["shift"] = score.higher_is_better(shift_cents, score.scaled(
+                score.SHIFT_CENTS,
+                c.jump_min_shift_cents / 2.0 if c.jump_min_shift_cents > 0
+                else 1.0))
+
+        parts = [(n, getattr(c, f"jump_w_{n}", 0.0), v) for n, v in sc.items()]
+        total = score.combine([p for p in parts if p[1] > 0] or parts)
+
+        # --- ворота по книге: жёсткие, но по умолчанию выключены -------------
         need_imb = getattr(c, "jump_book_min_imbalance", 0.0)
         if need_imb > 0 and imb is not None and imb < need_imb:
             return Action(NONE, (
                 f"{side}: книга не подтверждает — перекос {imb:+.2f} < "
-                f"{need_imb:+.2f} (продавцов больше, чем покупателей)"))
+                f"{need_imb:+.2f}"))
         max_wall = getattr(c, "jump_book_max_wall", 0.0)
         if max_wall > 0 and wall is not None and wall > max_wall:
             return Action(NONE, (
-                f"{side}: {wall:.0%} всей ask-ликвидности в одной заявке "
+                f"{side}: {wall:.0%} ask-ликвидности в одной заявке "
                 f"(> {max_wall:.0%}) — стена на пути движения"))
 
-        # --- ВЗВЕШЕННАЯ оценка качества --------------------------------------
-        # Каждый компонент нормирован на свой порог (1.0 = ровно на пороге) и
-        # ограничен тройкой, чтобы один аномальный признак не покупал сделку
-        # в одиночку. Раньше бралось простое среднее — то есть заявлялось,
-        # что все четыре признака одинаково важны. Это заведомо неверно, а
-        # проверить нечем, поэтому веса вынесены в настройки и участвуют в
-        # переборе наравне с порогами.
-        parts = [
-            ("speed", c.jump_w_speed, min(spd / need_speed, 3.0)),
-            ("edge", c.jump_w_edge, min(edge * 100 / edge_min, 3.0)),
-            ("jump", c.jump_w_jump, min(abs(jump) / need_jump, 3.0)),
-        ]
-        shift = self._expected_shift(s, jump)
-        if shift is not None and c.jump_min_shift_cents > 0:
-            parts.append(("shift", c.jump_w_shift,
-                          min(abs(shift) * 100 / c.jump_min_shift_cents, 3.0)))
-        if imb is not None and c.jump_w_book > 0:
-            # Перекос [−1..+1] переводим в ту же шкалу «доля от порога»:
-            # 0 перекоса = 1.0 (нейтрально), полный перекос в нашу сторону = 2.0.
-            parts.append(("book", c.jump_w_book, max(0.0, 1.0 + imb)))
-
-        wsum = sum(w for _n, w, _v in parts)
-        if wsum <= 0:                      # все веса обнулены — простое среднее
-            quality = sum(v for _n, _w, v in parts) / max(len(parts), 1)
-        else:
-            quality = sum(w * v for _n, w, v in parts) / wsum
-
-        need_q, why_strict = self.min_quality(s)
-        if quality < need_q:
-            return Action(NONE, (
-                f"{side}: качество {quality:.2f} < {need_q:.2f}"
-                f"{why_strict} — импульс есть, но слабый"))
-
-        cap = self.max_leg_price_for_quality(quality)
-        if ask > cap:
-            return Action(NONE, (
-                f"{side} ask {ask:.2f} > потолка {cap:.2f} для качества "
-                f"{quality:.2f} — риск не по сигналу"))
-
-        stake = self.stake_for_quality(quality)
-        # Признаки входа едут вместе с решением: движок положит их в ногу, а
-        # при закрытии — в журнал. Без этого «какой фильтр влияет на прибыль»
-        # остаётся вопросом без ответа.
+        detail = " ".join(f"{n} {v:.2f}" for n, v in sorted(sc.items()))
         feat = {
-            "q": round(quality, 3),
+            "q": round(total, 3),
             "jump_usd": round(jump, 2),
-            "jump_sigmas": round(abs(jump) / sigma, 2),
-            "speed": round(spd, 3),
-            "speed_sigmas": round(spd / sigma, 2),
+            "jump_sigmas": round(jump_sig, 2),
+            "speed": round(s.speed * direction, 3),
+            "speed_sigmas": round(speed_sig, 2),
             "accel": round(accel, 3),
             "hold": round(s.imp_hold, 3),
             "imp_age_s": round(s.imp_age_s, 2),
-            "edge_cents": round(edge * 100, 2),
-            "edge_min_cents": round(edge_min, 2),
+            "edge_cents": round(edge_cents, 2),
+            "edge_ref_cents": round(edge_ref, 2),
+            "shift_cents": (None if shift_cents is None
+                            else round(shift_cents, 2)),
             "spread_cents": round(spread * 100, 2),
             "sigma": round(sigma, 3),
             "secs_left": round(s.seconds_left, 1),
@@ -779,16 +753,41 @@ class JumpStrategy:
             "book_ask_trend": (None if s.ask_trend(side) is None
                                else round(s.ask_trend(side), 3)),
             "flow": round(s.flow(side), 3),
-            "strict_entry": bool(why_strict),
-            "q_parts": {n: round(v, 3) for n, _w, v in parts},
         }
+        # Оценки каждого признака — отдельными полями, чтобы `stats.py --split`
+        # мог резать выборку по любому из них и показывать, кто тянет вниз.
+        for n, v in sc.items():
+            feat[f"s_{n}"] = round(v, 3)
+
+        # --- ВЕТО ПО НУЛЮ ----------------------------------------------------
+        if getattr(c, "jump_score_veto_zero", True):
+            zeros = [n for n, v in sc.items() if v <= 0.0]
+            if zeros:
+                return Action(NONE, (
+                    f"{side}: Score {total:.2f}, но «{', '.join(zeros)}» "
+                    f"= 0 — это не слабый признак, а запрещающий "
+                    f"({detail})"), feat=feat)
+
+        need, why_strict = self.min_quality(s)
+        if total < need:
+            return Action(NONE, (
+                f"{side}: Score {total:.2f} < {need:.2f}{why_strict} "
+                f"({detail})"), feat=feat)
+
+        cap = self.max_leg_price_for_quality(total)
+        if ask > cap:
+            return Action(NONE, (
+                f"{side} ask {ask:.2f} > потолка {cap:.2f} для Score "
+                f"{total:.2f} — риск не по сигналу ({detail})"), feat=feat)
+
+        feat["strict_entry"] = bool(why_strict)
+        stake = self.stake_for_quality(total)
         return (side, "Q", (
-            f"ИМПУЛЬС {side}: Q={quality:.2f}{why_strict} (скачок ${jump:+.2f}"
-            f"={abs(jump)/sigma:.1f}σ, скорость {spd:.1f}$/с, "
-            f"удержание {s.imp_hold:.0%}, ускорение {accel:.2f}, "
-            f"запас +{edge*100:.1f}¢ при пороге {edge_min:.1f}¢"
-            + (f", перекос книги {imb:+.2f}" if imb is not None else "")
-            + ")"), stake, feat)
+            f"ИМПУЛЬС {side}: Score={total:.2f}{why_strict} [{detail}] "
+            f"(ход {jump_sig:.1f}σ, скорость {speed_sig:.1f}σ/с, "
+            f"удержание {s.imp_hold:.0%}, возраст {s.imp_age_s:.1f}с, "
+            f"ускорение {accel:.2f}, запас {edge_cents:+.1f}¢ "
+            f"при спреде {spread*100:.0f}¢)"), stake, feat)
 
     # ---- режим "jump": исходный триггер по скачку цены ----------------------
     def _trigger_jump(self, s: JumpSnapshot):

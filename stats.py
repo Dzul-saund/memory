@@ -32,7 +32,11 @@ from flowbot.stats import default_path, read_all
 # Признаки, по которым осмысленно резать выборку.
 FEATURES = ["q", "speed_sigmas", "jump_sigmas", "hold", "accel",
             "edge_cents", "spread_cents", "imp_age_s", "book_imb",
-            "book_wall", "secs_left", "sigma"]
+            "book_wall", "secs_left", "sigma",
+            # Оценки отдельных признаков (0..1). Ради них скоринг и вводился:
+            # по ним видно, КАКОЙ признак чаще всего тянет сделки вниз.
+            "s_speed", "s_edge", "s_jump", "s_hold", "s_age", "s_accel",
+            "s_shift", "s_book"]
 
 
 def _num(v) -> Optional[float]:

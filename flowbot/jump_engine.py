@@ -1033,19 +1033,30 @@ class JumpEngine(FlowEngine):
                 "и «запас» там ненастоящий", c.jump_max_leg_price)
         elif c.jump_entry_mode == "impulse":
             self.log.info(
-                "ВХОД ПО КАЧЕСТВУ ИМПУЛЬСА: скачок >=%.1fσ И скорость "
-                ">=%.1fσ $/с И удержание >=%.0f%% И без затухания "
-                "(ускорение >=%.2f) И импульс не старше %.0fс; "
-                "запас >= max(%.1f¢, %.1f×спред); Q >= %.2f",
-                c.jump_imp_jump_sigmas, c.jump_imp_speed_sigmas,
-                c.jump_imp_min_hold * 100, c.jump_imp_min_accel,
-                c.jump_imp_max_age_s, c.jump_min_edge_cents,
-                c.jump_edge_spread_mult, c.jump_imp_min_score)
+                "ВХОД ПО ОЦЕНКЕ (Score 0..1), а не по обязательным воротам: "
+                "каждый признак даёт 0..1, они складываются с весами, и "
+                "решение одно — Score >= %.2f. Признак, просевший ниже "
+                "прежнего порога, теперь СНИЖАЕТ оценку, а не отменяет сделку",
+                c.jump_imp_min_score)
             self.log.info(
-                "веса Q: скорость %.2f / запас %.2f / ход %.2f / сдвиг %.2f"
-                "%s", c.jump_w_speed, c.jump_w_edge, c.jump_w_jump,
-                c.jump_w_shift,
+                "веса: скорость %.2f / запас %.2f / ход %.2f / удержание %.2f "
+                "/ возраст %.2f / ускорение %.2f / сдвиг %.2f%s",
+                c.jump_w_speed, c.jump_w_edge, c.jump_w_jump, c.jump_w_hold,
+                c.jump_w_age, c.jump_w_accel, c.jump_w_shift,
                 f" / книга {c.jump_w_book:.2f}" if c.jump_w_book > 0 else "")
+            self.log.info(
+                "опорные пороги шкал: ход %.1fσ, скорость %.1fσ/с, удержание "
+                "%.0f%%, возраст %.0fс, ускорение %.2f, запас max(%.1f¢, "
+                "%.1f×спред)",
+                c.jump_imp_jump_sigmas, c.jump_imp_speed_sigmas,
+                c.jump_imp_min_hold * 100, c.jump_imp_max_age_s,
+                c.jump_imp_min_accel, c.jump_min_edge_cents,
+                c.jump_edge_spread_mult)
+            if c.jump_score_veto_zero:
+                self.log.info(
+                    "НОЛЬ по любому признаку отменяет вход: в шкалах ноль "
+                    "значит не «слабо», а «у нужного сигнала так не бывает» "
+                    "(удержание <60%, ход <1.5σ, скорость <0.7σ)")
             if c.jump_stake_by_quality:
                 self.log.info("ставка от качества: $%.0f/$%.0f/$%.0f/$%.0f",
                               c.jump_stake_usdc, c.jump_stake_good,

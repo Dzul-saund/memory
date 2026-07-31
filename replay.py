@@ -242,6 +242,11 @@ SWEEPS = {
     "imp-hold": ("jump_imp_min_hold", float),
     "imp-accel": ("jump_imp_min_accel", float),
     "imp-score": ("jump_imp_min_score", float),
+    "score-min": ("jump_imp_min_score", float),      # то же, понятнее имя
+    "veto-zero": ("jump_score_veto_zero", _flag),
+    "w-hold": ("jump_w_hold", float),
+    "w-age": ("jump_w_age", float),
+    "w-accel": ("jump_w_accel", float),
     "imp-lookback": ("jump_imp_lookback_s", float),
     "imp-max-age": ("jump_imp_max_age_s", float),
     "edge-mult": ("jump_edge_spread_mult", float),
