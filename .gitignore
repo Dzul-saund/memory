@@ -22,6 +22,10 @@ env/
 # Runtime artifacts
 trades.csv
 *_trades.csv
+# Режимы входа дописывают своё имя к CSV (jump_trades.csv -> jump_trades_edge.csv),
+# и такие имена мимо шаблона выше проходили — один такой файл уже уехал в репо.
+*trades*.csv
+trades.jsonl
 edge_*_paper.csv
 backtest_results.csv
 backtest_cache.json
