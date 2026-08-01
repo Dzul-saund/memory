@@ -13,17 +13,21 @@
 Dry-run её проверить не может: симулированный трейдер отвечает мгновенным
 полным филлом, ордер до биржи не доходит.
 
-КАК ЭТО МЕРЯЕТСЯ ЗДЕСЬ, НЕ ТРАТЯ ДЕНЕГ. Отправляется настоящий подписанный
-FAK-ордер, но с ЗАВЕДОМО НЕИСПОЛНИМОЙ ценой: покупка по 0.01 стороны, которая
-стоит около 0.98. Никто не продаёт по цене в сто раз ниже рынка, поэтому
-FAK не находит встречной заявки и мгновенно отменяется.
+КАК ЭТО МЕРЯЕТСЯ ЗДЕСЬ, ПОЧТИ НЕ ТРАТЯ ДЕНЕГ. Отправляется настоящий
+подписанный FAK-ордер, но с ЗАВЕДОМО НЕИСПОЛНИМОЙ ценой: покупка по 0.01
+стороны, которая стоит 0.74-0.98. Никто не продаёт в десятки раз ниже рынка,
+поэтому FAK не находит встречной заявки и мгновенно отменяется.
+
+Размер при этом НЕ минимальный: у площадки минимум ордера $1, и заявка на
+один цент отвергается ещё до матчинга («invalid amount for a marketable BUY
+order ($0.01), min size: 1»). Поэтому 0.01 x 150 = $1.50.
 
 При этом путь пройден ЦЕЛИКОМ и по-настоящему: подпись ECDSA, сеть до США,
 матчинг-движок биржи, ответ обратно, разбор ответа. Ровно то, что происходит
 с боевым ордером — минус сам факт покупки.
 
 Худший исход, если книга окажется невероятной и ордер всё-таки исполнится:
-1 шэр по 0.01 = ОДИН ЦЕНТ.
+150 шэров по 0.01 = $1.50. Не $50.
 
 ЧТО ЕЩЁ ЭТО ПОКАЗЫВАЕТ. Подпись и отправка меряются ОТДЕЛЬНО, потому что
 первый ордер на новый токен дороже остальных: `py_clob_client_v2` при первой
@@ -32,8 +36,12 @@ FAK не находит встречной заявки и мгновенно о
 вызывает — значит первый ордер КАЖДОГО раунда платит эту задержку. Здесь она
 будет видна как разрыв между первой пробой и остальными.
 
+ОТКАЗ БИРЖИ — ТОЖЕ ВАЛИДНЫЙ ЗАМЕР. Ответ «400» проходит ровно тот же путь,
+что и принятый ордер. Такие пробы засчитываются, а не выбрасываются.
+
     python pingorder.py --env-file cert.env
     python pingorder.py --env-file cert.env -n 20
+    python pingorder.py --env-file cert.env --price 0.02 --size 100
 
 НУЖНЫ КРЕДЫ: PRIVATE_KEY и FUNDER в env-файле. Ордер настоящий и подписанный,
 просто неисполнимый.
@@ -50,10 +58,12 @@ import sys
 import time
 from typing import List
 
-# Заведомо неисполнимая цена покупки. Сторона, которую мы «покупаем», стоит
-# около 0.98 — продавца по 0.01 не существует.
+# Заведомо неисполнимая цена покупки: продавца в десятки раз ниже рынка не
+# существует. Но размер выбран НЕ минимальный: у площадки минимум ордера $1
+# ("invalid amount for a marketable BUY order ($0.01), min size: 1"), поэтому
+# 0.01 x 150 = $1.50 — выше минимума и всё ещё неисполнимо.
 DEAD_PRICE = 0.01
-DEAD_SIZE = 1.0          # один шэр: максимальный риск = один цент
+DEAD_SIZE = 150.0        # 0.01 x 150 = $1.50; максимальный риск — эти $1.50
 
 
 def _tcp_rtt(host: str = "clob.polymarket.com", port: int = 443,
@@ -148,7 +158,20 @@ def main(argv=None) -> int:
     ap.add_argument("-n", "--samples", type=int, default=10,
                     help="сколько проб отправить (по умолчанию 10)")
     ap.add_argument("--asset", default=None, help="монета (по умолчанию из env)")
+    ap.add_argument("--price", type=float, default=DEAD_PRICE,
+                    help=f"цена неисполнимой заявки (по умолчанию {DEAD_PRICE})")
+    ap.add_argument("--size", type=float, default=DEAD_SIZE,
+                    help=f"размер в шэрах (по умолчанию {DEAD_SIZE:.0f}; "
+                         f"цена x размер должно быть >= $1 — минимум площадки)")
     args = ap.parse_args(argv)
+
+    price, size = round(args.price, 2), float(int(args.size))
+    if price * size < 1.0:
+        print(f"цена {price} x размер {size:.0f} = ${price * size:.2f} — "
+              f"площадка отвергнет: минимум ордера $1.\n"
+              f"Увеличь --size (например {int(1.5 / price) + 1}).",
+              file=sys.stderr)
+        return 2
 
     if args.env_file:
         if not os.path.exists(args.env_file):
@@ -182,18 +205,18 @@ def main(argv=None) -> int:
     print("=" * 70)
     print("ЗОНД ЗАДЕРЖКИ ОРДЕРА")
     print("Отправляются НАСТОЯЩИЕ подписанные FAK-ордера по цене "
-          f"{DEAD_PRICE:.2f} на сторону,")
+          f"{price:.2f} x {size:.0f} = ${price * size:.2f} на сторону,")
     print("которая стоит около 0.98. Встречной заявки по такой цене не "
           "существует,")
-    print("поэтому ордер не исполняется. Максимальный риск, если "
-          "исполнится: 1 цент.")
+    print(f"поэтому ордер не исполняется. Максимальный риск, если "
+          f"исполнится: ${price * size:.2f}.")
     print("=" * 70)
 
     print("\nищу текущий рынок…")
     market = asyncio.run(_find_market(asset))
     token, side, ask = _best_side(market)
     print(f"  раунд {market['slug']}")
-    print(f"  сторона {side}: ask {ask:.2f} — покупаем по {DEAD_PRICE:.2f}, "
+    print(f"  сторона {side}: ask {ask:.2f} — покупаем по {price:.2f}, "
           f"филла быть не может")
 
     print("\nмеряю TCP-рукопожатие (это и есть «пинг» из лога бота)…")
@@ -214,34 +237,53 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         fak = None
 
+    rejected: List[str] = []
     for i in range(args.samples):
+        resp = None
+        # ОТКАЗ БИРЖИ — ТОЖЕ ВАЛИДНЫЙ ЗАМЕР. Ответ «400 invalid amount»
+        # проходит ровно тот же путь, что и принятый ордер: подпись, сеть,
+        # матчинг-движок, ответ обратно. Выбрасывать такие пробы значит
+        # выбрасывать измерение из-за того, что оно не понравилось бирже.
         try:
             t0 = time.perf_counter()
             if fak is not None and hasattr(trader, "_build_signed"):
-                signed = trader._build_signed(token, DEAD_PRICE, DEAD_SIZE, "BUY")
+                signed = trader._build_signed(token, price, size, "BUY")
                 t1 = time.perf_counter()
-                resp = trader.client.post_order(signed, fak)
+                try:
+                    resp = trader.client.post_order(signed, fak)
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "status_code", None) is None:
+                        raise          # сети не было — мерить нечего
+                    rejected.append(str(getattr(exc, "error_message", exc))[:120])
                 t2 = time.perf_counter()
                 sign_ms.append((t1 - t0) * 1000.0)
                 send_ms.append((t2 - t1) * 1000.0)
                 total_ms.append((t2 - t0) * 1000.0)
             else:
-                resp = trader.buy(token, DEAD_PRICE, DEAD_SIZE)
+                resp = trader.buy(token, price, size)
                 total_ms.append((time.perf_counter() - t0) * 1000.0)
         except Exception as exc:  # noqa: BLE001 - зонд не должен падать
             errors += 1
-            print(f"  проба {i + 1}: ошибка — {exc}")
+            print(f"  проба {i + 1}: сеть/подпись упали — {exc}")
             time.sleep(0.5)
             continue
 
-        # Проверяем, не исполнилось ли (не должно).
-        from flowbot.fills import interpret
-        got = interpret(resp, DEAD_SIZE)
-        if got.ok and got.shares:
-            filled += 1
+        if resp is not None:
+            from flowbot.fills import interpret
+            got = interpret(resp, size)
+            if got.ok and got.shares:
+                filled += 1
+        tail = "" if resp is not None else "  (отказ биржи — замер валиден)"
         mark = "" if i else "   <- ПЕРВАЯ (подпись идёт в сеть за neg_risk/tick_size)"
-        print(f"  проба {i + 1:2}: {total_ms[-1]:7.1f} мс{mark}")
+        print(f"  проба {i + 1:2}: {total_ms[-1]:7.1f} мс{tail}{mark}")
         time.sleep(0.3)
+
+    if rejected:
+        uniq = sorted(set(rejected))
+        print(f"\n  биржа отклонила {len(rejected)} из {args.samples} — это "
+              f"НОРМАЛЬНО для зонда,\n  замеры остаются валидными. Причина:")
+        for r in uniq[:3]:
+            print(f"    {r}")
 
     print("\n" + "=" * 70)
     print("РЕЗУЛЬТАТ")
@@ -286,8 +328,8 @@ def main(argv=None) -> int:
             print("\n  Модель совпадает с реальностью — править нечего.")
 
     if filled:
-        print(f"\n  ВНИМАНИЕ: {filled} проб(ы) ИСПОЛНИЛИСЬ по {DEAD_PRICE:.2f}. "
-              f"Это ~${filled * DEAD_PRICE * DEAD_SIZE:.2f}.")
+        print(f"\n  ВНИМАНИЕ: {filled} проб(ы) ИСПОЛНИЛИСЬ по {price:.2f}. "
+              f"Это ~${filled * price * size:.2f}.")
         print("  Забери их Redeem'ом на сайте, если раунд выиграет.")
     else:
         print("\n  Ни одна проба не исполнилась — потрачено $0.00.")
