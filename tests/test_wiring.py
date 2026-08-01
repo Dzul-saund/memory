@@ -181,6 +181,108 @@ def test_упавший_record_settle_не_роняет_расчёт():
 
 
 # ---------------------------------------------------------------------------
+#  Предподписание ордеров
+# ---------------------------------------------------------------------------
+class _FakeTrader:
+    """Трейдер, который только запоминает вызов предподписания."""
+
+    def __init__(self):
+        self.calls = []
+
+    def presign_window(self, tokens, price_min, price_max, trade_size):
+        self.calls.append((tuple(tokens), price_min, price_max, trade_size))
+
+
+def _prep(eng, live=True, strategy="certainty"):
+    eng.cfg.strategy = strategy
+    eng.cfg.dry_run = not live
+    eng.trader = _FakeTrader()
+    return eng.trader
+
+
+def test_новое_окно_запускает_предподписание():
+    """Первый ордер на новый токен стоит +98мс (измерено pingorder.py).
+
+    Токены меняются каждые 5 минут, поэтому без предподписания эту задержку
+    платит первая ступень лестницы в КАЖДОМ раунде.
+    """
+    eng, cfg = _engine(strategy="certainty")
+    t = _prep(eng)
+    eng._window_key = None
+    eng._enter_window({"up": "U", "down": "D", "window_ts": 123,
+                       "slug": "s"})
+    assert len(t.calls) == 1
+    tokens, pmin, pmax, sizes = t.calls[0]
+    assert tokens == ("U", "D")
+    assert (pmin, pmax) == (cfg.cert_min_price, cfg.cert_max_price)
+    # ВСЕ размеры ступеней, а не один: ключ заготовки включает размер, и
+    # неподписанная ступень молча не найдёт заготовку. Повторы схлопывает
+    # сам presign_window — здесь важно, что ни один размер не потерялся.
+    assert set(sizes) == set(cfg.cert_steps)
+
+
+def test_повторный_вход_в_то_же_окно_не_переподписывает():
+    eng, _ = _engine(strategy="certainty")
+    t = _prep(eng)
+    eng._window_key = None
+    mk = {"up": "U", "down": "D", "window_ts": 123, "slug": "s"}
+    eng._enter_window(mk)
+    eng._enter_window(mk)
+    assert len(t.calls) == 1
+
+
+def test_без_стратегии_и_в_симуляции_не_подписываем():
+    """В dry-run ордера не уходят — подписывать нечего."""
+    eng, _ = _engine(strategy="certainty")
+    t = _prep(eng, live=False)
+    eng._presign({"up": "U", "down": "D"})
+    assert t.calls == []
+
+    eng2, _ = _engine()
+    t2 = _prep(eng2, strategy="none")
+    eng2._presign({"up": "U", "down": "D"})
+    assert t2.calls == []
+
+
+def test_упавшее_предподписание_не_роняет_бота():
+    eng, _ = _engine(strategy="certainty")
+
+    class Boom:
+        def presign_window(self, *a, **k):
+            raise RuntimeError("тест")
+
+    eng.cfg.dry_run = False
+    eng.trader = Boom()
+    eng._presign({"up": "U", "down": "D"})   # не должно бросить
+
+
+def test_ключ_заготовки_совпадает_с_ключом_боевого_ордера():
+    """САМАЯ ВАЖНАЯ ПРОВЕРКА ЗДЕСЬ.
+
+    Заготовка ищется по ключу (токен, цена, размер). Разойдись расчёт размера
+    в предподписании с расчётом в `_buy_leg` хоть на шэр — заготовка не
+    найдётся НИКОГДА, и вся работа пропадёт молча: ошибки не будет, просто
+    каждый ордер снова начнёт платить подпись.
+    """
+    from btc_bot.util import whole_shares
+
+    cfg = FlowConfig(strategy="certainty", max_round_usdc=50.0)
+    for usd in cfg.cert_steps:
+        for cents in range(int(round(cfg.cert_min_price * 100)),
+                           int(round(cfg.cert_max_price * 100)) + 1):
+            price = cents / 100.0
+            # как считает предподписание
+            presign_size = whole_shares(usd, price, cfg.min_order_usdc)
+            # как считает _buy_leg: want = size_usdc / fill, затем want * fill
+            want = usd / price
+            live_size = whole_shares(want * price, price, cfg.min_order_usdc)
+            assert presign_size == live_size, (usd, price)
+            # и ключ, по которому LiveTrader.buy ищет заготовку
+            assert ((("T", round(price, 2), presign_size))
+                    == ("T", round(price, 2), float(int(round(live_size)))))
+
+
+# ---------------------------------------------------------------------------
 #  Конфигурация: молчаливо неверные настройки
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("over,fragment", [

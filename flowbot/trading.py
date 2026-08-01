@@ -127,6 +127,31 @@ class TradingEngine(FlowEngine):
             self.price.reset()
             self._round_pnl = 0.0
             self.rounds += 1
+            self._presign(market)
+
+    def _presign(self, market: dict) -> None:
+        """Подписать ордера ЗАРАНЕЕ, в фоне, на старте окна.
+
+        ИЗМЕРЕНО зондом `pingorder.py` на боевом сервере: первый ордер на
+        новый токен стоит на 98 мс дороже остальных — клиент биржи при первой
+        подписи ходит в сеть за `neg_risk` и `tick_size`. Токены меняются
+        каждые 5 минут, поэтому эти 98 мс платил ПЕРВЫЙ ордер КАЖДОГО раунда:
+        ровно первая ступень лестницы, самая важная.
+
+        Заготовка живёт до конца окна (FAK с expiration=0 не протухает), а в
+        момент решения от отправки остаётся только POST.
+        """
+        c = self.cfg
+        if c.strategy != "certainty" or c.dry_run:
+            return
+        fn = getattr(self.trader, "presign_window", None)
+        if fn is None:                      # dry-run трейдер, подписывать нечего
+            return
+        try:
+            fn((market["up"], market["down"]),
+               c.cert_min_price, c.cert_max_price, list(c.cert_steps))
+        except Exception as exc:  # noqa: BLE001 - подпись не должна ронять бота
+            self.log.debug("предподписание не удалось: %s", exc)
 
     # ======================================================================
     #  Такт решения

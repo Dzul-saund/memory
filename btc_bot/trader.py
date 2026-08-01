@@ -17,7 +17,7 @@ import time
 from typing import Callable, Optional
 
 from .config import Config
-from .util import floor2, with_retry
+from .util import floor2, whole_shares, with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -72,16 +72,41 @@ class LiveTrader:
     def presign_window(self, tokens, price_min, price_max, trade_size):
         """Фоново заготовить подписанные BUY-ордера на все цены полосы для
         токенов текущего окна. FAK-ордера с expiration=0 не протухают, так
-        что подпись в начале окна годна до самого конца."""
+        что подпись в начале окна годна до самого конца.
+
+        ЗАЧЕМ ЭТО ИЗМЕРЕНО, А НЕ ПРЕДПОЛОЖЕНО. Зонд `pingorder.py` на боевом
+        сервере показал: первый ордер на новый токен стоит на 98 мс дороже
+        остальных — `py_clob_client_v2` при первой подписи ходит в сеть за
+        `neg_risk` и `tick_size`. Токены меняются каждые 5 минут, поэтому без
+        предподписания эти 98 мс платит ПЕРВЫЙ ордер КАЖДОГО раунда, то есть
+        первая ступень лестницы — самая важная.
+
+        `trade_size` — доллары на ордер. Принимает и одно число, и список:
+        у лестницы ступени разного размера (10 и 20), и подписать надо все,
+        иначе ключ не совпадёт и заготовка не пригодится.
+        """
         if not getattr(self.cfg, "presign_enabled", True):
             return
+        try:
+            sizes = ([float(trade_size)] if isinstance(trade_size, (int, float))
+                     else [float(x) for x in trade_size])
+        except (TypeError, ValueError):
+            return
+        sizes = sorted({s for s in sizes if s > 0})
+        if not sizes:
+            return
         cents = range(int(round(price_min * 100)), int(round(price_max * 100)) + 1)
-        jobs = [(str(tok), c / 100.0) for tok in tokens if tok for c in cents]
+        jobs = [(str(tok), c / 100.0, usd) for tok in tokens if tok
+                for c in cents for usd in sizes]
 
         def _work():
             fresh = {}
-            for token_id, price in jobs:
-                size = float(int(trade_size / price))
+            for token_id, price, usd in jobs:
+                # РАЗМЕР СЧИТАЕТСЯ ТАК ЖЕ, КАК В БОЮ (`whole_shares`), иначе
+                # ключ заготовки не совпадёт с ключом реального ордера и вся
+                # эта работа пропадёт молча.
+                size = whole_shares(usd, price,
+                                    getattr(self.cfg, "min_order_usdc", 0.0))
                 if size <= 0:
                     continue
                 try:
