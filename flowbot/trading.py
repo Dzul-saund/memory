@@ -37,6 +37,20 @@ from .stats import TradeJournal
 from .strategy import BUY, SELL, Snapshot, Strategy
 
 
+def build_strategy(cfg: FlowConfig) -> Strategy:
+    """Собрать стратегию по имени из конфига.
+
+    Единственное место, где движок знает про существование конкретных
+    стратегий. Неизвестное имя не проходит `FlowConfig.validate()`, поэтому
+    сюда оно не доедет; на всякий случай запасной вариант — пустая стратегия,
+    которая просто не торгует.
+    """
+    if getattr(cfg, "strategy", "none") == "certainty":
+        from .certainty import CertaintyStrategy
+        return CertaintyStrategy(cfg)
+    return Strategy(cfg)
+
+
 class TradingEngine(FlowEngine):
     """Исполнение решений стратегии: ордера, позиции, сверка, журнал."""
 
@@ -44,7 +58,7 @@ class TradingEngine(FlowEngine):
         super().__init__(cfg, logger or logging.getLogger("flowbot"))
         # Базовый FlowEngine собрал σ-стратегию и позицию-одиночку — они здесь
         # не нужны: своя стратегия и свой список ног.
-        self.strategy = Strategy(cfg)
+        self.strategy = build_strategy(cfg)
         self.pos = None
         self.legs: List[dict] = []          # фактические ноги (шэры, стоимость)
         self._window_key: Optional[float] = None
@@ -143,6 +157,15 @@ class TradingEngine(FlowEngine):
             # Покупки сейчас не пройдут (пауза после отказа биржи). Стратегия
             # обязана это знать, если её выход рассчитывает на покупку.
             entries_paused=t_now < self._retry_after,
+            # СЫРЬЁ для собственных измерений стратегии: история цены и уровни
+            # книги. Волатильность, скорость, глубину и перекос она считает
+            # сама — движок не знает, что именно ей понадобится.
+            price_hist=self.price.history(),
+            up_levels=self.book.depth(up, cfg.book_levels),
+            down_levels=self.book.depth(dn, cfg.book_levels),
+            # Мёртвый поток CLOB изнутри неотличим от тихого рынка: цены в
+            # книге остаются те же, что были в момент обрыва.
+            book_age_s=self.book.age_s(t_now),
         )
 
         # Запоминаем последний bid каждой ноги — по нему считаем расчёт, если
@@ -790,6 +813,16 @@ class TradingEngine(FlowEngine):
             # под наблюдение: иначе она пропадает из вида навсегда.
             self._watch_leftover(leg)
             pnl = round(payout - leg["cost"], 2)
+            # Стратегия обязана узнать исход. Без этого дневной риск слеп:
+            # `record_sell` знает только про позиции, которые закрыли сами, а
+            # эта стратегия по замыслу почти всегда доживает до расчёта.
+            slg = next((x for x in self.strategy.legs
+                        if x.idx == leg["idx"]), None)
+            if slg is not None:
+                try:
+                    self.strategy.record_settle(slg, payout, pnl, time.time())
+                except Exception as exc:  # noqa: BLE001 - учёт не роняет бота
+                    self.log.warning("record_settle упал: %s", exc)
             self._journal(leg, result, mark, payout, pnl)
             payout_total += payout
             self._book_pnl(pnl)
@@ -837,6 +870,11 @@ class TradingEngine(FlowEngine):
                 "pm": snap.pm_price,
                 "pm_age": (round(snap.pm_age_ms)
                            if snap.pm_age_ms is not None else None),
+                # Возраст книги ПО ФАКТУ. Восстановить его задним числом
+                # нельзя: при обрыве потока такты продолжают идти по таймеру
+                # с теми же ценами, и запись выглядит совершенно нормальной.
+                "book_age": (round(snap.book_age_s, 2)
+                             if snap.book_age_s is not None else None),
                 # Глубина книги: сырьё, которое по цене задним числом не
                 # восстановить. Новой стратегии оно понадобится, а второй раз
                 # этот рынок уже не запишешь.
@@ -955,10 +993,30 @@ class TradingEngine(FlowEngine):
         mode = "DRY-RUN (без реальных ордеров)" if c.dry_run else "*** LIVE ***"
         self.log.info("=" * 72)
         self.log.info("flowbot — %s Up/Down 5m — %s", c.asset.upper(), mode)
-        self.log.info(
-            "СТРАТЕГИЯ НЕ ЗАДАНА: flowbot/strategy.py — чистый лист, "
-            "should_enter и should_exit возвращают None. Бот смотрит рынок, "
-            "ведёт учёт и сверку, но сделок не открывает.")
+        if c.strategy == "certainty":
+            self.log.info(
+                "СТРАТЕГИЯ «ПОЧТИ-ФАКТ» (flowbot/certainty.py): покупка "
+                "выигрывающей стороны при цене %.2f-%.2f, только когда запас "
+                "до таргета >= %.1fσ, лестницей %s = $%.0f, удержание до "
+                "расчёта.", c.cert_min_price, c.cert_max_price, c.cert_z_min,
+                "/".join(f"${x:.0f}" for x in c.cert_steps), c.cert_full_size)
+            self.log.info(
+                "порог риска <= %.0f/100 (ужесточается на %.0f за ступень) | "
+                "окно входа %.0f-%.0fс до конца | аварийный выход при запасе "
+                "< %.1fσ, подтверждённом %d тактов за %.1fс",
+                c.cert_risk_max, c.cert_risk_tighten, c.cert_min_seconds_left,
+                c.cert_max_seconds_left, c.cert_exit_z,
+                c.cert_exit_confirm_ticks, c.cert_exit_confirm_s)
+            self.log.info(
+                "дневной риск: не больше %d потерь, не хуже -$%.0f, не больше "
+                "%d сделок. ОДНА ПОТЕРЯ = 49 ВЫИГРЫШЕЙ.",
+                c.cert_max_day_losses, c.cert_max_day_loss_usd,
+                c.cert_max_day_trades)
+        else:
+            self.log.info(
+                "СТРАТЕГИЯ НЕ ЗАДАНА: flowbot/strategy.py — чистый лист, "
+                "should_enter и should_exit возвращают None. Бот смотрит "
+                "рынок, ведёт учёт и сверку, но сделок не открывает.")
         self.log.info(
             "ставка по умолчанию $%.2f | минимум ордера $%.2f | потолок "
             "раунда $%.0f", c.stake_usdc, c.min_order_usdc, c.max_round_usdc)

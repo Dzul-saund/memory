@@ -36,7 +36,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # --- что движок умеет исполнить ---------------------------------------------
 NONE = "none"       # ничего не делать
@@ -63,6 +63,17 @@ class Snapshot:
     # Движок сейчас не пропустит покупку (пауза после отказа биржи).
     # Стратегия обязана это учитывать, если её выход рассчитывает на покупку.
     entries_paused: bool = False
+    # СЫРЬЁ, а не производные величины. История цены и уровни книги — это
+    # те же данные, только за больший промежуток: волатильность, скорость,
+    # глубину и перекос стратегия считает из них сама и хранит у себя.
+    price_hist: Sequence[Tuple[float, float]] = ()      # [(время, цена), …]
+    up_levels: Tuple[Sequence, Sequence] = ((), ())     # (биды, аски)
+    down_levels: Tuple[Sequence, Sequence] = ((), ())
+    # Сколько секунд книга не менялась. None — событий ещё не было. Обрыв
+    # потока CLOB изнутри выглядит как «рынок замер»: цены остаются те же,
+    # что были в момент разрыва, и отличить тихий рынок от мёртвого сокета
+    # можно только по времени.
+    book_age_s: Optional[float] = None
 
     def bid(self, outcome: str) -> Optional[float]:
         return self.up_bid if outcome == "Up" else self.down_bid
@@ -204,6 +215,15 @@ class Strategy:
     def record_sell(self, idx: int, proceeds: float, t: float) -> None:
         self.legs = [lg for lg in self.legs if lg.idx != idx]
         self.net_out -= proceeds
+
+    def record_settle(self, leg: Leg, payout: float, pnl: float,
+                      t: float) -> None:
+        """Раунд рассчитан: движок сообщает исход позиции.
+
+        Без этого стратегия не знает, выиграла она или проиграла, — а
+        значит не может вести дневной риск. Продажа (`record_sell`) отвечает
+        только за те позиции, которые закрыли сами.
+        """
 
     @property
     def debt(self) -> float:

@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Deque, Dict, Optional, Tuple
 
@@ -87,30 +88,53 @@ class BookEngine:
         self.up_token: Optional[str] = None
         self.down_token: Optional[str] = None
         self.books: Dict[str, Book] = {}
+        # Когда книга последний раз менялась. Обрыв потока CLOB выглядит
+        # изнутри как «рынок замер»: цены в книге остаются те же, что были в
+        # момент разрыва, и по ним нельзя отличить тихий рынок от мёртвого
+        # сокета. Отдаём время, а решает по нему стратегия.
+        self.last_event_s: Optional[float] = None
 
     def set_tokens(self, up_token: str, down_token: str) -> None:
         self.up_token, self.down_token = str(up_token), str(down_token)
         self.books = {self.up_token: Book(), self.down_token: Book()}
+        self.last_event_s = None
 
     # -- наполнение из CLOB-потока -------------------------------------------
     def on_event(self, ev: dict, recv_s: Optional[float] = None) -> bool:
         """Применить одно событие потока. True, если изменился топ книги."""
         etype = ev.get("event_type") or ev.get("type")
-        changed = False
+        changed = False      # сдвинулся ТОП книги — есть о чём думать
+        seen = False         # событие вообще про наши токены — поток жив
         if etype == "book":
             book = self.books.get(str(ev.get("asset_id")))
             if book is not None:
                 book.apply_snapshot(ev.get("bids") or ev.get("buys"),
                                     ev.get("asks") or ev.get("sells"))
-                changed = True
+                changed = seen = True
         elif etype == "price_change":
             for ch in ev.get("changes") or []:
-                if self._apply_change(str(ev.get("asset_id")), ch):
-                    changed = True
+                tok = str(ev.get("asset_id"))
+                seen = seen or tok in self.books
+                changed = self._apply_change(tok, ch) or changed
             for ch in ev.get("price_changes") or []:
-                if self._apply_change(str(ch.get("asset_id")), ch):
-                    changed = True
+                tok = str(ch.get("asset_id"))
+                seen = seen or tok in self.books
+                changed = self._apply_change(tok, ch) or changed
+        if seen:
+            # Отметку ставим по ЛЮБОМУ принятому событию наших токенов, а НЕ
+            # только по смене лучшей цены. Живой поток — признак связи, а не
+            # признак движения: на решённом раунде топ книги может честно
+            # стоять на месте минутами, и считать это обрывом значило бы
+            # запрещать вход ровно там, где стратегия и должна работать.
+            self.last_event_s = recv_s if recv_s is not None else time.time()
         return changed
+
+    def age_s(self, now: Optional[float] = None) -> Optional[float]:
+        """Сколько секунд книга не менялась. None — событий ещё не было."""
+        if self.last_event_s is None:
+            return None
+        return max(0.0, (now if now is not None else time.time())
+                   - self.last_event_s)
 
     def _apply_change(self, tok: str, ch: dict) -> bool:
         book = self.books.get(tok)
