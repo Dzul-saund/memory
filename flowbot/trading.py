@@ -61,6 +61,8 @@ class TradingEngine(FlowEngine):
         self._busy_since = 0.0
         self._last_skip_log = 0.0
         self._last_reconcile = 0.0
+        # Когда стратегия приняла решение, которое сейчас исполняется.
+        self._decided_ts: Optional[float] = None
         # Шэры, доставшиеся нам от ЗАКОНЧИВШИХСЯ раундов. Сверка спрашивала
         # биржу только про два токена текущего окна, поэтому остаток от
         # прошлого раунда был невидим по построению: на Polymarket висит
@@ -191,6 +193,11 @@ class TradingEngine(FlowEngine):
 
         self.busy = True
         self._busy_since = now
+        # МОМЕНТ РЕШЕНИЯ. От него до записанной позиции и есть задержка
+        # «сигнал -> покупка»: работа бота плюс дорога до биржи. Раньше её
+        # не писали никуда, и ответить «через сколько он купил» было нечем —
+        # ни в CSV, ни в журнале такого поля не было.
+        self._decided_ts = snap.t
         asyncio.create_task(self._execute(action))
 
     async def _reconcile(self) -> None:
@@ -483,11 +490,17 @@ class TradingEngine(FlowEngine):
             "feat": dict(action.feat or {}),
             "entry_bid": bid,
             "entry_ts": time.time(),
+            # Сколько прошло от решения до записанной позиции, мс.
+            "lag_ms": (round((time.time() - self._decided_ts) * 1000.0, 1)
+                       if self._decided_ts else None),
         })
         self.log.warning(
             "КУПЛЕНО [#%d] %s — %.2f шэр @ $%.2f (=$%.2f) | вложено за раунд "
-            "$%.2f | ответ: %s", leg.idx, outcome, shares, fill,
-            cost, self.strategy.net_out, _short(resp))
+            "$%.2f | задержка %s | ответ: %s", leg.idx, outcome, shares,
+            fill, cost, self.strategy.net_out,
+            (f"{self.legs[-1]['lag_ms']:.0f}мс"
+             if self.legs[-1].get("lag_ms") is not None else "—"),
+            _short(resp))
 
     @staticmethod
     def _is_short_balance(err) -> bool:
@@ -728,6 +741,9 @@ class TradingEngine(FlowEngine):
                        if leg.get("entry_ts") else None),
             "coin_at_entry": leg.get("coin_at_entry"),
             "secs_at_entry": leg.get("secs_at_entry"),
+            # Задержка «сигнал -> покупка». Без неё нельзя отличить
+            # «стратегия ошиблась» от «пока ордер летел, цена ушла».
+            "lag_ms": leg.get("lag_ms"),
         }
         row.update(feat)          # q, speed, hold, accel, edge, книга и т.д.
         self.journal.append(row)
