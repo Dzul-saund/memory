@@ -1,0 +1,31 @@
+# Secrets — NEVER commit your private key / API creds.
+# ЛЮБОЙ .env в этом проекте содержит поля PRIVATE_KEY / FUNDER, поэтому
+# игнорируем их все, а не по одному имени: новый пресет иначе однажды
+# уедет в историю git вместе с ключом, и оттуда его уже не стереть.
+.env
+*.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# Runtime artifacts
+trades.csv
+*_trades.csv
+# Режимы входа дописывают своё имя к CSV (jump_trades.csv -> jump_trades_edge.csv),
+# и такие имена мимо шаблона выше проходили — один такой файл уже уехал в репо.
+*trades*.csv
+trades.jsonl
+edge_*_paper.csv
+backtest_results.csv
+backtest_cache.json

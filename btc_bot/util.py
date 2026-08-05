@@ -1,0 +1,103 @@
+"""Small shared helpers: retry/backoff, time parsing, formatting."""
+from __future__ import annotations
+
+import math
+import time
+from datetime import datetime
+from typing import Callable, Optional, TypeVar
+
+T = TypeVar("T")
+
+
+def with_retry(
+    fn: Callable[[], T],
+    *,
+    retries: int,
+    base: float,
+    max_backoff: float,
+    what: str,
+    logger=None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Call ``fn`` and retry on any exception with exponential backoff.
+
+    Backoff is ``base ** attempt`` seconds (capped at ``max_backoff``), e.g. with
+    base=2 -> 2s, 4s, 8s, 16s. Re-raises the last exception once ``retries`` is
+    exhausted so the caller's circuit-breaker can react.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - we genuinely want to catch all
+            attempt += 1
+            if attempt > retries:
+                raise
+            delay = min(base ** attempt, max_backoff)
+            if logger is not None:
+                logger.warning(
+                    "%s failed (attempt %d/%d): %s — retrying in %.0fs",
+                    what, attempt, retries, exc, delay,
+                )
+            sleep(delay)
+
+
+def parse_iso(s: str) -> datetime:
+    """Parse an ISO-8601 timestamp, tolerating a trailing 'Z'."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def iso_to_epoch(s: str) -> int:
+    return int(parse_iso(s).timestamp())
+
+
+def floor2(x: float) -> float:
+    """Round down to 2 decimals (Polymarket share precision)."""
+    return math.floor(x * 100) / 100.0
+
+
+def whole_shares(usdc: float, price: float, min_usdc: float = 0.0) -> float:
+    """Сколько ЦЕЛЫХ шэров взять на `usdc` по цене `price`.
+
+    Polymarket отвергает покупку, если сумма в USDC (price * size) имеет
+    больше двух знаков после запятой:
+
+        {"error": "invalid amounts, the market buy orders maker amount
+                   supports a max accuracy of 2 decimals"}
+
+    Цена всегда в целых центах, поэтому два знака гарантированы только для
+    ЦЕЛОГО числа шэров: 0.57 * 1.76 = $1.0032 отвергается, 0.57 * 2 = $1.14
+    проходит. Дробные размеры (floor2/ceil2) для покупки не годятся —
+    именно на них живой ордер и падал с 400.
+
+    Если целая часть не дотягивает до минимального размера ордера,
+    округляем ВВЕРХ до первого целого, который его перекрывает.
+    """
+    if price <= 0:
+        return 0.0
+    n = math.floor(usdc / price)
+    if n * price < min_usdc - 1e-9:
+        n = math.ceil(min_usdc / price)
+    return float(max(n, 0))
+
+
+def ceil2(x: float) -> float:
+    """Round UP to 2 decimals (Polymarket share precision).
+
+    Нужен там, где округление вниз опускает ордер под минимальный размер:
+    $1.00 / 0.53 = 1.8867 шэра, floor2 даёт 1.88 -> $0.9964, то есть КАЖДАЯ
+    покупка на ставку $1 оказывалась чуть дешевле доллара.
+    """
+    # Округляем до 9 знаков перед ceil: 1.89*100 в двоичной дроби даёт
+    # 188.99999999999997, и без этого ceil вернул бы лишнюю сотую.
+    return math.ceil(round(x * 100, 9)) / 100.0
+
+
+def fmt(x: Optional[float], nd: int = 2) -> str:
+    return "-" if x is None else f"{x:.{nd}f}"
+
+
+def fmt_money(x: Optional[float]) -> str:
+    return "-" if x is None else f"{x:,.2f}"
